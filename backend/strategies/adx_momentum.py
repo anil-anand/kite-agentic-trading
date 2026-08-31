@@ -20,9 +20,9 @@ class ADXMomentumStrategy(BaseStrategy):
             if prev['+di'] <= prev['-di'] and last['+di'] > last['-di']:
                 sl = self.calculate_stop_loss(last['close'], "BUY", 0.5)
                 target = self.calculate_target(last['close'], sl, 1.5)
-                signals.append(self.format_signal(symbol, "BUY", 85, last['close'], sl, target, 1.5, "ADX crossed +DI for strong uptrend", {}))
+                signals.append(self.format_signal(symbol, "BUY", 85, last['close'], sl, target, round(abs(target-entry)/abs(entry-sl), 2) if entry != sl else 0, "ADX crossed +DI for strong uptrend", {}))
             elif prev['-di'] <= prev['+di'] and last['-di'] > last['+di']:
                 sl = self.calculate_stop_loss(last['close'], "SELL", 0.5)
                 target = self.calculate_target(last['close'], sl, 1.5)
-                signals.append(self.format_signal(symbol, "SELL", 85, last['close'], sl, target, 1.5, "ADX crossed -DI for strong downtrend", {}))
+                signals.append(self.format_signal(symbol, "SELL", 85, last['close'], sl, target, round(abs(target-entry)/abs(entry-sl), 2) if entry != sl else 0, "ADX crossed -DI for strong downtrend", {}))
         return signals

@@ -30,11 +30,11 @@ class BollingerBreakoutStrategy(BaseStrategy):
         # BUY Condition (Breakout above upper band)
         if prev['close'] <= prev['bb_high'] and last['close'] > last['bb_high'] and vol_confirmed:
             entry = last['close']
-            sl = self.calculate_stop_loss(entry, "BUY", 0.8)
-            target = self.calculate_target(entry, sl, 2.0)
+            sl = self.calculate_stop_loss(entry, "BUY")
+            target = self.calculate_target(entry, sl)
             
             signals.append(self.format_signal(
-                tradingsymbol, "BUY", 80, entry, sl, target, 2.0,
+                tradingsymbol, "BUY", 80, entry, sl, target, round(abs(target-entry)/abs(entry-sl), 2) if entry != sl else 0,
                 "Bollinger upper band breakout with volume spike",
                 {"bb_high": last['bb_high']}
             ))
@@ -42,11 +42,11 @@ class BollingerBreakoutStrategy(BaseStrategy):
         # SELL Condition (Breakdown below lower band)
         elif prev['close'] >= prev['bb_low'] and last['close'] < last['bb_low'] and vol_confirmed:
             entry = last['close']
-            sl = self.calculate_stop_loss(entry, "SELL", 0.8)
-            target = self.calculate_target(entry, sl, 2.0)
+            sl = self.calculate_stop_loss(entry, "SELL")
+            target = self.calculate_target(entry, sl)
             
             signals.append(self.format_signal(
-                tradingsymbol, "SELL", 80, entry, sl, target, 2.0,
+                tradingsymbol, "SELL", 80, entry, sl, target, round(abs(target-entry)/abs(entry-sl), 2) if entry != sl else 0,
                 "Bollinger lower band breakdown with volume spike",
                 {"bb_low": last['bb_low']}
             ))

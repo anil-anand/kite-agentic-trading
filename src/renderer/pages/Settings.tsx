@@ -89,6 +89,26 @@ const Settings: React.FC = () => {
                   className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white focus:border-accent-light outline-none" 
                 />
               </div>
+              <div>
+                <label className="block text-surface-400 text-sm mb-1">Default Stop Loss (%)</label>
+                <input 
+                  type="number" 
+                  step="0.1"
+                  value={localSettings.risk?.defaultStopLossPercent || ''} 
+                  onChange={(e) => handleRiskChange('defaultStopLossPercent', e.target.value)}
+                  className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white focus:border-accent-light outline-none" 
+                />
+              </div>
+              <div>
+                <label className="block text-surface-400 text-sm mb-1">Default Target (%)</label>
+                <input 
+                  type="number" 
+                  step="0.1"
+                  value={localSettings.risk?.defaultTargetPercent || ''} 
+                  onChange={(e) => handleRiskChange('defaultTargetPercent', e.target.value)}
+                  className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white focus:border-accent-light outline-none" 
+                />
+              </div>
             </div>
           </section>
         </div>

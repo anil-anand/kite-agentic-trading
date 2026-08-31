@@ -17,9 +17,9 @@ class TSICrossStrategy(BaseStrategy):
         if prev['tsi'] < 0 and last['tsi'] >= 0:
             sl = self.calculate_stop_loss(last['close'], "BUY", 0.8)
             target = self.calculate_target(last['close'], sl, 1.5)
-            signals.append(self.format_signal(symbol, "BUY", 76, last['close'], sl, target, 1.5, "TSI crossed above zero line", {}))
+            signals.append(self.format_signal(symbol, "BUY", 76, last['close'], sl, target, round(abs(target-entry)/abs(entry-sl), 2) if entry != sl else 0, "TSI crossed above zero line", {}))
         elif prev['tsi'] > 0 and last['tsi'] <= 0:
             sl = self.calculate_stop_loss(last['close'], "SELL", 0.8)
             target = self.calculate_target(last['close'], sl, 1.5)
-            signals.append(self.format_signal(symbol, "SELL", 76, last['close'], sl, target, 1.5, "TSI crossed below zero line", {}))
+            signals.append(self.format_signal(symbol, "SELL", 76, last['close'], sl, target, round(abs(target-entry)/abs(entry-sl), 2) if entry != sl else 0, "TSI crossed below zero line", {}))
         return signals

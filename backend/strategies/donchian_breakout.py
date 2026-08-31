@@ -18,9 +18,9 @@ class DonchianBreakoutStrategy(BaseStrategy):
         if last['close'] > prev['dc_high']:
             sl = self.calculate_stop_loss(last['close'], "BUY", 0.5)
             target = self.calculate_target(last['close'], sl, 2.0)
-            signals.append(self.format_signal(symbol, "BUY", 75, last['close'], sl, target, 2.0, "Price broke 20-period Donchian high", {}))
+            signals.append(self.format_signal(symbol, "BUY", 75, last['close'], sl, target, round(abs(target-entry)/abs(entry-sl), 2) if entry != sl else 0, "Price broke 20-period Donchian high", {}))
         elif last['close'] < prev['dc_low']:
             sl = self.calculate_stop_loss(last['close'], "SELL", 0.5)
             target = self.calculate_target(last['close'], sl, 2.0)
-            signals.append(self.format_signal(symbol, "SELL", 75, last['close'], sl, target, 2.0, "Price broke 20-period Donchian low", {}))
+            signals.append(self.format_signal(symbol, "SELL", 75, last['close'], sl, target, round(abs(target-entry)/abs(entry-sl), 2) if entry != sl else 0, "Price broke 20-period Donchian low", {}))
         return signals
