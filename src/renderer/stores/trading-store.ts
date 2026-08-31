@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { persist } from 'zustand/middleware';
 import {
   AuthState, Position, Order, Holding, Margins, AgentState,
   Signal, ActivityLogEntry, WatchlistItem, Tick, AppSettings, DashboardSummary
@@ -37,63 +38,81 @@ interface TradingState {
   setConnectionStatus: (status: 'connected' | 'disconnected' | 'connecting') => void;
 }
 
-export const useTradingStore = create<TradingState>((set) => ({
-  auth: { isLoggedIn: false, credentials: null, loginUrl: null, error: null },
-  positions: [],
-  orders: [],
-  holdings: [],
-  margins: null,
-  agentState: {
-    running: false,
-    mode: 'confirm',
-    enabledStrategies: [],
-    tradesToday: 0,
-    signalsGenerated: 0,
-    currentPnl: 0,
-    maxDrawdownToday: 0,
-    lastScanTime: null,
-    status: 'idle',
-    statusMessage: ''
-  },
-  signals: [],
-  activityLog: [],
-  watchlist: [],
-  ticks: {},
-  settings: null,
-  dashboard: null,
-  connectionStatus: 'disconnected',
+export const useTradingStore = create<TradingState>()(
+  persist(
+    (set) => ({
+      auth: { isLoggedIn: false, credentials: null, loginUrl: null, error: null },
+      positions: [],
+      orders: [],
+      holdings: [],
+      margins: null,
+      agentState: {
+        running: false,
+        mode: 'confirm',
+        enabledStrategies: [],
+        tradesToday: 0,
+        signalsGenerated: 0,
+        currentPnl: 0,
+        maxDrawdownToday: 0,
+        lastScanTime: null,
+        status: 'idle',
+        statusMessage: ''
+      },
+      signals: [],
+      activityLog: [],
+      watchlist: [],
+      ticks: {},
+      settings: null,
+      dashboard: null,
+      connectionStatus: 'disconnected',
 
-  setAuth: (auth) => set((state) => ({ auth: { ...state.auth, ...auth } })),
-  setPositions: (positions) => set({ positions }),
-  setOrders: (orders) => set({ orders }),
-  setHoldings: (holdings) => set({ holdings }),
-  setMargins: (margins) => set({ margins }),
-  setAgentState: (agentState) => set((state) => ({ agentState: { ...state.agentState, ...agentState } })),
-  setSignals: (signals) => set({ signals }),
-  addSignal: (signal) => set((state) => {
-    // Prevent duplicate signals from same strategy on same symbol
-    const existingIdx = state.signals.findIndex(
-      s => s.tradingsymbol === signal.tradingsymbol && s.strategy === signal.strategy
-    );
-    
-    let newSignals = [...state.signals];
-    if (existingIdx >= 0) {
-      newSignals[existingIdx] = signal; // Update existing
-    } else {
-      newSignals = [signal, ...state.signals]; // Prepend new
+      setAuth: (auth) => set((state) => ({ auth: { ...state.auth, ...auth } })),
+      setPositions: (positions) => set({ positions }),
+      setOrders: (orders) => set({ orders }),
+      setHoldings: (holdings) => set({ holdings }),
+      setMargins: (margins) => set({ margins }),
+      setAgentState: (agentState) => set((state) => ({ agentState: { ...state.agentState, ...agentState } })),
+      setSignals: (signals) => set({ signals }),
+      addSignal: (signal) => set((state) => {
+        // Prevent duplicate signals from same strategy on same symbol
+        const existingIdx = state.signals.findIndex(
+          s => s.tradingsymbol === signal.tradingsymbol && s.strategy === signal.strategy
+        );
+        
+        let newSignals = [...state.signals];
+        if (existingIdx >= 0) {
+          newSignals[existingIdx] = signal; // Update existing
+        } else {
+          newSignals = [signal, ...state.signals]; // Prepend new
+        }
+        
+        // Keep max 50 signals in memory
+        return { signals: newSignals.slice(0, 50) };
+      }),
+      removeSignal: (id) => set((state) => ({
+        signals: state.signals.filter(s => s.id !== id)
+      })),
+      setActivityLog: (activityLog) => set({ activityLog }),
+      addLogEntry: (entry) => set((state) => ({ activityLog: [entry, ...state.activityLog] })),
+      setWatchlist: (watchlist) => set({ watchlist }),
+      updateTick: (symbol, tick) => set((state) => ({ ticks: { ...state.ticks, [symbol]: tick } })),
+      setSettings: (settings) => set({ settings }),
+      setDashboard: (dashboard) => set({ dashboard }),
+      setConnectionStatus: (status) => set({ connectionStatus: status })
+    }),
+    {
+      name: 'kite-trading-storage',
+      partialize: (state) => ({
+        activityLog: state.activityLog,
+        signals: state.signals,
+        watchlist: state.watchlist,
+        agentState: {
+          ...state.agentState,
+          running: false,
+          status: 'idle',
+          statusMessage: ''
+        }
+      }),
     }
-    
-    // Keep max 50 signals in memory
-    return { signals: newSignals.slice(0, 50) };
-  }),
-  removeSignal: (id) => set((state) => ({
-    signals: state.signals.filter(s => s.id !== id)
-  })),
-  setActivityLog: (activityLog) => set({ activityLog }),
-  addLogEntry: (entry) => set((state) => ({ activityLog: [entry, ...state.activityLog] })),
-  setWatchlist: (watchlist) => set({ watchlist }),
-  updateTick: (symbol, tick) => set((state) => ({ ticks: { ...state.ticks, [symbol]: tick } })),
-  setSettings: (settings) => set({ settings }),
-  setDashboard: (dashboard) => set({ dashboard }),
-  setConnectionStatus: (status) => set({ connectionStatus: status })
-}));
+  )
+);
