@@ -6,7 +6,7 @@ import base64
 
 class ConfigManager:
     def __init__(self):
-        self.config_dir = Path(__file__).parent.parent / ".data"
+        self.config_dir = Path.home() / ".kite-agentic-trading"
         self.config_file = self.config_dir / "config.json"
         self.key_file = self.config_dir / ".key"
         self.config = {}

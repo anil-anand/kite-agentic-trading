@@ -103,9 +103,11 @@ export const useTradingStore = create<TradingState>()(
     {
       name: 'kite-trading-storage',
       partialize: (state) => ({
+        auth: state.auth,
         activityLog: state.activityLog,
         signals: state.signals,
         watchlist: state.watchlist,
+        settings: state.settings,
         agentState: {
           ...state.agentState,
           running: false,
