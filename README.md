@@ -66,12 +66,19 @@ On your first launch, navigate to the **Settings** tab to enter your Kite API Ke
 
 ## 🏗️ Building for Production
 
-To package the application into a standalone executable (e.g., a `.dmg` for macOS or `.exe` for Windows):
+To create a standalone executable (e.g., a `.dmg` for macOS or `.exe` for Windows), there is a two-step process:
 
-```bash
-npm run build
-```
-The compiled binaries will be available in the `dist/` or `release/` directory.
+1. **Compile the source code** (TypeScript to JavaScript):
+   ```bash
+   npm run build
+   ```
+
+2. **Package the application** (Creates the `.dmg` / installer):
+   ```bash
+   npm run dist
+   ```
+
+The final compiled installer files will be available in the `release/` directory.
 
 ## ⚠️ Disclaimer
 
