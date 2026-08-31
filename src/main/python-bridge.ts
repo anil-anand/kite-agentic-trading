@@ -16,16 +16,20 @@ class PythonBridge {
 
   constructor() {
     const isPackaged = app.isPackaged;
-    // In dev mode, __dirname is dist/main/main, so go up 3 levels to project root
-    const basePath = isPackaged 
-      ? path.join(process.resourcesPath, '..') 
-      : path.join(__dirname, '..', '..', '..');
     
-    // In dev mode, use the venv Python; in production, use bundled/system Python
-    const venvPython = path.join(basePath, 'venv', 'bin', 'python3');
-    const fs = require('fs');
-    this.pythonPath = (!isPackaged && fs.existsSync(venvPython)) ? venvPython : 'python3';
-    this.scriptPath = path.join(basePath, 'backend', 'main.py');
+    if (isPackaged) {
+      // In production, use the PyInstaller standalone binary located in extraResources
+      const platformBinary = process.platform === 'win32' ? 'kite_agent_backend.exe' : 'kite_agent_backend';
+      this.pythonPath = path.join(process.resourcesPath, 'backend_dist', platformBinary);
+      this.scriptPath = ''; // Not needed for binary
+    } else {
+      // In dev mode, use the venv Python and raw script
+      const basePath = path.join(__dirname, '..', '..', '..');
+      const venvPython = path.join(basePath, 'venv', 'bin', 'python3');
+      const fs = require('fs');
+      this.pythonPath = fs.existsSync(venvPython) ? venvPython : 'python3';
+      this.scriptPath = path.join(basePath, 'backend', 'main.py');
+    }
   }
 
   public start(): void {
@@ -33,9 +37,13 @@ class PythonBridge {
 
     this.isShuttingDown = false;
     
-    console.log(`Starting Python backend at ${this.scriptPath}`);
-    
-    this.childProcess = spawn(this.pythonPath, ['-m', 'backend.main'], { cwd: path.dirname(path.dirname(this.scriptPath)) });
+    if (app.isPackaged) {
+      console.log(`Starting Python backend binary at ${this.pythonPath}`);
+      this.childProcess = spawn(this.pythonPath, [], { cwd: path.dirname(this.pythonPath) });
+    } else {
+      console.log(`Starting Python backend script at ${this.scriptPath}`);
+      this.childProcess = spawn(this.pythonPath, ['-m', 'backend.main'], { cwd: path.dirname(path.dirname(this.scriptPath)) });
+    }
 
     this.childProcess.stdout?.on('data', (data) => {
       const lines = data.toString().split('\n');

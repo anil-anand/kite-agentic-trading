@@ -13,9 +13,10 @@
     "build": "npm run build:main && npm run build:renderer",
     "build:main": "tsc -p tsconfig.main.json",
     "build:renderer": "vite build",
+    "build:python": "source venv/bin/activate && pyinstaller --name kite_agent_backend --distpath backend_dist --onefile backend/main.py",
     "start": "electron dist/main/main/index.js",
     "pack": "electron-builder --dir",
-    "dist": "electron-builder",
+    "dist": "npm run build && npm run build:python && electron-builder",
     "lint": "eslint src/ --ext .ts,.tsx",
     "typecheck": "tsc --noEmit"
   },

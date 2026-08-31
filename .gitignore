@@ -37,3 +37,8 @@ logs/
 
 # Local Data
 .data/
+
+# PyInstaller
+build/
+backend_dist/
+*.spec

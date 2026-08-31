@@ -10,8 +10,8 @@ files:
   - node_modules/**/*
   - package.json
 extraResources:
-  - from: backend/
-    to: backend/
+  - from: backend_dist/
+    to: backend_dist/
     filter:
       - "**/*"
 mac:
