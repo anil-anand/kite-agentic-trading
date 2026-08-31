@@ -1,0 +1,34 @@
+appId: com.kite-agentic-trading.app
+productName: Kite Agentic Trading
+copyright: Copyright © 2026
+directories:
+  output: release
+  buildResources: build
+files:
+  - dist/**/*
+  - backend/**/*
+  - node_modules/**/*
+  - package.json
+extraResources:
+  - from: backend/
+    to: backend/
+    filter:
+      - "**/*"
+mac:
+  category: public.app-category.finance
+  target:
+    - dmg
+    - zip
+  darkModeSupport: true
+win:
+  target:
+    - nsis
+    - portable
+linux:
+  target:
+    - AppImage
+    - deb
+  category: Finance
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true

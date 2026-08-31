@@ -1,0 +1,38 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply bg-surface-700 rounded-full;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-surface-500;
+  }
+  
+  body {
+    @apply bg-surface-950 text-white font-sans;
+  }
+}
+
+@layer utilities {
+  .text-profit {
+    @apply text-profit-light;
+  }
+  .text-loss {
+    @apply text-loss-light;
+  }
+  .bg-profit-fade {
+    @apply bg-profit-light/10 text-profit-light;
+  }
+  .bg-loss-fade {
+    @apply bg-loss-light/10 text-loss-light;
+  }
+}

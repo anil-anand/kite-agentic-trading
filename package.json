@@ -1,0 +1,45 @@
+{
+  "name": "kite-agentic-trading",
+  "version": "1.0.0",
+  "description": "Agentic intraday trading desktop app for Zerodha Kite",
+  "main": "dist/main/main/index.js",
+  "author": "Anil Anand",
+  "license": "MIT",
+  "scripts": {
+    "dev": "concurrently \"npm run dev:renderer\" \"wait-on http://localhost:5173 && tsc -p tsconfig.main.json && electron dist/main/main/index.js\"",
+    "dev:watch": "concurrently \"npm run dev:main\" \"npm run dev:renderer\"",
+    "dev:main": "tsc -p tsconfig.main.json --watch",
+    "dev:renderer": "vite",
+    "build": "npm run build:main && npm run build:renderer",
+    "build:main": "tsc -p tsconfig.main.json",
+    "build:renderer": "vite build",
+    "start": "electron dist/main/main/index.js",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder",
+    "lint": "eslint src/ --ext .ts,.tsx",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "lightweight-charts": "^4.2.1",
+    "lucide-react": "^0.460.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.28.0",
+    "zustand": "^5.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "autoprefixer": "^10.4.20",
+    "concurrently": "^9.1.0",
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8",
+    "eslint": "^9.15.0",
+    "postcss": "^8.4.49",
+    "tailwindcss": "^3.4.15",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.1",
+    "wait-on": "^8.0.1"
+  }
+}
