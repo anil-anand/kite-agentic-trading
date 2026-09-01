@@ -49,11 +49,18 @@ class KiteClient:
         return convert_keys(res)
         
     def get_orders(self) -> List[Dict[str, Any]]:
+        from .config import config_manager
         res = self.kite.orders() if self.kite else []
+        app_orders = config_manager.get_app_order_ids()
+        for o in res:
+            o["is_app_order"] = (str(o.get("order_id")) in app_orders)
         return convert_keys(res)
         
     def place_order(self, variety, exchange, tradingsymbol, transaction_type, quantity, product, order_type, price=None, validity=None, validity_ttl=None, disclosed_quantity=None, trigger_price=None, squareoff=None, stoploss=None, trailing_stoploss=None, tag=None) -> str:
-        return self.kite.place_order(variety, exchange, tradingsymbol, transaction_type, quantity, product, order_type, price, validity, validity_ttl, disclosed_quantity, trigger_price, squareoff, stoploss, trailing_stoploss, tag)
+        from .config import config_manager
+        order_id = self.kite.place_order(variety, exchange, tradingsymbol, transaction_type, quantity, product, order_type, price, validity, validity_ttl, disclosed_quantity, trigger_price, squareoff, stoploss, trailing_stoploss, tag)
+        config_manager.add_app_order_id(order_id)
+        return order_id
         
     def cancel_order(self, variety, order_id, parent_order_id=None):
         return self.kite.cancel_order(variety, order_id, parent_order_id)

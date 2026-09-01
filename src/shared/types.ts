@@ -98,6 +98,7 @@ export interface OrderRequest {
 
 export interface Order {
   orderId: string;
+  isAppOrder?: boolean;
   tradingsymbol: string;
   exchange: string;
   transactionType: TransactionType;

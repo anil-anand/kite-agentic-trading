@@ -53,15 +53,30 @@ const Orders: React.FC = () => {
                 </tr>
               </thead>
               <tbody>
-                {orders.length === 0 ? (
+                {orders.filter(o => {
+                  if (tab === 'open') return o.status === 'OPEN' || o.status.includes('PENDING');
+                  if (tab === 'executed') return o.status === 'COMPLETE' || o.status === 'REJECTED' || o.status === 'CANCELLED';
+                  return true;
+                }).length === 0 ? (
                   <tr>
                     <td colSpan={7} className="px-6 py-8 text-center text-surface-400">No orders found.</td>
                   </tr>
                 ) : (
-                  orders.map(o => (
+                  orders.filter(o => {
+                    if (tab === 'open') return o.status === 'OPEN' || o.status.includes('PENDING');
+                    if (tab === 'executed') return o.status === 'COMPLETE' || o.status === 'REJECTED' || o.status === 'CANCELLED';
+                    return true;
+                  }).map(o => (
                     <tr key={o.orderId} className="border-b border-surface-700 hover:bg-surface-700/50">
                       <td className="px-6 py-4">{new Date(o.orderTimestamp).toLocaleTimeString()}</td>
-                      <td className="px-6 py-4 font-bold text-white">{o.tradingsymbol}</td>
+                      <td className="px-6 py-4 font-bold text-white">
+                        {o.tradingsymbol}
+                        {o.isAppOrder && (
+                          <span className="ml-2 inline-flex items-center px-2 py-0.5 rounded text-[10px] font-bold bg-accent-dark/30 text-accent-light border border-accent-dark">
+                            AGENT
+                          </span>
+                        )}
+                      </td>
                       <td className={`px-6 py-4 font-bold ${o.transactionType === 'BUY' ? 'text-profit-light' : 'text-loss-light'}`}>{o.transactionType}</td>
                       <td className="px-6 py-4 font-mono">{o.quantity}</td>
                       <td className="px-6 py-4 font-mono">₹{o.price || o.averagePrice || 0}</td>

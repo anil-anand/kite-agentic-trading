@@ -128,5 +128,23 @@ class ConfigManager:
         
     def get_watchlist(self):
         return self.config.get("watchlist", self.default_config["watchlist"])
+        
+    def get_app_order_ids(self) -> set:
+        path = self.config_dir / "app_orders.json"
+        if path.exists():
+            try:
+                with open(path, "r") as f:
+                    return set(json.load(f))
+            except:
+                return set()
+        return set()
+        
+    def add_app_order_id(self, order_id: str):
+        if not order_id: return
+        orders = self.get_app_order_ids()
+        orders.add(str(order_id))
+        path = self.config_dir / "app_orders.json"
+        with open(path, "w") as f:
+            json.dump(list(orders), f)
 
 config_manager = ConfigManager()
