@@ -42,6 +42,7 @@ export const useKiteAPI = () => {
         const authStat = await window.electronAPI?.invoke(IPC.AUTH_STATUS);
         if (authStat !== undefined) {
           store.setAuth({ isLoggedIn: authStat === true });
+          store.setConnectionStatus(authStat === true ? 'connected' : 'disconnected');
         }
         const agentStat = await window.electronAPI?.invoke(IPC.AGENT_STATUS);
         if (agentStat) {
@@ -79,6 +80,7 @@ export const useKiteAPI = () => {
   const logout = async () => {
     await window.electronAPI?.invoke(IPC.AUTH_LOGOUT);
     store.setAuth({ isLoggedIn: false });
+    store.setConnectionStatus('disconnected');
   };
 
   const placeOrder = async (order: OrderRequest) => {
