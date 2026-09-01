@@ -51,7 +51,14 @@ const Dashboard: React.FC = () => {
       <h1 className="text-2xl font-bold text-white">Dashboard</h1>
       
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-        <PnLDisplay amount={dashboard?.totalPnl || 0} percentage={2.5} />
+        <PnLDisplay 
+          amount={dashboard?.totalPnl || 0} 
+          percentage={
+            ((dashboard?.availableMargin || 0) + (dashboard?.usedMargin || 0)) > 0 
+              ? ((dashboard?.totalPnl || 0) / ((dashboard?.availableMargin || 0) + (dashboard?.usedMargin || 0))) * 100 
+              : undefined
+          } 
+        />
         
         <div className="bg-surface-800 p-4 rounded-xl border border-surface-700 flex flex-col justify-center">
           <span className="text-surface-400 text-sm mb-1">Trades Taken</span>
@@ -65,7 +72,7 @@ const Dashboard: React.FC = () => {
         
         <div className="bg-surface-800 p-4 rounded-xl border border-surface-700 flex flex-col justify-center">
           <span className="text-surface-400 text-sm mb-1">Available Margin</span>
-          <span className="text-3xl font-mono text-white font-bold">₹{dashboard?.availableMargin || 0}</span>
+          <span className="text-3xl font-mono text-white font-bold">₹{(dashboard?.availableMargin || 0).toFixed(2)}</span>
         </div>
       </div>
 

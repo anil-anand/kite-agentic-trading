@@ -144,9 +144,20 @@ def handle_request(req):
             available_margin = equity_margin.get("available", {}).get("live_balance", 0)
             if not available_margin:
                 available_margin = equity_margin.get("net", 0)
-                
+            
             positions = kite_client.get_positions().get("net", [])
             total_pnl = sum(p.get("pnl", p.get("m2m", 0)) for p in positions)
+            
+            calculated_used_margin = 0
+            for p in positions:
+                if p.get("quantity", 0) != 0:
+                    multiplier = 0.2 if p.get("product") == "MIS" else 1.0
+                    avg_price = p.get("averagePrice", 0)
+                    if avg_price == 0:
+                        avg_price = p.get("buyPrice", 0) if p.get("quantity", 0) > 0 else p.get("sellPrice", 0)
+                    calculated_used_margin += abs(p.get("quantity", 0)) * avg_price * multiplier
+            
+            used_margin = calculated_used_margin
             
             # Count trades and win rate based on realized positions (quantity == 0) and open positions
             trades_today = len(positions)
@@ -157,7 +168,8 @@ def handle_request(req):
                 "totalPnl": round(total_pnl, 2),
                 "tradesToday": trades_today,
                 "winRate": round(win_rate, 2),
-                "availableMargin": available_margin
+                "availableMargin": available_margin,
+                "usedMargin": used_margin
             }
             return success(summary)
             
