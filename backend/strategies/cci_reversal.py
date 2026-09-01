@@ -17,9 +17,9 @@ class CCIReversalStrategy(BaseStrategy):
         if prev['cci'] < -100 and last['cci'] >= -100:
             sl = self.calculate_stop_loss(last['close'], "BUY", 0.8)
             target = self.calculate_target(last['close'], sl, 1.5)
-            signals.append(self.format_signal(symbol, "BUY", 72, last['close'], sl, target, round(abs(target-entry)/abs(entry-sl), 2) if entry != sl else 0, "CCI crossed above -100 (Oversold reversal)", {}))
+            signals.append(self.format_signal(symbol, "BUY", 72, last['close'], sl, target, round(abs(target-last['close'])/abs(last['close']-sl), 2) if last['close'] != sl else 0, "CCI crossed above -100 (Oversold reversal)", {}))
         elif prev['cci'] > 100 and last['cci'] <= 100:
             sl = self.calculate_stop_loss(last['close'], "SELL", 0.8)
             target = self.calculate_target(last['close'], sl, 1.5)
-            signals.append(self.format_signal(symbol, "SELL", 72, last['close'], sl, target, round(abs(target-entry)/abs(entry-sl), 2) if entry != sl else 0, "CCI crossed below 100 (Overbought reversal)", {}))
+            signals.append(self.format_signal(symbol, "SELL", 72, last['close'], sl, target, round(abs(target-last['close'])/abs(last['close']-sl), 2) if last['close'] != sl else 0, "CCI crossed below 100 (Overbought reversal)", {}))
         return signals

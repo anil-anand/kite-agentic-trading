@@ -66,7 +66,7 @@ class SupertrendStrategy(BaseStrategy):
                 confidence = min(100, int(70 + (last['adx'] - 25)))
                 
                 signals.append(self.format_signal(
-                    tradingsymbol, "BUY", confidence, entry, sl, target, round(abs(target-entry)/abs(entry-sl), 2) if entry != sl else 0,
+                    tradingsymbol, "BUY", confidence, entry, sl, target, round(abs(target-last['close'])/abs(last['close']-sl), 2) if last['close'] != sl else 0,
                     f"Supertrend turned bullish, ADX {last['adx']:.1f}",
                     {"adx": last['adx'], "lowerband": last['lowerband']}
                 ))
@@ -80,7 +80,7 @@ class SupertrendStrategy(BaseStrategy):
                 confidence = min(100, int(70 + (last['adx'] - 25)))
                 
                 signals.append(self.format_signal(
-                    tradingsymbol, "SELL", confidence, entry, sl, target, round(abs(target-entry)/abs(entry-sl), 2) if entry != sl else 0,
+                    tradingsymbol, "SELL", confidence, entry, sl, target, round(abs(target-last['close'])/abs(last['close']-sl), 2) if last['close'] != sl else 0,
                     f"Supertrend turned bearish, ADX {last['adx']:.1f}",
                     {"adx": last['adx'], "upperband": last['upperband']}
                 ))

@@ -19,9 +19,9 @@ class PSARTrendStrategy(BaseStrategy):
         if pd.isna(prev['psar_up']) and not pd.isna(last['psar_up']):
             sl = last['psar_up']
             target = self.calculate_target(last['close'], sl, 1.5)
-            signals.append(self.format_signal(symbol, "BUY", 80, last['close'], sl, target, round(abs(target-entry)/abs(entry-sl), 2) if entry != sl else 0, "PSAR flipped below price", {}))
+            signals.append(self.format_signal(symbol, "BUY", 80, last['close'], sl, target, round(abs(target-last['close'])/abs(last['close']-sl), 2) if last['close'] != sl else 0, "PSAR flipped below price", {}))
         elif pd.isna(prev['psar_down']) and not pd.isna(last['psar_down']):
             sl = last['psar_down']
             target = self.calculate_target(last['close'], sl, 1.5)
-            signals.append(self.format_signal(symbol, "SELL", 80, last['close'], sl, target, round(abs(target-entry)/abs(entry-sl), 2) if entry != sl else 0, "PSAR flipped above price", {}))
+            signals.append(self.format_signal(symbol, "SELL", 80, last['close'], sl, target, round(abs(target-last['close'])/abs(last['close']-sl), 2) if last['close'] != sl else 0, "PSAR flipped above price", {}))
         return signals

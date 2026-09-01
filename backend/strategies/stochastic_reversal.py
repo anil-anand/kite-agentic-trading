@@ -31,7 +31,7 @@ class StochasticReversalStrategy(BaseStrategy):
             target = self.calculate_target(entry, sl)
             
             signals.append(self.format_signal(
-                tradingsymbol, "BUY", 75, entry, sl, target, round(abs(target-entry)/abs(entry-sl), 2) if entry != sl else 0,
+                tradingsymbol, "BUY", 75, entry, sl, target, round(abs(target-last['close'])/abs(last['close']-sl), 2) if last['close'] != sl else 0,
                 "Stochastic bullish crossover in oversold region",
                 {"stoch_k": last['stoch_k'], "stoch_d": last['stoch_d']}
             ))
@@ -43,7 +43,7 @@ class StochasticReversalStrategy(BaseStrategy):
             target = self.calculate_target(entry, sl)
             
             signals.append(self.format_signal(
-                tradingsymbol, "SELL", 75, entry, sl, target, round(abs(target-entry)/abs(entry-sl), 2) if entry != sl else 0,
+                tradingsymbol, "SELL", 75, entry, sl, target, round(abs(target-last['close'])/abs(last['close']-sl), 2) if last['close'] != sl else 0,
                 "Stochastic bearish crossover in overbought region",
                 {"stoch_k": last['stoch_k'], "stoch_d": last['stoch_d']}
             ))

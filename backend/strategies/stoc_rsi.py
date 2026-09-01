@@ -18,9 +18,9 @@ class StochRSIStrategy(BaseStrategy):
         if prev['srsi_k'] < 0.20 and last['srsi_k'] >= 0.20 and last['srsi_k'] > last['srsi_d']:
             sl = self.calculate_stop_loss(last['close'], "BUY", 0.5)
             target = self.calculate_target(last['close'], sl, 1.2)
-            signals.append(self.format_signal(symbol, "BUY", 77, last['close'], sl, target, round(abs(target-entry)/abs(entry-sl), 2) if entry != sl else 0, "StochRSI K crossed above 0.20", {}))
+            signals.append(self.format_signal(symbol, "BUY", 77, last['close'], sl, target, round(abs(target-last['close'])/abs(last['close']-sl), 2) if last['close'] != sl else 0, "StochRSI K crossed above 0.20", {}))
         elif prev['srsi_k'] > 0.80 and last['srsi_k'] <= 0.80 and last['srsi_k'] < last['srsi_d']:
             sl = self.calculate_stop_loss(last['close'], "SELL", 0.5)
             target = self.calculate_target(last['close'], sl, 1.2)
-            signals.append(self.format_signal(symbol, "SELL", 77, last['close'], sl, target, round(abs(target-entry)/abs(entry-sl), 2) if entry != sl else 0, "StochRSI K crossed below 0.80", {}))
+            signals.append(self.format_signal(symbol, "SELL", 77, last['close'], sl, target, round(abs(target-last['close'])/abs(last['close']-sl), 2) if last['close'] != sl else 0, "StochRSI K crossed below 0.80", {}))
         return signals

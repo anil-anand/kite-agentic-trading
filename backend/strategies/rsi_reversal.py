@@ -39,7 +39,7 @@ class RSIReversalStrategy(BaseStrategy):
             confidence = min(100, max(50, confidence))
             
             signals.append(self.format_signal(
-                tradingsymbol, "BUY", confidence, entry, sl, target, round(abs(target-entry)/abs(entry-sl), 2) if entry != sl else 0,
+                tradingsymbol, "BUY", confidence, entry, sl, target, round(abs(target-last['close'])/abs(last['close']-sl), 2) if last['close'] != sl else 0,
                 f"RSI crossed above 30 from {prev['rsi']:.1f}, price above VWAP",
                 {"rsi": last['rsi'], "vwap": last['vwap']}
             ))
@@ -54,7 +54,7 @@ class RSIReversalStrategy(BaseStrategy):
             confidence = min(100, max(50, confidence))
             
             signals.append(self.format_signal(
-                tradingsymbol, "SELL", confidence, entry, sl, target, round(abs(target-entry)/abs(entry-sl), 2) if entry != sl else 0,
+                tradingsymbol, "SELL", confidence, entry, sl, target, round(abs(target-last['close'])/abs(last['close']-sl), 2) if last['close'] != sl else 0,
                 f"RSI crossed below 70 from {prev['rsi']:.1f}, price below VWAP",
                 {"rsi": last['rsi'], "vwap": last['vwap']}
             ))

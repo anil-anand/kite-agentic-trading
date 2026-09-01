@@ -62,6 +62,9 @@ class Scanner:
                 return pd.DataFrame(), False
                 
             df = pd.DataFrame(records)
+            for col in ['open', 'high', 'low', 'close']:
+                if col in df.columns:
+                    df[col] = df[col].astype(float)
             self.candle_cache[instrument_token] = df
             self.last_cache_time[instrument_token] = now
             return df, False

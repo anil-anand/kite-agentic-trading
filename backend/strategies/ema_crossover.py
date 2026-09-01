@@ -42,7 +42,7 @@ class EMACrossoverStrategy(BaseStrategy):
             confidence = min(100, int(60 + (vol_ratio * 10)))
             
             signals.append(self.format_signal(
-                tradingsymbol, "BUY", confidence, entry, sl, target, round(abs(target-entry)/abs(entry-sl), 2) if entry != sl else 0,
+                tradingsymbol, "BUY", confidence, entry, sl, target, round(abs(target-last['close'])/abs(last['close']-sl), 2) if last['close'] != sl else 0,
                 f"EMA 9 crossed above EMA 21 with volume ratio {vol_ratio:.2f}x",
                 {"fast_ema": last['fast_ema'], "slow_ema": last['slow_ema'], "vol_sma": last['vol_sma']}
             ))
@@ -57,7 +57,7 @@ class EMACrossoverStrategy(BaseStrategy):
             confidence = min(100, int(60 + (vol_ratio * 10)))
             
             signals.append(self.format_signal(
-                tradingsymbol, "SELL", confidence, entry, sl, target, round(abs(target-entry)/abs(entry-sl), 2) if entry != sl else 0,
+                tradingsymbol, "SELL", confidence, entry, sl, target, round(abs(target-last['close'])/abs(last['close']-sl), 2) if last['close'] != sl else 0,
                 f"EMA 9 crossed below EMA 21 with volume ratio {vol_ratio:.2f}x",
                 {"fast_ema": last['fast_ema'], "slow_ema": last['slow_ema'], "vol_sma": last['vol_sma']}
             ))

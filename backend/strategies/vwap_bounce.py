@@ -46,7 +46,7 @@ class VWAPBounceStrategy(BaseStrategy):
                 
                 confidence = 80
                 signals.append(self.format_signal(
-                    tradingsymbol, "BUY", confidence, entry, sl, target, round(abs(target-entry)/abs(entry-sl), 2) if entry != sl else 0,
+                    tradingsymbol, "BUY", confidence, entry, sl, target, round(abs(target-last['close'])/abs(last['close']-sl), 2) if last['close'] != sl else 0,
                     f"Bullish bounce off VWAP, RSI > 40, trend aligned",
                     {"vwap": last['vwap'], "rsi": last['rsi']}
                 ))
@@ -59,7 +59,7 @@ class VWAPBounceStrategy(BaseStrategy):
                 
                 confidence = 80
                 signals.append(self.format_signal(
-                    tradingsymbol, "SELL", confidence, entry, sl, target, round(abs(target-entry)/abs(entry-sl), 2) if entry != sl else 0,
+                    tradingsymbol, "SELL", confidence, entry, sl, target, round(abs(target-last['close'])/abs(last['close']-sl), 2) if last['close'] != sl else 0,
                     f"Bearish rejection from VWAP, RSI < 60, trend aligned",
                     {"vwap": last['vwap'], "rsi": last['rsi']}
                 ))

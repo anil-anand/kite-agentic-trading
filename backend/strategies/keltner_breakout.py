@@ -18,9 +18,9 @@ class KeltnerBreakoutStrategy(BaseStrategy):
         if prev['close'] <= prev['kc_h'] and last['close'] > last['kc_h']:
             sl = self.calculate_stop_loss(last['close'], "BUY", 0.5)
             target = self.calculate_target(last['close'], sl, 2.0)
-            signals.append(self.format_signal(symbol, "BUY", 82, last['close'], sl, target, round(abs(target-entry)/abs(entry-sl), 2) if entry != sl else 0, "Broke above Upper Keltner Channel", {}))
+            signals.append(self.format_signal(symbol, "BUY", 82, last['close'], sl, target, round(abs(target-last['close'])/abs(last['close']-sl), 2) if last['close'] != sl else 0, "Broke above Upper Keltner Channel", {}))
         elif prev['close'] >= prev['kc_l'] and last['close'] < last['kc_l']:
             sl = self.calculate_stop_loss(last['close'], "SELL", 0.5)
             target = self.calculate_target(last['close'], sl, 2.0)
-            signals.append(self.format_signal(symbol, "SELL", 82, last['close'], sl, target, round(abs(target-entry)/abs(entry-sl), 2) if entry != sl else 0, "Broke below Lower Keltner Channel", {}))
+            signals.append(self.format_signal(symbol, "SELL", 82, last['close'], sl, target, round(abs(target-last['close'])/abs(last['close']-sl), 2) if last['close'] != sl else 0, "Broke below Lower Keltner Channel", {}))
         return signals

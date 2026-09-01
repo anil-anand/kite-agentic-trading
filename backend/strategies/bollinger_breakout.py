@@ -34,7 +34,7 @@ class BollingerBreakoutStrategy(BaseStrategy):
             target = self.calculate_target(entry, sl)
             
             signals.append(self.format_signal(
-                tradingsymbol, "BUY", 80, entry, sl, target, round(abs(target-entry)/abs(entry-sl), 2) if entry != sl else 0,
+                tradingsymbol, "BUY", 80, entry, sl, target, round(abs(target-last['close'])/abs(last['close']-sl), 2) if last['close'] != sl else 0,
                 "Bollinger upper band breakout with volume spike",
                 {"bb_high": last['bb_high']}
             ))
@@ -46,7 +46,7 @@ class BollingerBreakoutStrategy(BaseStrategy):
             target = self.calculate_target(entry, sl)
             
             signals.append(self.format_signal(
-                tradingsymbol, "SELL", 80, entry, sl, target, round(abs(target-entry)/abs(entry-sl), 2) if entry != sl else 0,
+                tradingsymbol, "SELL", 80, entry, sl, target, round(abs(target-last['close'])/abs(last['close']-sl), 2) if last['close'] != sl else 0,
                 "Bollinger lower band breakdown with volume spike",
                 {"bb_low": last['bb_low']}
             ))
