@@ -201,6 +201,30 @@ class TradingEngine:
             for p in positions:
                 if p["quantity"] != 0:
                     symbol = p["tradingsymbol"]
+                    
+                    # Adopt untracked positions in auto mode
+                    if symbol not in self.active_trades and self.mode == "auto":
+                        avg_price = p.get("averagePrice", 0)
+                        if avg_price > 0:
+                            direction = "BUY" if p["quantity"] > 0 else "SELL"
+                            risk_config = config_manager.get_risk_config()
+                            sl_pct = risk_config.get("defaultStopLossPercent", 1.5)
+                            tgt_pct = risk_config.get("defaultTargetPercent", 3.0)
+                            
+                            if direction == "BUY":
+                                sl = round(avg_price * (1 - sl_pct/100), 2)
+                                target = round(avg_price * (1 + tgt_pct/100), 2)
+                            else:
+                                sl = round(avg_price * (1 + sl_pct/100), 2)
+                                target = round(avg_price * (1 - tgt_pct/100), 2)
+                                
+                            self.active_trades[symbol] = {
+                                "sl": sl,
+                                "target": target,
+                                "direction": direction
+                            }
+                            self._push_log(f"Adopted open position {symbol} ({direction}) at ₹{avg_price}. Auto-calculated SL: ₹{sl}, Target: ₹{target}")
+
                     if symbol in self.active_trades:
                         trade = self.active_trades[symbol]
                         ltp = p.get("lastPrice", 0)
