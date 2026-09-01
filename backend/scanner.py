@@ -123,4 +123,42 @@ class Scanner:
         all_signals.sort(key=lambda x: x.get('confidence', 0), reverse=True)
         return all_signals
 
+    def evaluate_position(self, tradingsymbol: str, instrument_token: int) -> Dict[str, Any]:
+        """
+        Re-evaluate a single symbol against all enabled strategies.
+        Returns a directional summary for thesis invalidation checks.
+        """
+        strategy_config = config_manager.get_strategy_config()
+        
+        df, _ = self._fetch_candles(instrument_token, tradingsymbol)
+        if df.empty:
+            return {"buy_signals": 0, "sell_signals": 0, "strategies": []}
+        
+        buy_signals = 0
+        sell_signals = 0
+        triggered_strategies = []
+        
+        for strat_id, strategy in self.strategies.items():
+            config = strategy_config.get(strat_id, {})
+            if not config.get("enabled", False):
+                continue
+                
+            try:
+                signals = strategy.calculate_signals(df, tradingsymbol)
+                for sig in signals:
+                    if sig.get("direction") == "BUY":
+                        buy_signals += 1
+                        triggered_strategies.append({"strategy": strat_id, "direction": "BUY", "confidence": sig.get("confidence", 0)})
+                    elif sig.get("direction") == "SELL":
+                        sell_signals += 1
+                        triggered_strategies.append({"strategy": strat_id, "direction": "SELL", "confidence": sig.get("confidence", 0)})
+            except Exception:
+                pass  # Skip individual strategy failures silently
+        
+        return {
+            "buy_signals": buy_signals,
+            "sell_signals": sell_signals,
+            "strategies": triggered_strategies
+        }
+
 scanner = Scanner()

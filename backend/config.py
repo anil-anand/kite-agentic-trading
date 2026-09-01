@@ -20,7 +20,9 @@ class ConfigManager:
                 "autoSquareOff": True,
                 "squareOffTime": "15:15",
                 "defaultStopLossPercent": 1.5,
-                "defaultTargetPercent": 3
+                "defaultTargetPercent": 3,
+                "positionRevalWeakExitMins": 15,
+                "positionRevalBreakevenMins": 45
             },
             "strategies": {
                 "ema_crossover": {"enabled": True},

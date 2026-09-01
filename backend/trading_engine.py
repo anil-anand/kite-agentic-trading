@@ -16,7 +16,8 @@ class TradingEngine:
         self.thread = None
         self.mode = "confirm" # auto or confirm
         self.interval = 60 # seconds
-        self.active_trades = {} # tradingsymbol -> { sl, target, direction }
+        self.active_trades = {} # tradingsymbol -> { sl, target, direction, entry_price, entry_time, original_strategy }
+        self._instrument_map = {} # cached symbol -> instrument_token map
         
     def start(self, mode: str = "confirm"):
         if self.running:
@@ -105,6 +106,13 @@ class TradingEngine:
                     break
                 time.sleep(1)
                 
+    def _ensure_instrument_map(self):
+        """Cache the NSE instrument map for reuse across scan and re-evaluation."""
+        if not self._instrument_map:
+            instruments = kite_client.get_instruments("NSE")
+            self._instrument_map = {i['tradingsymbol']: i['instrument_token'] for i in instruments}
+        return self._instrument_map
+
     def scan_and_trade(self):
         can_trade, reason = risk_manager.can_trade()
         if not can_trade:
@@ -138,6 +146,10 @@ class TradingEngine:
                     
         # Scan stocks in parallel and stream signals to the UI instantly via handle_new_signal callback
         signals = scanner.scan_watchlist(self.dynamic_watchlist, on_signal=handle_new_signal)
+        
+        # Re-evaluate open positions for thesis invalidation
+        if self.active_trades:
+            self._reevaluate_positions()
                     
     def execute_signal(self, signal: dict):
         can_trade, reason = risk_manager.can_trade()
@@ -164,7 +176,10 @@ class TradingEngine:
             self.active_trades[signal["tradingsymbol"]] = {
                 "sl": signal["stopLoss"],
                 "target": signal["target"],
-                "direction": signal["direction"]
+                "direction": signal["direction"],
+                "entry_price": signal["entryPrice"],
+                "entry_time": datetime.datetime.now(),
+                "original_strategy": signal.get("strategy", "unknown")
             }
             return True
         except Exception as e:
@@ -221,7 +236,10 @@ class TradingEngine:
                             self.active_trades[symbol] = {
                                 "sl": sl,
                                 "target": target,
-                                "direction": direction
+                                "direction": direction,
+                                "entry_price": avg_price,
+                                "entry_time": datetime.datetime.now(),
+                                "original_strategy": "adopted"
                             }
                             self._push_log(f"Adopted open position {symbol} ({direction}) at ₹{avg_price}. Auto-calculated SL: ₹{sl}, Target: ₹{target}")
 
@@ -259,6 +277,126 @@ class TradingEngine:
                             # Let the manual closure cleanup handle removing it on the next loop
         except Exception as e:
             self._push_log(f"Error monitoring positions: {e}")
+
+    def _reevaluate_positions(self):
+        """Re-evaluate open positions against current strategy signals (thesis invalidation)."""
+        if not self.active_trades:
+            return
+            
+        risk_config = config_manager.get_risk_config()
+        weak_exit_mins = risk_config.get("positionRevalWeakExitMins", 15)
+        breakeven_mins = risk_config.get("positionRevalBreakevenMins", 45)
+        instrument_map = self._ensure_instrument_map()
+        now = datetime.datetime.now()
+        
+        # Get current positions for P&L and LTP data
+        try:
+            positions = kite_client.get_positions().get("net", [])
+            position_map = {p["tradingsymbol"]: p for p in positions if p["quantity"] != 0}
+        except Exception as e:
+            self._push_log(f"Error fetching positions for re-evaluation: {e}")
+            return
+        
+        # Snapshot keys to avoid modifying dict during iteration
+        symbols_to_evaluate = list(self.active_trades.keys())
+        
+        for symbol in symbols_to_evaluate:
+            if symbol not in self.active_trades:
+                continue  # May have been removed by a prior iteration
+                
+            trade = self.active_trades[symbol]
+            token = instrument_map.get(symbol)
+            if not token:
+                continue
+            
+            # Get current position data
+            pos = position_map.get(symbol)
+            if not pos:
+                continue  # Position already closed
+            
+            # Evaluate current strategy signals for this symbol
+            try:
+                evaluation = scanner.evaluate_position(symbol, token)
+            except Exception as e:
+                self._push_log(f"Error evaluating {symbol}: {e}")
+                continue
+            
+            direction = trade["direction"]
+            entry_time = trade.get("entry_time", now)
+            entry_price = trade.get("entry_price", pos.get("averagePrice", 0))
+            mins_held = (now - entry_time).total_seconds() / 60
+            ltp = pos.get("lastPrice", 0)
+            
+            # Determine P&L direction
+            if direction == "BUY":
+                in_loss = ltp < entry_price
+                supporting = evaluation["buy_signals"]
+                opposing = evaluation["sell_signals"]
+            else:
+                in_loss = ltp > entry_price
+                supporting = evaluation["sell_signals"]
+                opposing = evaluation["buy_signals"]
+            
+            # === Graduated Exit Rules ===
+            
+            # Rule 1: Strong opposing signal — thesis fully invalidated
+            if opposing >= 2 and supporting == 0:
+                reason = f"Thesis invalidated for {symbol}: {opposing} opposing signals, 0 supporting. Exiting."
+                self._push_log(reason, level="warning")
+                if self.mode == "auto":
+                    self._exit_position(pos, symbol, reason)
+                continue
+            
+            # Rule 2: Weak conviction — no support + in loss + time elapsed
+            if supporting == 0 and in_loss and mins_held >= weak_exit_mins:
+                reason = f"Weak conviction for {symbol}: 0 supporting signals, in loss, held {mins_held:.0f} mins. Exiting."
+                self._push_log(reason, level="warning")
+                if self.mode == "auto":
+                    self._exit_position(pos, symbol, reason)
+                continue
+            
+            # Rule 3: Time decay — tighten to breakeven
+            if mins_held >= breakeven_mins:
+                if entry_price > 0 and trade["sl"] != entry_price:
+                    old_sl = trade["sl"]
+                    self._tighten_to_breakeven(symbol)
+                    self._push_log(f"Time decay for {symbol}: held {mins_held:.0f} mins. SL tightened from ₹{old_sl} to breakeven ₹{entry_price}.")
+                continue
+            
+            # Rule 4: Thesis still valid — hold
+            if supporting > 0:
+                self._push_log(f"Thesis valid for {symbol}: {supporting} supporting, {opposing} opposing. Holding.")
+    
+    def _tighten_to_breakeven(self, symbol: str):
+        """Move the stop-loss to the entry price (breakeven)."""
+        if symbol in self.active_trades:
+            entry_price = self.active_trades[symbol].get("entry_price", 0)
+            if entry_price > 0:
+                self.active_trades[symbol]["sl"] = entry_price
+    
+    def _exit_position(self, position: dict, symbol: str, reason: str):
+        """Exit a position due to thesis invalidation."""
+        try:
+            ltp = position.get("lastPrice", 0)
+            if ltp == 0:
+                self._push_log(f"Cannot exit {symbol}: no LTP available")
+                return
+                
+            tx_type = "SELL" if position["quantity"] > 0 else "BUY"
+            kite_client.place_order(
+                variety="regular",
+                exchange=position["exchange"],
+                tradingsymbol=symbol,
+                transaction_type=tx_type,
+                quantity=abs(position["quantity"]),
+                product=position["product"],
+                order_type="LIMIT",
+                price=self._get_exit_limit_price(ltp, tx_type)
+            )
+            self._push_log(f"Thesis exit order placed for {symbol} ({tx_type})")
+            # Cleanup will happen via the manual closure detection in monitor_positions
+        except Exception as e:
+            self._push_log(f"Failed to exit {symbol}: {e}")
             
     def square_off_all(self):
         self._push_log("Squaring off all open positions")
