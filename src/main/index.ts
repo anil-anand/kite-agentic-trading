@@ -20,6 +20,9 @@ async function createWindow() {
     minHeight: 768,
     title: 'Kite Agentic Trading',
     titleBarStyle: 'hiddenInset',
+    icon: app.isPackaged
+      ? path.join(process.resourcesPath, 'icon.png')
+      : path.join(__dirname, '../../../build/icon.png'),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       nodeIntegration: false,
@@ -135,7 +138,7 @@ app.whenReady().then(() => {
   setupIpcHandlers();
   setupMenu();
   createWindow();
-  
+
   // Start the Python backend bridge
   pythonBridge.start();
 

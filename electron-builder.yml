@@ -1,6 +1,8 @@
 appId: com.kite-agentic-trading.app
 productName: Kite Agentic Trading
 copyright: Copyright © 2026
+icon: build/icon
+
 directories:
   output: release
   buildResources: build
@@ -20,15 +22,18 @@ mac:
     - dmg
     - zip
   darkModeSupport: true
+  icon: build/icon.icns
 win:
   target:
     - nsis
     - portable
+  icon: build/icon.ico
 linux:
   target:
     - AppImage
     - deb
   category: Finance
+  icon: build/icon.png
 nsis:
   oneClick: false
   allowToChangeInstallationDirectory: true
