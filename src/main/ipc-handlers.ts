@@ -110,8 +110,8 @@ export function setupIpcHandlers() {
 
   // ─── Trading Agent ────────────────────────────────────────────────
   
-  ipcMain.handle(channels.AGENT_START, async () => {
-    return await pythonBridge.call('start_agent');
+  ipcMain.handle(channels.AGENT_START, async (_, params) => {
+    return await pythonBridge.call('start_agent', params);
   });
   
   ipcMain.handle(channels.AGENT_STOP, async () => {
@@ -122,8 +122,8 @@ export function setupIpcHandlers() {
     return await pythonBridge.call('agent_status');
   });
   
-  ipcMain.handle(channels.AGENT_EXECUTE_SIGNAL, async (_, signalId: string) => {
-    return await pythonBridge.call('agent_execute_signal', { signalId });
+  ipcMain.handle(channels.AGENT_EXECUTE_SIGNAL, async (_, signal: any) => {
+    return await pythonBridge.call('execute_signal', { signal });
   });
   
   ipcMain.handle(channels.AGENT_DISMISS_SIGNAL, async (_, signalId: string) => {

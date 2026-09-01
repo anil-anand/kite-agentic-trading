@@ -18,14 +18,20 @@ const Settings: React.FC = () => {
     return <div className="p-6 text-white">Loading settings...</div>;
   }
 
-  const handleRiskChange = (key: string, value: string) => {
-    setLocalSettings((prev: any) => ({
-      ...prev,
-      risk: {
-        ...prev.risk,
-        [key]: parseFloat(value) || 0
+  const handleRiskChange = (key: string, value: string | boolean) => {
+    setLocalSettings((prev: any) => {
+      let finalValue = value;
+      if (typeof value === 'string' && !value.includes(':')) {
+        finalValue = parseFloat(value) || 0;
       }
-    }));
+      return {
+        ...prev,
+        risk: {
+          ...prev.risk,
+          [key]: finalValue
+        }
+      };
+    });
   };
 
   const saveChanges = async () => {
@@ -38,6 +44,22 @@ const Settings: React.FC = () => {
     } catch (error) {
       setSaveStatus('Error saving settings');
     }
+  };
+
+  const resetToDefaults = () => {
+    setLocalSettings((prev: any) => ({
+      ...prev,
+      risk: {
+        ...prev.risk,
+        maxCapitalPerTrade: 10000,
+        maxDailyLoss: 2000,
+        maxSimultaneousPositions: 5,
+        autoSquareOff: true,
+        squareOffTime: "15:15",
+        defaultStopLossPercent: 1.5,
+        defaultTargetPercent: 3
+      }
+    }));
   };
 
   return (
@@ -89,12 +111,71 @@ const Settings: React.FC = () => {
                   className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white focus:border-accent-light outline-none" 
                 />
               </div>
+              <div>
+                <label className="block text-surface-400 text-sm mb-1">Auto Square Off</label>
+                <div className="flex items-center h-10">
+                  <label className="relative inline-flex items-center cursor-pointer">
+                    <input 
+                      type="checkbox" 
+                      className="sr-only peer" 
+                      checked={localSettings.risk?.autoSquareOff ?? true}
+                      onChange={(e) => handleRiskChange('autoSquareOff', e.target.checked)}
+                    />
+                    <div className="w-11 h-6 bg-surface-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-accent-dark"></div>
+                  </label>
+                </div>
+              </div>
+              <div>
+                <label className="block text-surface-400 text-sm mb-1">Square Off Time</label>
+                <input 
+                  type="time" 
+                  value={localSettings.risk?.squareOffTime || '15:15'} 
+                  onChange={(e) => handleRiskChange('squareOffTime', e.target.value)}
+                  disabled={!(localSettings.risk?.autoSquareOff ?? true)}
+                  className={`w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white focus:border-accent-light outline-none ${!(localSettings.risk?.autoSquareOff ?? true) ? 'opacity-50 cursor-not-allowed' : ''}`} 
+                />
+              </div>
+              <div>
+                <label className="block text-surface-400 text-sm mb-1">Max Simultaneous Positions</label>
+                <input 
+                  type="number" 
+                  value={localSettings.risk?.maxSimultaneousPositions || ''} 
+                  onChange={(e) => handleRiskChange('maxSimultaneousPositions', e.target.value)}
+                  className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white focus:border-accent-light outline-none" 
+                />
+              </div>
+              <div>
+                <label className="block text-surface-400 text-sm mb-1">Default Stop Loss (%)</label>
+                <input 
+                  type="number" 
+                  step="0.1"
+                  value={localSettings.risk?.defaultStopLossPercent || ''} 
+                  onChange={(e) => handleRiskChange('defaultStopLossPercent', e.target.value)}
+                  className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white focus:border-accent-light outline-none" 
+                />
+              </div>
+              <div>
+                <label className="block text-surface-400 text-sm mb-1">Default Target (%)</label>
+                <input 
+                  type="number" 
+                  step="0.1"
+                  value={localSettings.risk?.defaultTargetPercent || ''} 
+                  onChange={(e) => handleRiskChange('defaultTargetPercent', e.target.value)}
+                  className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white focus:border-accent-light outline-none" 
+                />
+              </div>
             </div>
           </section>
         </div>
       </div>
       
       <div className="flex justify-end gap-4 pb-8">
+        <button 
+          onClick={resetToDefaults}
+          className="px-6 py-2 bg-surface-700 hover:bg-surface-600 rounded-lg text-white font-medium transition-colors"
+        >
+          Reset to Defaults
+        </button>
         <button 
           onClick={saveChanges}
           className="px-6 py-2 bg-accent-dark hover:bg-accent rounded-lg text-white font-medium transition-colors"

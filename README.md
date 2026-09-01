@@ -28,7 +28,7 @@ The app features a modern Electron/React frontend communicating with a high-perf
 ## 📦 Prerequisites
 
 1. **Node.js** (v18 or higher recommended)
-2. **Python** (v3.9 or higher)
+2. **uv** (latest version recommended; installs Python environments and packages)
 3. An active **Zerodha Account**
 4. A **Kite Connect API** subscription (API Key + Secret)
 
@@ -47,11 +47,7 @@ The app features a modern Electron/React frontend communicating with a high-perf
 
 3. **Install Backend Dependencies**
    ```bash
-   # Optional: Create a virtual environment first
-   # python -m venv venv
-   # source venv/bin/activate (Mac/Linux) or venv\Scripts\activate (Windows)
-   
-   pip install -r requirements.txt
+   uv sync
    ```
 
 The NIFTY 50 universe is refreshed from NSE's live index constituents endpoint once per day. If NSE is unavailable or blocks the request, the bundled list in `backend/nifty_universe.py` is used instead.

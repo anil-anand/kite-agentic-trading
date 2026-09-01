@@ -43,13 +43,21 @@ class RiskManager:
     def should_square_off(self) -> bool:
         config = config_manager.get_risk_config()
         now = datetime.datetime.now().time()
-        square_off_time = datetime.datetime.strptime(config["squareOffTime"], "%H:%M").time()
+        
+        # Check max daily loss first, as this should trigger regardless of time
+        max_loss_hit = self.check_daily_loss_limit()
+        
+        time_to_square_off = False
+        if config.get("autoSquareOff", True):
+            try:
+                square_off_time = datetime.datetime.strptime(config.get("squareOffTime", "15:15"), "%H:%M").time()
+                time_to_square_off = now >= square_off_time and now <= datetime.time(15, 30)
+            except ValueError:
+                pass # Fallback if invalid time string
         
         # Only square off if we have positions AND we hit max loss or time
-        time_to_square_off = now >= square_off_time and now <= datetime.time(15, 30)
-        
         if self.open_positions > 0:
-            return time_to_square_off or self.check_daily_loss_limit()
+            return time_to_square_off or max_loss_hit
         
         return False
         

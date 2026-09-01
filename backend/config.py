@@ -15,9 +15,14 @@ class ConfigManager:
             "risk": {
                 "maxCapitalPerTrade": 10000,
                 "maxDailyLoss": 2000,
-                "maxSimultaneousPositions": 3,
+                "maxSimultaneousPositions": 5,
                 "noNewTradesAfter": "15:00",
-                "squareOffTime": "15:15"
+                "autoSquareOff": True,
+                "squareOffTime": "15:15",
+                "defaultStopLossPercent": 1.5,
+                "defaultTargetPercent": 3,
+                "positionRevalWeakExitMins": 15,
+                "positionRevalBreakevenMins": 45
             },
             "strategies": {
                 "ema_crossover": {"enabled": True},
@@ -128,5 +133,38 @@ class ConfigManager:
         
     def get_watchlist(self):
         return self.config.get("watchlist", self.default_config["watchlist"])
+        
+    def get_app_order_ids(self) -> set:
+        path = self.config_dir / "app_orders.json"
+        if path.exists():
+            try:
+                with open(path, "r") as f:
+                    return set(json.load(f))
+            except:
+                return set()
+        return set()
+        
+    def add_app_order_id(self, order_id: str):
+        if not order_id: return
+        orders = self.get_app_order_ids()
+        orders.add(str(order_id))
+        path = self.config_dir / "app_orders.json"
+        with open(path, "w") as f:
+            json.dump(list(orders), f)
+
+    def get_historical_orders(self) -> dict:
+        path = self.config_dir / "historical_orders.json"
+        if path.exists():
+            try:
+                with open(path, "r") as f:
+                    return json.load(f)
+            except:
+                return {}
+        return {}
+
+    def save_historical_orders(self, orders: dict):
+        path = self.config_dir / "historical_orders.json"
+        with open(path, "w") as f:
+            json.dump(orders, f, indent=4, default=str)
 
 config_manager = ConfigManager()

@@ -28,12 +28,12 @@ class MACDCrossStrategy(BaseStrategy):
         # BUY Condition
         if prev['macd'] <= prev['macd_signal'] and last['macd'] > last['macd_signal']:
             entry = last['close']
-            sl = self.calculate_stop_loss(entry, "BUY", 0.6)
-            target = self.calculate_target(entry, sl, 1.5)
+            sl = self.calculate_stop_loss(entry, "BUY")
+            target = self.calculate_target(entry, sl)
             confidence = 75 if last['macd'] < 0 else 65 # Stronger if crossed below zero line
             
             signals.append(self.format_signal(
-                tradingsymbol, "BUY", confidence, entry, sl, target, 1.5,
+                tradingsymbol, "BUY", confidence, entry, sl, target, round(abs(target-last['close'])/abs(last['close']-sl), 2) if last['close'] != sl else 0,
                 "MACD crossed above signal line",
                 {"macd": last['macd'], "signal": last['macd_signal']}
             ))
@@ -41,12 +41,12 @@ class MACDCrossStrategy(BaseStrategy):
         # SELL Condition
         elif prev['macd'] >= prev['macd_signal'] and last['macd'] < last['macd_signal']:
             entry = last['close']
-            sl = self.calculate_stop_loss(entry, "SELL", 0.6)
-            target = self.calculate_target(entry, sl, 1.5)
+            sl = self.calculate_stop_loss(entry, "SELL")
+            target = self.calculate_target(entry, sl)
             confidence = 75 if last['macd'] > 0 else 65
             
             signals.append(self.format_signal(
-                tradingsymbol, "SELL", confidence, entry, sl, target, 1.5,
+                tradingsymbol, "SELL", confidence, entry, sl, target, round(abs(target-last['close'])/abs(last['close']-sl), 2) if last['close'] != sl else 0,
                 "MACD crossed below signal line",
                 {"macd": last['macd'], "signal": last['macd_signal']}
             ))

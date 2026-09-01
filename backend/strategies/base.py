@@ -18,18 +18,25 @@ class BaseStrategy(ABC):
     def calculate_signals(self, df: pd.DataFrame, tradingsymbol: str) -> List[Dict[str, Any]]:
         pass
         
-    def calculate_stop_loss(self, entry: float, direction: str, percentage: float = 0.5) -> float:
+    def calculate_stop_loss(self, entry: float, direction: str, percentage: float = None) -> float:
+        if percentage is None:
+            from ..config import config_manager
+            percentage = config_manager.get_risk_config().get("defaultStopLossPercent", 1.5)
+            
         if direction == "BUY":
             return round(entry * (1 - percentage/100), 2)
         else:
             return round(entry * (1 + percentage/100), 2)
             
-    def calculate_target(self, entry: float, sl: float, rr_ratio: float = 2.0) -> float:
-        risk = abs(entry - sl)
+    def calculate_target(self, entry: float, sl: float, percentage: float = None) -> float:
+        if percentage is None:
+            from ..config import config_manager
+            percentage = config_manager.get_risk_config().get("defaultTargetPercent", 3.0)
+            
         if entry > sl: # BUY
-            return round(entry + (risk * rr_ratio), 2)
+            return round(entry * (1 + percentage/100), 2)
         else: # SELL
-            return round(entry - (risk * rr_ratio), 2)
+            return round(entry * (1 - percentage/100), 2)
             
     def generate_signal_id(self) -> str:
         return str(uuid.uuid4())

@@ -98,6 +98,7 @@ export interface OrderRequest {
 
 export interface Order {
   orderId: string;
+  isAppOrder?: boolean;
   tradingsymbol: string;
   exchange: string;
   transactionType: TransactionType;
@@ -220,6 +221,7 @@ export interface RiskConfig {
   maxDailyLoss: number;
   maxOpenPositions: number;
   noNewTradesAfter: string; // "14:30" format
+  autoSquareOff: boolean;
   squareOffTime: string; // "15:10" format
   defaultStopLossPercent: number;
   defaultTargetPercent: number;

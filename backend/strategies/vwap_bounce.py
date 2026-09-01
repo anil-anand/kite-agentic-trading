@@ -41,12 +41,12 @@ class VWAPBounceStrategy(BaseStrategy):
             # BUY Condition
             if last['close'] > last['open'] and last['rsi'] > 40 and last['fast_ema'] > last['slow_ema'] and last['close'] >= last['vwap']:
                 entry = last['close']
-                sl = self.calculate_stop_loss(entry, "BUY", 0.5)
-                target = self.calculate_target(entry, sl, 2.0)
+                sl = self.calculate_stop_loss(entry, "BUY")
+                target = self.calculate_target(entry, sl)
                 
                 confidence = 80
                 signals.append(self.format_signal(
-                    tradingsymbol, "BUY", confidence, entry, sl, target, 2.0,
+                    tradingsymbol, "BUY", confidence, entry, sl, target, round(abs(target-last['close'])/abs(last['close']-sl), 2) if last['close'] != sl else 0,
                     f"Bullish bounce off VWAP, RSI > 40, trend aligned",
                     {"vwap": last['vwap'], "rsi": last['rsi']}
                 ))
@@ -54,12 +54,12 @@ class VWAPBounceStrategy(BaseStrategy):
             # SELL Condition
             elif last['close'] < last['open'] and last['rsi'] < 60 and last['fast_ema'] < last['slow_ema'] and last['close'] <= last['vwap']:
                 entry = last['close']
-                sl = self.calculate_stop_loss(entry, "SELL", 0.5)
-                target = self.calculate_target(entry, sl, 2.0)
+                sl = self.calculate_stop_loss(entry, "SELL")
+                target = self.calculate_target(entry, sl)
                 
                 confidence = 80
                 signals.append(self.format_signal(
-                    tradingsymbol, "SELL", confidence, entry, sl, target, 2.0,
+                    tradingsymbol, "SELL", confidence, entry, sl, target, round(abs(target-last['close'])/abs(last['close']-sl), 2) if last['close'] != sl else 0,
                     f"Bearish rejection from VWAP, RSI < 60, trend aligned",
                     {"vwap": last['vwap'], "rsi": last['rsi']}
                 ))

@@ -17,9 +17,9 @@ class MFIExhaustionStrategy(BaseStrategy):
         if prev['mfi'] < 20 and last['mfi'] >= 20:
             sl = self.calculate_stop_loss(last['close'], "BUY", 0.7)
             target = self.calculate_target(last['close'], sl, 1.5)
-            signals.append(self.format_signal(symbol, "BUY", 78, last['close'], sl, target, 1.5, "MFI volume exhaustion bounce from 20", {}))
+            signals.append(self.format_signal(symbol, "BUY", 78, last['close'], sl, target, round(abs(target-last['close'])/abs(last['close']-sl), 2) if last['close'] != sl else 0, "MFI volume exhaustion bounce from 20", {}))
         elif prev['mfi'] > 80 and last['mfi'] <= 80:
             sl = self.calculate_stop_loss(last['close'], "SELL", 0.7)
             target = self.calculate_target(last['close'], sl, 1.5)
-            signals.append(self.format_signal(symbol, "SELL", 78, last['close'], sl, target, 1.5, "MFI volume exhaustion rejection from 80", {}))
+            signals.append(self.format_signal(symbol, "SELL", 78, last['close'], sl, target, round(abs(target-last['close'])/abs(last['close']-sl), 2) if last['close'] != sl else 0, "MFI volume exhaustion rejection from 80", {}))
         return signals
