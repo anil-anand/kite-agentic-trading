@@ -29,8 +29,9 @@ The app features a modern Electron/React frontend communicating with a high-perf
 
 1. **Node.js** (v18 or higher recommended)
 2. **Python** (v3.9 or higher)
-3. An active **Zerodha Account**
-4. A **Kite Connect API** subscription (API Key + Secret)
+3. **uv** (Python package and environment manager)
+4. An active **Zerodha Account**
+5. A **Kite Connect API** subscription (API Key + Secret)
 
 ## ⚙️ Installation
 
@@ -47,12 +48,18 @@ The app features a modern Electron/React frontend communicating with a high-perf
 
 3. **Install Backend Dependencies**
    ```bash
-   # Optional: Create a virtual environment first
-   # python -m venv venv
-   # source venv/bin/activate (Mac/Linux) or venv\Scripts\activate (Windows)
-   
-   pip install -r requirements.txt
+   uv venv
+   source .venv/bin/activate # Mac/Linux; use .venv\Scripts\activate on Windows
+   uv pip install -r requirements.txt
    ```
+
+## 🤖 AI Agent Setup Instructions
+
+Copy and paste the following prompt into Claude, Codex, or another coding agent from the repository root:
+
+```text
+Set up this repository for local development. First verify that Node.js, Python, and uv are installed. Run `npm install` for the frontend, then create the Python environment with `uv venv` and install the backend dependencies with `uv pip install -r requirements.txt`. After setup, run `npm run lint`, `npm run typecheck`, and `npm run build`, and report any failures with their causes. Do not request, print, commit, or modify real Kite API credentials; credentials must be configured locally through the app's Settings screen.
+```
 
 ## 🚀 Running the App
 
