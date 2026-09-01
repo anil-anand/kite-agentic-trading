@@ -1,13 +1,15 @@
 import json
-from datetime import datetime
+
 
 class DateTimeEncoder(json.JSONEncoder):
     def default(self, obj):
         import datetime
+
         if isinstance(obj, (datetime.datetime, datetime.date)):
             return obj.isoformat()
         try:
             import numpy as np
+
             if isinstance(obj, np.integer):
                 return int(obj)
             if isinstance(obj, np.floating):

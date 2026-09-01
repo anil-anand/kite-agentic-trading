@@ -5,14 +5,15 @@ final bar, mirroring how the live scanner evaluates the latest candle.
 The series here were validated against the actual indicator math; if a strategy's
 logic changes, these are the tests that should catch it.
 """
+
 import numpy as np
 
-from backend.tests.conftest import build_candles, assert_valid_signal
-from backend.strategies.ema_crossover import EMACrossoverStrategy
-from backend.strategies.donchian_breakout import DonchianBreakoutStrategy
 from backend.strategies.bollinger_breakout import BollingerBreakoutStrategy
-from backend.strategies.williams_r import WilliamsRStrategy
 from backend.strategies.cci_reversal import CCIReversalStrategy
+from backend.strategies.donchian_breakout import DonchianBreakoutStrategy
+from backend.strategies.ema_crossover import EMACrossoverStrategy
+from backend.strategies.williams_r import WilliamsRStrategy
+from backend.tests.conftest import assert_valid_signal, build_candles
 
 
 def _one(signals):

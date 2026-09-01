@@ -15,6 +15,7 @@ dependencies = [
 dev = [
     "pyinstaller>=6.0.0",
     "pytest>=8.0.0",
+    "ruff>=0.6.0",
 ]
 
 [tool.uv]
@@ -24,3 +25,14 @@ package = false
 testpaths = ["backend/tests"]
 python_files = ["test_*.py"]
 addopts = "-ra"
+
+[tool.ruff]
+line-length = 88
+target-version = "py39"
+
+[tool.ruff.lint]
+# pycodestyle (E, W), Pyflakes (F), and import sorting (I) — a PEP 8 baseline.
+select = ["E", "W", "F", "I"]
+# E501 (line-too-long) is left to the formatter; it intentionally does not wrap
+# long string literals, so enforcing it here would just create noise.
+ignore = ["E501"]

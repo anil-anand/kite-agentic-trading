@@ -93,6 +93,19 @@ uv run pytest -k williams                                 # tests matching a key
 Tests live in `backend/tests/`. `pytest` is included in the dev dependencies, so
 `uv sync` provisions it automatically.
 
+## 🎨 Code Style (Python)
+
+The Python backend follows **PEP 8**, enforced with [Ruff](https://docs.astral.sh/ruff/)
+(configured in `pyproject.toml`). Ruff is included in the dev dependencies, so
+`uv sync` installs it.
+
+```bash
+uvx ruff check backend/ run_backend.py     # lint
+uvx ruff format backend/ run_backend.py    # auto-format
+```
+
+The frontend continues to use ESLint (`npm run lint`).
+
 ## 🏗️ Building for Production
 
 To create a standalone executable (e.g., a `.dmg` for macOS or `.exe` for Windows), there is a two-step process:
