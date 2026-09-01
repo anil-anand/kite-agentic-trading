@@ -60,6 +60,8 @@ Copy and paste the following prompt into Claude, Codex, or another coding agent 
 Set up this repository for local development. First verify that Node.js and uv are installed. Run `npm install` for the frontend, then run `uv sync` to provision the Python environment and install backend dependencies. After setup, run `npm run lint`, `npm run typecheck`, and `npm run build`, and report any failures with their causes. Do not request, print, commit, or modify real Kite API credentials; credentials must be configured locally through the app's Settings screen.
 ```
 
+The NIFTY 50 universe is refreshed from NSE's live index constituents endpoint once per day. If NSE is unavailable or blocks the request, the bundled list in `backend/nifty_universe.py` is used instead.
+
 ## 🚀 Running the App
 
 To start the application in development mode (which automatically launches both the Vite frontend server and the Python background processes via Electron):

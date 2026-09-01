@@ -125,10 +125,10 @@ class TradingEngine:
         # Use our AI/Algorithmic screener to dynamically find "In Play" stocks from NIFTY 50 + Custom Watchlist
         if not hasattr(self, 'dynamic_watchlist') or not self.dynamic_watchlist:
             from .screener import screener_engine
-            from .nifty_universe import NIFTY_50
+            from .nifty_universe import get_nifty50_universe
             
             custom_watchlist = config_manager.get_watchlist()
-            full_universe = list(set(NIFTY_50 + custom_watchlist))
+            full_universe = list(set(get_nifty50_universe() + custom_watchlist))
             
             self._push_log(f"Running algorithmic screener on NIFTY 50 + {len(custom_watchlist)} custom stocks...")
             self.dynamic_watchlist = screener_engine.generate_daily_watchlist(universe=full_universe, limit=12)

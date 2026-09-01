@@ -128,9 +128,9 @@ def handle_request(req):
             
         elif method == "scan_now":
             from .screener import screener_engine
-            from .nifty_universe import NIFTY_50
+            from .nifty_universe import get_nifty50_universe
             custom_watchlist = config_manager.get_watchlist()
-            full_universe = list(set(NIFTY_50 + custom_watchlist))
+            full_universe = list(set(get_nifty50_universe() + custom_watchlist))
             
             # Run the AI screener
             top_stocks = screener_engine.generate_daily_watchlist(universe=full_universe, limit=12)
