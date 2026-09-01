@@ -57,7 +57,7 @@ The app features a modern Electron/React frontend communicating with a high-perf
 Copy and paste the following prompt into Claude, Codex, or another coding agent from the repository root:
 
 ```text
-Set up this repository for local development. First verify that Node.js and uv are installed. Run `npm install` for the frontend, then run `uv sync` to provision the Python environment and install backend dependencies. After setup, run `npm run lint`, `npm run typecheck`, and `npm run build`, and report any failures with their causes. Do not request, print, commit, or modify real Kite API credentials; credentials must be configured locally through the app's Settings screen.
+Set up this repository for local development. First verify that Node.js and uv are installed. Run `npm install` for the frontend, then run `uv sync` to provision the Python environment and install backend dependencies. After setup, run `npm run lint`, `npm run typecheck`, `npm run build`, and `uv run pytest`, and report any failures with their causes. Do not request, print, commit, or modify real Kite API credentials; credentials must be configured locally through the app's Settings screen.
 ```
 
 The NIFTY 50 universe is refreshed from NSE's live index constituents endpoint once per day. If NSE is unavailable or blocks the request, the bundled list in `backend/nifty_universe.py` is used instead.
@@ -71,6 +71,27 @@ npm run dev
 ```
 
 On your first launch, navigate to the **Settings** tab to enter your Kite API Key and API Secret. The app will encrypt and save them locally.
+
+## 🧪 Running Tests
+
+The backend test suite (`pytest`) covers the trading strategies. The strategy
+signal calculations are pure functions, so the tests run fully offline — no Kite
+API credentials or network access required.
+
+```bash
+uv run pytest
+```
+
+Useful variants:
+
+```bash
+uv run pytest -v                                          # list every test
+uv run pytest backend/tests/strategies/test_triggers.py   # a single file
+uv run pytest -k williams                                 # tests matching a keyword
+```
+
+Tests live in `backend/tests/`. `pytest` is included in the dev dependencies, so
+`uv sync` provisions it automatically.
 
 ## 🏗️ Building for Production
 
