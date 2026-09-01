@@ -17,6 +17,7 @@ class ConfigManager:
                 "maxDailyLoss": 2000,
                 "maxSimultaneousPositions": 5,
                 "noNewTradesAfter": "15:00",
+                "autoSquareOff": True,
                 "squareOffTime": "15:15",
                 "defaultStopLossPercent": 1.5,
                 "defaultTargetPercent": 3
