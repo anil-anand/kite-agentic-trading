@@ -40,6 +40,20 @@ const Settings: React.FC = () => {
     }
   };
 
+  const resetToDefaults = () => {
+    setLocalSettings((prev: any) => ({
+      ...prev,
+      risk: {
+        ...prev.risk,
+        maxCapitalPerTrade: 10000,
+        maxDailyLoss: 2000,
+        maxSimultaneousPositions: 5,
+        defaultStopLossPercent: 1.5,
+        defaultTargetPercent: 3
+      }
+    }));
+  };
+
   return (
     <div className="p-6 h-full overflow-auto max-w-4xl mx-auto space-y-8">
       <div>
@@ -90,6 +104,15 @@ const Settings: React.FC = () => {
                 />
               </div>
               <div>
+                <label className="block text-surface-400 text-sm mb-1">Max Simultaneous Positions</label>
+                <input 
+                  type="number" 
+                  value={localSettings.risk?.maxSimultaneousPositions || ''} 
+                  onChange={(e) => handleRiskChange('maxSimultaneousPositions', e.target.value)}
+                  className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white focus:border-accent-light outline-none" 
+                />
+              </div>
+              <div>
                 <label className="block text-surface-400 text-sm mb-1">Default Stop Loss (%)</label>
                 <input 
                   type="number" 
@@ -115,6 +138,12 @@ const Settings: React.FC = () => {
       </div>
       
       <div className="flex justify-end gap-4 pb-8">
+        <button 
+          onClick={resetToDefaults}
+          className="px-6 py-2 bg-surface-700 hover:bg-surface-600 rounded-lg text-white font-medium transition-colors"
+        >
+          Reset to Defaults
+        </button>
         <button 
           onClick={saveChanges}
           className="px-6 py-2 bg-accent-dark hover:bg-accent rounded-lg text-white font-medium transition-colors"

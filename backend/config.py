@@ -15,9 +15,11 @@ class ConfigManager:
             "risk": {
                 "maxCapitalPerTrade": 10000,
                 "maxDailyLoss": 2000,
-                "maxSimultaneousPositions": 3,
+                "maxSimultaneousPositions": 5,
                 "noNewTradesAfter": "15:00",
-                "squareOffTime": "15:15"
+                "squareOffTime": "15:15",
+                "defaultStopLossPercent": 1.5,
+                "defaultTargetPercent": 3
             },
             "strategies": {
                 "ema_crossover": {"enabled": True},
