@@ -72,14 +72,14 @@ const Dashboard: React.FC = () => {
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <div className="lg:col-span-2 space-y-4">
           <h2 className="text-xl font-semibold text-white">Open Positions</h2>
-          {positions.length === 0 ? (
+          {positions.filter(p => p.quantity !== 0).length === 0 ? (
             <div className="bg-surface-800 border border-surface-700 rounded-xl p-8 flex flex-col items-center justify-center text-surface-400 h-48">
               <Activity size={48} className="mb-4 opacity-20" />
               <p>No open positions</p>
             </div>
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {positions.map(p => <PositionCard key={p.tradingsymbol} position={p} onExit={handleExit} />)}
+              {positions.filter(p => p.quantity !== 0).map(p => <PositionCard key={p.tradingsymbol} position={p} onExit={handleExit} />)}
             </div>
           )}
         </div>
