@@ -89,8 +89,8 @@ export const useKiteAPI = () => {
     return await window.electronAPI?.invoke(IPC.ORDERS_CANCEL, orderId);
   };
 
-  const startAgent = async () => {
-    return await window.electronAPI?.invoke(IPC.AGENT_START);
+  const startAgent = async (mode: string) => {
+    return await window.electronAPI?.invoke(IPC.AGENT_START, { mode });
   };
 
   const stopAgent = async () => {

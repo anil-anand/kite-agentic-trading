@@ -110,8 +110,8 @@ export function setupIpcHandlers() {
 
   // ─── Trading Agent ────────────────────────────────────────────────
   
-  ipcMain.handle(channels.AGENT_START, async () => {
-    return await pythonBridge.call('start_agent');
+  ipcMain.handle(channels.AGENT_START, async (_, params) => {
+    return await pythonBridge.call('start_agent', params);
   });
   
   ipcMain.handle(channels.AGENT_STOP, async () => {
