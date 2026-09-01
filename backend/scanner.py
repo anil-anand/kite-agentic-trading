@@ -116,7 +116,8 @@ class Scanner:
                                 on_signal(sig)
                         all_signals.extend(signals)
                 except Exception as e:
-                    print(f"Error in parallel processing: {e}")
+                    import sys
+                    print(f"Error in parallel processing: {e}", file=sys.stderr)
             
         # Sort by confidence descending
         all_signals.sort(key=lambda x: x.get('confidence', 0), reverse=True)

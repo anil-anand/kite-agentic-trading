@@ -147,4 +147,19 @@ class ConfigManager:
         with open(path, "w") as f:
             json.dump(list(orders), f)
 
+    def get_historical_orders(self) -> dict:
+        path = self.config_dir / "historical_orders.json"
+        if path.exists():
+            try:
+                with open(path, "r") as f:
+                    return json.load(f)
+            except:
+                return {}
+        return {}
+
+    def save_historical_orders(self, orders: dict):
+        path = self.config_dir / "historical_orders.json"
+        with open(path, "w") as f:
+            json.dump(orders, f, indent=4, default=str)
+
 config_manager = ConfigManager()

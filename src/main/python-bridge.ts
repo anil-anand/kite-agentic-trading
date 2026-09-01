@@ -45,8 +45,11 @@ class PythonBridge {
       this.childProcess = spawn(this.pythonPath, ['-m', 'backend.main'], { cwd: path.dirname(path.dirname(this.scriptPath)) });
     }
 
+    let stdoutBuffer = '';
     this.childProcess.stdout?.on('data', (data) => {
-      const lines = data.toString().split('\n');
+      stdoutBuffer += data.toString();
+      const lines = stdoutBuffer.split('\n');
+      stdoutBuffer = lines.pop() || '';
       for (const line of lines) {
         if (!line.trim()) continue;
         try {

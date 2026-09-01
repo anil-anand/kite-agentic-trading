@@ -52,9 +52,24 @@ class KiteClient:
         from .config import config_manager
         res = self.kite.orders() if self.kite else []
         app_orders = config_manager.get_app_order_ids()
+        
+        historical = config_manager.get_historical_orders()
         for o in res:
+            o_id = str(o.get("order_id"))
+            historical[o_id] = o
+            
+        config_manager.save_historical_orders(historical)
+        all_orders = list(historical.values())
+        
+        def get_ts(order):
+            return str(order.get("order_timestamp") or order.get("exchange_timestamp") or "")
+            
+        all_orders.sort(key=get_ts, reverse=True)
+        
+        for o in all_orders:
             o["is_app_order"] = (str(o.get("order_id")) in app_orders)
-        return convert_keys(res)
+            
+        return convert_keys(all_orders)
         
     def place_order(self, variety, exchange, tradingsymbol, transaction_type, quantity, product, order_type, price=None, validity=None, validity_ttl=None, disclosed_quantity=None, trigger_price=None, squareoff=None, stoploss=None, trailing_stoploss=None, tag=None) -> str:
         from .config import config_manager
