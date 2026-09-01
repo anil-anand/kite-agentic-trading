@@ -54,6 +54,8 @@ The app features a modern Electron/React frontend communicating with a high-perf
    pip install -r requirements.txt
    ```
 
+The NIFTY 50 universe is refreshed from NSE's live index constituents endpoint once per day. If NSE is unavailable or blocks the request, the bundled list in `backend/nifty_universe.py` is used instead.
+
 ## 🚀 Running the App
 
 To start the application in development mode (which automatically launches both the Vite frontend server and the Python background processes via Electron):
