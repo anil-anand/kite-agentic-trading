@@ -141,8 +141,7 @@ class TradingEngine:
                 quantity=qty,
                 product="MIS",
                 order_type="LIMIT",
-                price=signal["entryPrice"],
-                tag=signal["id"][:8]
+                price=signal["entryPrice"]
             )
             self._push_log(f"Executed {transaction_type} for {signal['tradingsymbol']}, qty {qty}, order_id {order_id}")
             self.active_trades[signal["tradingsymbol"]] = {
