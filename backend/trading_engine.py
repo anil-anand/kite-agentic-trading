@@ -130,7 +130,11 @@ class TradingEngine:
             if signal["confidence"] >= 70:
                 self._push_signal(signal)
                 if self.mode == "auto" and signal["confidence"] >= 80 and can_trade:
-                    self.execute_signal(signal)
+                    # Prevent buying the same stock if we already have an active trade for it!
+                    if signal["tradingsymbol"] not in self.active_trades:
+                        self.execute_signal(signal)
+                    else:
+                        self._push_log(f"Skipping auto-trade for {signal['tradingsymbol']} as it is already an active position.")
                     
         # Scan stocks in parallel and stream signals to the UI instantly via handle_new_signal callback
         signals = scanner.scan_watchlist(self.dynamic_watchlist, on_signal=handle_new_signal)
@@ -181,6 +185,18 @@ class TradingEngine:
             open_count = sum(1 for p in positions if p["quantity"] != 0)
             risk_manager.set_open_positions(open_count)
             
+            # Get symbols of currently open positions to track manual closures
+            open_symbols = {p["tradingsymbol"] for p in positions if p["quantity"] != 0}
+            
+            # Clean up active_trades if position was closed manually via Kite App
+            symbols_to_remove = []
+            for symbol in self.active_trades.keys():
+                if symbol not in open_symbols:
+                    symbols_to_remove.append(symbol)
+            for symbol in symbols_to_remove:
+                self._push_log(f"Detected manual closure for {symbol}. Removing from tracking.")
+                del self.active_trades[symbol]
+                
             # Evaluate SL and Targets
             for p in positions:
                 if p["quantity"] != 0:
@@ -216,7 +232,7 @@ class TradingEngine:
                                 order_type="LIMIT",
                                 price=self._get_exit_limit_price(ltp, tx_type)
                             )
-                            del self.active_trades[symbol]
+                            # Let the manual closure cleanup handle removing it on the next loop
         except Exception as e:
             self._push_log(f"Error monitoring positions: {e}")
             
