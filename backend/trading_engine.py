@@ -18,8 +18,10 @@ class TradingEngine:
         self.thread = None
         self.mode = "confirm"  # auto or confirm
         self.interval = 60  # seconds
-        self.active_trades = {}  # tradingsymbol -> { sl, target, direction, entry_price, entry_time, original_strategy }
+        self.active_trades = {}  # tradingsymbol -> { sl, target, direction, entry_price, entry_time, original_strategy, stop_order_id, exit_pending, exit_order_id }
         self._instrument_map = {}  # cached symbol -> instrument_token map
+        self._entry_fill_timeout_seconds = 15
+        self._entry_fill_poll_seconds = 1
 
     def start(self, mode: str = "confirm"):
         if self.running:
@@ -186,6 +188,36 @@ class TradingEngine:
             self._push_log(
                 f"Executed {transaction_type} for {signal['tradingsymbol']}, qty {qty}, order_id {order_id}"
             )
+            position = self._wait_for_entry_fill(signal, order_id)
+            if not position:
+                self._push_log(
+                    f"Entry order {order_id} for {signal['tradingsymbol']} not filled. Not tracking as active trade.",
+                    level="warning",
+                )
+                try:
+                    kite_client.cancel_order("regular", order_id)
+                except Exception:
+                    pass
+                return False
+
+            stop_order_id = self._place_protective_stop(
+                signal,
+                abs(position.get("quantity", qty)) or qty,
+                position.get("exchange", signal["exchange"]),
+                position.get("product", "MIS"),
+            )
+            if not stop_order_id:
+                self._push_log(
+                    f"Failed to place protective stop for {signal['tradingsymbol']}. Exiting position immediately.",
+                    level="error",
+                )
+                self._exit_position(
+                    position,
+                    signal["tradingsymbol"],
+                    "Protective stop placement failed",
+                )
+                return False
+
             self.active_trades[signal["tradingsymbol"]] = {
                 "sl": signal["stopLoss"],
                 "target": signal["target"],
@@ -193,6 +225,10 @@ class TradingEngine:
                 "entry_price": signal["entryPrice"],
                 "entry_time": datetime.datetime.now(),
                 "original_strategy": signal.get("strategy", "unknown"),
+                "entry_order_id": order_id,
+                "stop_order_id": stop_order_id,
+                "exit_pending": False,
+                "exit_order_id": None,
             }
             return True
         except Exception as e:
@@ -210,6 +246,12 @@ class TradingEngine:
     def monitor_positions(self):
         try:
             positions = kite_client.get_positions().get("net", [])
+            total_pnl = sum(
+                p.get("realised", 0.0) + p.get("unrealised", 0.0) for p in positions
+            )
+            pnl_delta = total_pnl - risk_manager.daily_pnl
+            if pnl_delta != 0:
+                risk_manager.update_pnl(pnl_delta)
             open_count = sum(1 for p in positions if p["quantity"] != 0)
             risk_manager.set_open_positions(open_count)
 
@@ -225,6 +267,7 @@ class TradingEngine:
                 self._push_log(
                     f"Detected manual closure for {symbol}. Removing from tracking."
                 )
+                self._cancel_protective_stop(symbol)
                 del self.active_trades[symbol]
 
             # Evaluate SL and Targets
@@ -262,6 +305,9 @@ class TradingEngine:
 
                     if symbol in self.active_trades:
                         trade = self.active_trades[symbol]
+                        if trade.get("exit_pending"):
+                            self._sync_exit_pending_status(symbol)
+                            continue
                         ltp = p.get("lastPrice", 0)
                         if ltp == 0:
                             continue
@@ -285,19 +331,7 @@ class TradingEngine:
                             self._push_log(
                                 f"{reason} hit for {symbol} at {ltp}. Exiting position."
                             )
-
-                            tx_type = "SELL" if p["quantity"] > 0 else "BUY"
-                            kite_client.place_order(
-                                variety="regular",
-                                exchange=p["exchange"],
-                                tradingsymbol=symbol,
-                                transaction_type=tx_type,
-                                quantity=abs(p["quantity"]),
-                                product=p["product"],
-                                order_type="LIMIT",
-                                price=self._get_exit_limit_price(ltp, tx_type),
-                            )
-                            # Let the manual closure cleanup handle removing it on the next loop
+                            self._place_exit_order(p, symbol)
         except Exception as e:
             self._push_log(f"Error monitoring positions: {e}")
 
@@ -410,20 +444,7 @@ class TradingEngine:
             if ltp == 0:
                 self._push_log(f"Cannot exit {symbol}: no LTP available")
                 return
-
-            tx_type = "SELL" if position["quantity"] > 0 else "BUY"
-            kite_client.place_order(
-                variety="regular",
-                exchange=position["exchange"],
-                tradingsymbol=symbol,
-                transaction_type=tx_type,
-                quantity=abs(position["quantity"]),
-                product=position["product"],
-                order_type="LIMIT",
-                price=self._get_exit_limit_price(ltp, tx_type),
-            )
-            self._push_log(f"Thesis exit order placed for {symbol} ({tx_type})")
-            # Cleanup will happen via the manual closure detection in monitor_positions
+            self._place_exit_order(position, symbol, reason)
         except Exception as e:
             self._push_log(f"Failed to exit {symbol}: {e}")
 
@@ -433,25 +454,138 @@ class TradingEngine:
             positions = kite_client.get_positions().get("net", [])
             for p in positions:
                 if p["quantity"] != 0:
-                    tx_type = "SELL" if p["quantity"] > 0 else "BUY"
-                    ltp = p.get("lastPrice", 0)
-
-                    kite_client.place_order(
-                        variety="regular",
-                        exchange=p["exchange"],
-                        tradingsymbol=p["tradingsymbol"],
-                        transaction_type=tx_type,
-                        quantity=abs(p["quantity"]),
-                        product=p["product"],
-                        order_type="LIMIT",
-                        price=self._get_exit_limit_price(ltp, tx_type)
-                        if ltp > 0
-                        else 0,
-                    )
-                    if p["tradingsymbol"] in self.active_trades:
-                        del self.active_trades[p["tradingsymbol"]]
+                    self._place_exit_order(p, p["tradingsymbol"], "Square off")
         except Exception as e:
             self._push_log(f"Error in square off: {e}")
+
+    def _wait_for_entry_fill(self, signal: dict, order_id: str) -> dict:
+        deadline = time.time() + self._entry_fill_timeout_seconds
+        symbol = signal["tradingsymbol"]
+        direction = signal["direction"]
+        while time.time() <= deadline:
+            position = self._find_live_position(symbol, direction)
+            if position:
+                return position
+
+            if self._is_order_closed_without_fill(order_id):
+                return {}
+
+            time.sleep(self._entry_fill_poll_seconds)
+        return {}
+
+    def _find_live_position(self, symbol: str, direction: str) -> dict:
+        positions = kite_client.get_positions().get("net", [])
+        for p in positions:
+            qty = p.get("quantity", 0)
+            if p.get("tradingsymbol") != symbol or qty == 0:
+                continue
+            if direction == "BUY" and qty > 0:
+                return p
+            if direction == "SELL" and qty < 0:
+                return p
+        return {}
+
+    def _is_order_closed_without_fill(self, order_id: str) -> bool:
+        orders = kite_client.get_orders()
+        for order in orders:
+            if str(order.get("orderId")) != str(order_id):
+                continue
+            status = str(order.get("status", "")).upper()
+            filled_qty = order.get("filledQuantity", 0) or 0
+            if status in {"REJECTED", "CANCELLED"}:
+                return True
+            if status == "COMPLETE" and filled_qty <= 0:
+                return True
+            return False
+        return False
+
+    def _place_protective_stop(
+        self, signal: dict, quantity: int, exchange: str, product: str
+    ) -> str:
+        try:
+            direction = signal["direction"]
+            stop_tx = "SELL" if direction == "BUY" else "BUY"
+            trigger_price = signal["stopLoss"]
+            order_id = kite_client.place_order(
+                variety="regular",
+                exchange=exchange,
+                tradingsymbol=signal["tradingsymbol"],
+                transaction_type=stop_tx,
+                quantity=quantity,
+                product=product,
+                order_type="SL-M",
+                trigger_price=trigger_price,
+            )
+            self._push_log(
+                f"Placed protective stop for {signal['tradingsymbol']} at trigger ₹{trigger_price}, order_id {order_id}"
+            )
+            return order_id
+        except Exception as e:
+            self._push_log(
+                f"Failed to place protective stop for {signal['tradingsymbol']}: {e}",
+                level="error",
+            )
+            return ""
+
+    def _cancel_protective_stop(self, symbol: str):
+        trade = self.active_trades.get(symbol)
+        if not trade:
+            return
+        stop_order_id = trade.get("stop_order_id")
+        if not stop_order_id:
+            return
+        try:
+            kite_client.cancel_order("regular", stop_order_id)
+        except Exception:
+            pass
+        trade["stop_order_id"] = None
+
+    def _place_exit_order(self, position: dict, symbol: str, reason: str = ""):
+        if symbol in self.active_trades and self.active_trades[symbol].get(
+            "exit_pending"
+        ):
+            return
+
+        ltp = position.get("lastPrice", 0)
+        tx_type = "SELL" if position["quantity"] > 0 else "BUY"
+        self._cancel_protective_stop(symbol)
+        order_id = kite_client.place_order(
+            variety="regular",
+            exchange=position["exchange"],
+            tradingsymbol=symbol,
+            transaction_type=tx_type,
+            quantity=abs(position["quantity"]),
+            product=position["product"],
+            order_type="LIMIT",
+            price=self._get_exit_limit_price(ltp, tx_type) if ltp > 0 else 0,
+        )
+        if symbol in self.active_trades:
+            self.active_trades[symbol]["exit_pending"] = True
+            self.active_trades[symbol]["exit_order_id"] = order_id
+        reason_prefix = f"{reason}: " if reason else ""
+        self._push_log(f"{reason_prefix}exit order placed for {symbol} ({tx_type})")
+
+    def _sync_exit_pending_status(self, symbol: str):
+        trade = self.active_trades.get(symbol)
+        if not trade:
+            return
+        order_id = trade.get("exit_order_id")
+        if not order_id:
+            trade["exit_pending"] = False
+            return
+        orders = kite_client.get_orders()
+        for order in orders:
+            if str(order.get("orderId")) != str(order_id):
+                continue
+            status = str(order.get("status", "")).upper()
+            if status in {"REJECTED", "CANCELLED"}:
+                trade["exit_pending"] = False
+                trade["exit_order_id"] = None
+                self._push_log(
+                    f"Exit order {order_id} for {symbol} {status.lower()}. Re-attempting on next cycle.",
+                    level="warning",
+                )
+            break
 
 
 trading_engine = TradingEngine()

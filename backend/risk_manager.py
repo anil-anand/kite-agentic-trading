@@ -38,9 +38,20 @@ class RiskManager:
     def calculate_position_size(self, price: float, stop_loss: float) -> int:
         config = config_manager.get_risk_config()
         max_capital = config["maxCapitalPerTrade"]
+        risk_per_trade = config.get("riskPerTrade", max_capital * 0.01)
 
-        # Risk amount can also be used, but for now we just use max capital
-        quantity = int(max_capital / price)
+        quantity_by_capital = int(max_capital / price) if price > 0 else 0
+        stop_distance = abs(price - stop_loss)
+
+        if stop_distance > 0 and risk_per_trade > 0:
+            quantity_by_risk = int(risk_per_trade / stop_distance)
+            quantity = (
+                min(quantity_by_capital, quantity_by_risk)
+                if quantity_by_capital > 0
+                else quantity_by_risk
+            )
+        else:
+            quantity = quantity_by_capital
         return max(1, quantity)
 
     def check_daily_loss_limit(self) -> bool:
