@@ -75,19 +75,32 @@ class TradingEngine:
         sys.stdout.flush()
         
     def _run_loop(self):
+        last_scan_time = 0
+        scan_interval = 60 # Check for new signals every 60 seconds
+        monitor_interval = 5 # Check open positions every 5 seconds for rapid exits
+        
         while self.running:
             try:
+                # 1. Fast polling: Monitor live positions for Stop-Loss / Target
                 self.monitor_positions()
+                
+                # 2. Check End of Day square off
                 if risk_manager.should_square_off():
                     self.square_off_all()
                     self.stop()
                     break
                     
-                self.scan_and_trade()
+                # 3. Slow polling: Scan for new entry signals
+                current_time = time.time()
+                if current_time - last_scan_time >= scan_interval:
+                    self.scan_and_trade()
+                    last_scan_time = current_time
+                    
             except Exception as e:
                 self._push_log(f"Error in trading loop: {e}")
                 
-            for _ in range(self.interval):
+            # Sleep for the shorter interval (5 seconds)
+            for _ in range(monitor_interval):
                 if not self.running:
                     break
                 time.sleep(1)
