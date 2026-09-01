@@ -50,6 +50,16 @@ The app features a modern Electron/React frontend communicating with a high-perf
    uv sync
    ```
 
+`uv sync` creates the project environment in `.venv` and installs the locked backend dependencies. The development app and production Python build both invoke Python through `uv`.
+
+## 🤖 AI Agent Setup Instructions
+
+Copy and paste the following prompt into Claude, Codex, or another coding agent from the repository root:
+
+```text
+Set up this repository for local development. First verify that Node.js and uv are installed. Run `npm install` for the frontend, then run `uv sync` to provision the Python environment and install backend dependencies. After setup, run `npm run lint`, `npm run typecheck`, and `npm run build`, and report any failures with their causes. Do not request, print, commit, or modify real Kite API credentials; credentials must be configured locally through the app's Settings screen.
+```
+
 The NIFTY 50 universe is refreshed from NSE's live index constituents endpoint once per day. If NSE is unavailable or blocks the request, the bundled list in `backend/nifty_universe.py` is used instead.
 
 ## 🚀 Running the App
