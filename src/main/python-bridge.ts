@@ -23,11 +23,9 @@ class PythonBridge {
       this.pythonPath = path.join(process.resourcesPath, 'backend_dist', platformBinary);
       this.scriptPath = ''; // Not needed for binary
     } else {
-      // In dev mode, use the venv Python and raw script
+      // In dev mode, let uv select and provision the project's environment.
       const basePath = path.join(__dirname, '..', '..', '..');
-      const venvPython = path.join(basePath, 'venv', 'bin', 'python3');
-      const fs = require('fs');
-      this.pythonPath = fs.existsSync(venvPython) ? venvPython : 'python3';
+      this.pythonPath = 'uv';
       this.scriptPath = path.join(basePath, 'backend', 'main.py');
     }
   }
@@ -41,8 +39,8 @@ class PythonBridge {
       console.log(`Starting Python backend binary at ${this.pythonPath}`);
       this.childProcess = spawn(this.pythonPath, [], { cwd: path.dirname(this.pythonPath) });
     } else {
-      console.log(`Starting Python backend script at ${this.scriptPath}`);
-      this.childProcess = spawn(this.pythonPath, ['-m', 'backend.main'], { cwd: path.dirname(path.dirname(this.scriptPath)) });
+      console.log(`Starting Python backend with uv at ${this.scriptPath}`);
+      this.childProcess = spawn(this.pythonPath, ['run', '--locked', 'python', '-m', 'backend.main'], { cwd: path.dirname(path.dirname(this.scriptPath)) });
     }
 
     let stdoutBuffer = '';
