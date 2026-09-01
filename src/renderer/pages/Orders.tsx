@@ -3,8 +3,24 @@ import { useTradingStore } from '../stores/trading-store';
 import OrderForm from '../components/OrderForm';
 
 const Orders: React.FC = () => {
-  const { orders } = useTradingStore();
+  const { orders, setOrders } = useTradingStore();
   const [tab, setTab] = useState<'open' | 'executed' | 'all'>('all');
+
+  React.useEffect(() => {
+    const fetchOrders = async () => {
+      try {
+        const response = await window.electronAPI?.orders.getAll();
+        if (response) {
+          setOrders(response);
+        }
+      } catch (e) {
+        console.error("Failed to fetch orders", e);
+      }
+    };
+    fetchOrders();
+    const interval = setInterval(fetchOrders, 10000);
+    return () => clearInterval(interval);
+  }, [setOrders]);
 
   return (
     <div className="p-6 h-full flex flex-col space-y-6">

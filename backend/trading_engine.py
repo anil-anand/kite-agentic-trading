@@ -203,7 +203,7 @@ class TradingEngine:
                     symbol = p["tradingsymbol"]
                     if symbol in self.active_trades:
                         trade = self.active_trades[symbol]
-                        ltp = p.get("last_price", 0)
+                        ltp = p.get("lastPrice", 0)
                         if ltp == 0:
                             continue
                             
@@ -243,7 +243,7 @@ class TradingEngine:
             for p in positions:
                 if p["quantity"] != 0:
                     tx_type = "SELL" if p["quantity"] > 0 else "BUY"
-                    ltp = p.get("last_price", 0)
+                    ltp = p.get("lastPrice", 0)
                     
                     kite_client.place_order(
                         variety="regular",

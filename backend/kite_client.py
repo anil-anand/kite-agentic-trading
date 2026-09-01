@@ -1,6 +1,18 @@
 from kiteconnect import KiteConnect
 from typing import Dict, List, Any, Optional
 
+def to_camel(s):
+    parts = s.split('_')
+    return parts[0] + ''.join(word.capitalize() for word in parts[1:])
+
+def convert_keys(obj):
+    if isinstance(obj, list):
+        return [convert_keys(i) for i in obj]
+    elif isinstance(obj, dict):
+        return {to_camel(k): convert_keys(v) for k, v in obj.items()}
+    else:
+        return obj
+
 class KiteClient:
     _instance = None
     
@@ -33,10 +45,12 @@ class KiteClient:
         return session
         
     def get_positions(self) -> Dict[str, Any]:
-        return self.kite.positions() if self.kite else {"net": [], "day": []}
+        res = self.kite.positions() if self.kite else {"net": [], "day": []}
+        return convert_keys(res)
         
     def get_orders(self) -> List[Dict[str, Any]]:
-        return self.kite.orders() if self.kite else []
+        res = self.kite.orders() if self.kite else []
+        return convert_keys(res)
         
     def place_order(self, variety, exchange, tradingsymbol, transaction_type, quantity, product, order_type, price=None, validity=None, validity_ttl=None, disclosed_quantity=None, trigger_price=None, squareoff=None, stoploss=None, trailing_stoploss=None, tag=None) -> str:
         return self.kite.place_order(variety, exchange, tradingsymbol, transaction_type, quantity, product, order_type, price, validity, validity_ttl, disclosed_quantity, trigger_price, squareoff, stoploss, trailing_stoploss, tag)
