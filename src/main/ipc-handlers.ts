@@ -122,8 +122,8 @@ export function setupIpcHandlers() {
     return await pythonBridge.call('agent_status');
   });
   
-  ipcMain.handle(channels.AGENT_EXECUTE_SIGNAL, async (_, signalId: string) => {
-    return await pythonBridge.call('agent_execute_signal', { signalId });
+  ipcMain.handle(channels.AGENT_EXECUTE_SIGNAL, async (_, signal: any) => {
+    return await pythonBridge.call('execute_signal', { signal });
   });
   
   ipcMain.handle(channels.AGENT_DISMISS_SIGNAL, async (_, signalId: string) => {

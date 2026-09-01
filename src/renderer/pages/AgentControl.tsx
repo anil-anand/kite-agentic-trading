@@ -219,7 +219,7 @@ const AgentControl: React.FC = () => {
                     <div className="flex gap-2 mt-2 pt-3 border-t border-surface-700">
                       <button 
                         onClick={() => {
-                          window.electronAPI?.portfolio.placeOrder(bestSignal);
+                          window.electronAPI?.invoke('agent:execute-signal', bestSignal);
                           group.signals.forEach(s => useTradingStore.getState().removeSignal(s.id));
                         }} 
                         className="flex-1 bg-profit-dark hover:bg-profit flex items-center justify-center gap-2 py-2 rounded transition-colors text-white text-sm font-medium"
