@@ -1,4 +1,5 @@
 """Tests for the shared BaseStrategy helpers used by every strategy."""
+
 import pytest
 
 from backend.strategies.ema_crossover import EMACrossoverStrategy
@@ -35,8 +36,15 @@ class TestCalculateTarget:
 class TestFormatSignal:
     def test_signal_has_all_required_fields(self, strategy):
         sig = strategy.format_signal(
-            "RELIANCE", "BUY", 82, 100.0, 98.5, 103.0, 2.0,
-            "unit test", {"foo": 1},
+            "RELIANCE",
+            "BUY",
+            82,
+            100.0,
+            98.5,
+            103.0,
+            2.0,
+            "unit test",
+            {"foo": 1},
         )
         assert sig["tradingsymbol"] == "RELIANCE"
         assert sig["exchange"] == "NSE"

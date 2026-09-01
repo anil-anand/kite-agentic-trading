@@ -4,10 +4,11 @@ These run each of the 17 strategies through the same scenarios so a newly
 added strategy is automatically covered for the universal invariants:
 insufficient data is handled, and any emitted signal is well-formed.
 """
+
 import pytest
 
 from backend.scanner import scanner
-from backend.tests.conftest import build_candles, assert_valid_signal
+from backend.tests.conftest import assert_valid_signal, build_candles
 
 # Pull the live strategy registry so new strategies are picked up automatically.
 STRATEGY_ITEMS = list(scanner.strategies.items())

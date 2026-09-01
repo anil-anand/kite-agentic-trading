@@ -4,6 +4,7 @@ Strategy signal calculations are pure functions of an OHLCV DataFrame, so
 these fixtures let us construct deterministic candle data and assert on the
 resulting signals without ever touching the Kite API.
 """
+
 import os
 import tempfile
 
@@ -94,9 +95,19 @@ def assert_valid_signal(sig, entry_tolerance=1e-6):
     """Assert a strategy signal dict has the expected shape and self-consistent
     stop-loss / target placement relative to its direction."""
     required = {
-        "id", "tradingsymbol", "exchange", "strategy", "direction",
-        "confidence", "entryPrice", "stopLoss", "target", "riskReward",
-        "reasoning", "timestamp", "indicators",
+        "id",
+        "tradingsymbol",
+        "exchange",
+        "strategy",
+        "direction",
+        "confidence",
+        "entryPrice",
+        "stopLoss",
+        "target",
+        "riskReward",
+        "reasoning",
+        "timestamp",
+        "indicators",
     }
     assert required.issubset(sig.keys()), f"missing keys: {required - sig.keys()}"
 

@@ -7,10 +7,11 @@ these series are a sine slice cut so the signal lands on the final bar. Each
 `_seed` was found against the real indicator math and is asserted here so a
 regression in a strategy's condition breaks the test.
 """
+
 import numpy as np
 
-from backend.tests.conftest import build_candles, assert_valid_signal
 from backend.scanner import scanner
+from backend.tests.conftest import assert_valid_signal, build_candles
 
 STRAT = scanner.strategies
 
