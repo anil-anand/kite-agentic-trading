@@ -16,6 +16,7 @@ class TradingEngine:
         self.thread = None
         self.mode = "confirm" # auto or confirm
         self.interval = 60 # seconds
+        self.active_trades = {} # tradingsymbol -> { sl, target, direction }
         
     def start(self, mode: str = "confirm"):
         if self.running:
@@ -144,17 +145,66 @@ class TradingEngine:
                 tag=signal["id"][:8]
             )
             self._push_log(f"Executed {transaction_type} for {signal['tradingsymbol']}, qty {qty}, order_id {order_id}")
+            self.active_trades[signal["tradingsymbol"]] = {
+                "sl": signal["stopLoss"],
+                "target": signal["target"],
+                "direction": signal["direction"]
+            }
             return True
         except Exception as e:
             self._push_log(f"Failed to execute signal: {e}")
             return False
             
+    def _get_exit_limit_price(self, ltp: float, tx_type: str) -> float:
+        # A pseudo-market limit order to ensure immediate fill without Kite MARKET restrictions
+        buffer = 0.01 # 1% buffer
+        if tx_type == "BUY":
+            return round(ltp * (1 + buffer), 2)
+        else:
+            return round(ltp * (1 - buffer), 2)
+
     def monitor_positions(self):
         try:
             positions = kite_client.get_positions().get("net", [])
             open_count = sum(1 for p in positions if p["quantity"] != 0)
             risk_manager.set_open_positions(open_count)
-            # Add complex stop-loss and trailing logic here
+            
+            # Evaluate SL and Targets
+            for p in positions:
+                if p["quantity"] != 0:
+                    symbol = p["tradingsymbol"]
+                    if symbol in self.active_trades:
+                        trade = self.active_trades[symbol]
+                        ltp = p.get("last_price", 0)
+                        if ltp == 0:
+                            continue
+                            
+                        hit_sl = False
+                        hit_target = False
+                        
+                        if trade["direction"] == "BUY":
+                            if ltp <= trade["sl"]: hit_sl = True
+                            if ltp >= trade["target"]: hit_target = True
+                        else:
+                            if ltp >= trade["sl"]: hit_sl = True
+                            if ltp <= trade["target"]: hit_target = True
+                            
+                        if hit_sl or hit_target:
+                            reason = "Stop Loss" if hit_sl else "Target"
+                            self._push_log(f"{reason} hit for {symbol} at {ltp}. Exiting position.")
+                            
+                            tx_type = "SELL" if p["quantity"] > 0 else "BUY"
+                            kite_client.place_order(
+                                variety="regular",
+                                exchange=p["exchange"],
+                                tradingsymbol=symbol,
+                                transaction_type=tx_type,
+                                quantity=abs(p["quantity"]),
+                                product=p["product"],
+                                order_type="LIMIT",
+                                price=self._get_exit_limit_price(ltp, tx_type)
+                            )
+                            del self.active_trades[symbol]
         except Exception as e:
             self._push_log(f"Error monitoring positions: {e}")
             
@@ -165,6 +215,8 @@ class TradingEngine:
             for p in positions:
                 if p["quantity"] != 0:
                     tx_type = "SELL" if p["quantity"] > 0 else "BUY"
+                    ltp = p.get("last_price", 0)
+                    
                     kite_client.place_order(
                         variety="regular",
                         exchange=p["exchange"],
@@ -172,8 +224,11 @@ class TradingEngine:
                         transaction_type=tx_type,
                         quantity=abs(p["quantity"]),
                         product=p["product"],
-                        order_type="MARKET"
+                        order_type="LIMIT",
+                        price=self._get_exit_limit_price(ltp, tx_type) if ltp > 0 else 0
                     )
+                    if p["tradingsymbol"] in self.active_trades:
+                        del self.active_trades[p["tradingsymbol"]]
         except Exception as e:
             self._push_log(f"Error in square off: {e}")
 
