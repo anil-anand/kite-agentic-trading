@@ -40,7 +40,12 @@ def test_fetches_and_parses_nifty50_from_nse(monkeypatch):
         [
             FakeResponse({}, FakeHeaders(["nse cookie=value; Path=/"])),
             FakeResponse(
-                {"data": [{"symbol": "NIFTY 50"}, *[{"symbol": symbol} for symbol in symbols] ]}
+                {
+                    "data": [
+                        {"symbol": "NIFTY 50"},
+                        *[{"symbol": symbol} for symbol in symbols],
+                    ]
+                }
             ),
         ]
     )
