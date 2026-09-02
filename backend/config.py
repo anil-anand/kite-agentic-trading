@@ -1,3 +1,4 @@
+import datetime
 import json
 from copy import deepcopy
 from pathlib import Path
@@ -254,6 +255,47 @@ class ConfigManager:
         path = self.config_dir / "historical_orders.json"
         with open(path, "w") as f:
             json.dump(orders, f, indent=4, default=str)
+
+    def save_active_trades(self, trades: dict):
+        """Persist the trading engine's active_trades to disk.
+
+        entry_time is a datetime; it's stored as an ISO string and restored by
+        load_active_trades so the engine can resume managing positions after a
+        crash or restart.
+        """
+        path = self.config_dir / "active_trades.json"
+        serializable = {}
+        for symbol, trade in trades.items():
+            record = dict(trade)
+            entry_time = record.get("entry_time")
+            if isinstance(entry_time, (datetime.datetime, datetime.date)):
+                record["entry_time"] = entry_time.isoformat()
+            serializable[symbol] = record
+        with open(path, "w") as f:
+            json.dump(serializable, f, indent=4, default=str)
+
+    def load_active_trades(self) -> dict:
+        """Load persisted active_trades, restoring entry_time to a datetime.
+
+        Returns {} if there's nothing persisted or the file is unreadable —
+        the engine reconciles against live positions regardless.
+        """
+        path = self.config_dir / "active_trades.json"
+        if not path.exists():
+            return {}
+        try:
+            with open(path, "r") as f:
+                trades = json.load(f)
+        except Exception:
+            return {}
+        for trade in trades.values():
+            entry_time = trade.get("entry_time")
+            if isinstance(entry_time, str):
+                try:
+                    trade["entry_time"] = datetime.datetime.fromisoformat(entry_time)
+                except ValueError:
+                    trade["entry_time"] = datetime.datetime.now()
+        return trades
 
 
 config_manager = ConfigManager()

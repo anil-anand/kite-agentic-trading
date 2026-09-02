@@ -41,6 +41,115 @@ class TradingEngine:
         self._tick_size_map = {}
         self._reserved_entry_margin = 0.0
 
+    # Kite order statuses that mean an order is still live (protecting / working).
+    _OPEN_ORDER_STATUSES = {"OPEN", "TRIGGER PENDING"}
+
+    def _persist_trades(self):
+        """Snapshot active_trades to disk so it survives a crash/restart."""
+        try:
+            with self._trade_lock:
+                snapshot = {s: dict(t) for s, t in self.active_trades.items()}
+            config_manager.save_active_trades(snapshot)
+        except Exception as e:
+            self._push_log(f"Failed to persist active trades: {e}", level="warning")
+
+    def _open_order_ids(self) -> set:
+        """Set of order ids that are currently live at the broker."""
+        try:
+            orders = kite_client.get_orders()
+        except Exception:
+            return set()
+        return {
+            str(o.get("orderId"))
+            for o in orders
+            if str(o.get("status", "")).upper() in self._OPEN_ORDER_STATUSES
+        }
+
+    def reconcile_active_trades(self):
+        """Reconcile persisted active_trades against live broker state on startup.
+
+        active_trades lives only in memory while the engine runs, so a crash or
+        restart loses all stop/target tracking and can orphan broker-side stop
+        orders. On start we reload the persisted trades and:
+
+        - drop any trade whose position is no longer open (it closed while we
+          were down), cancelling a lingering protective stop if one is still live;
+        - for a position that's still open, verify its protective stop order is
+          still live and re-place it if it's gone (cancelled, filled, or never
+          recorded) — so no resumed position is left unprotected;
+        - clear a stale exit_pending unless the recorded exit order is still
+          working, in which case we keep waiting on it.
+
+        Untracked live positions are intentionally left to the normal
+        auto-mode adoption path in monitor_positions.
+        """
+        persisted = config_manager.load_active_trades()
+        if not persisted:
+            return
+
+        try:
+            positions = kite_client.get_positions().get("net", [])
+        except Exception as e:
+            self._push_log(f"Reconcile: failed to fetch positions: {e}", level="error")
+            return
+
+        open_map = {
+            p["tradingsymbol"]: p for p in positions if p.get("quantity", 0) != 0
+        }
+        open_orders = self._open_order_ids()
+
+        reconciled = {}
+        for symbol, trade in persisted.items():
+            pos = open_map.get(symbol)
+            if not pos:
+                stop_id = trade.get("stop_order_id")
+                if stop_id and str(stop_id) in open_orders:
+                    try:
+                        kite_client.cancel_order("regular", stop_id)
+                    except Exception:
+                        pass
+                self._push_log(
+                    f"Reconcile: {symbol} no longer open; dropping stale tracking."
+                )
+                continue
+
+            # Position still open — ensure a live protective stop.
+            stop_id = trade.get("stop_order_id")
+            if not stop_id or str(stop_id) not in open_orders:
+                self._push_log(
+                    f"Reconcile: {symbol} is open with no live protective stop; re-placing.",
+                    level="warning",
+                )
+                new_stop_id = self._place_protective_stop(
+                    {
+                        "tradingsymbol": symbol,
+                        "direction": trade["direction"],
+                        "stopLoss": trade["sl"],
+                    },
+                    abs(pos["quantity"]),
+                    pos.get("exchange", trade.get("exchange", "NSE")),
+                    pos.get("product", "MIS"),
+                )
+                trade["stop_order_id"] = new_stop_id or None
+
+            # Keep waiting on an exit that's still working; otherwise clear it.
+            exit_id = trade.get("exit_order_id")
+            if exit_id and str(exit_id) in open_orders:
+                trade["exit_pending"] = True
+            else:
+                trade["exit_pending"] = False
+                trade["exit_order_id"] = None
+
+            trade.setdefault("exchange", pos.get("exchange", "NSE"))
+            reconciled[symbol] = trade
+
+        with self._trade_lock:
+            self.active_trades = reconciled
+        self._persist_trades()
+        self._push_log(
+            f"Reconcile complete: {len(reconciled)} active trade(s) resumed."
+        )
+
     def _get_tick_size(self, symbol: str, exchange: str = "NSE") -> float:
         if symbol in self._tick_size_map:
             return self._tick_size_map[symbol]
@@ -65,6 +174,13 @@ class TradingEngine:
             return
 
         self.mode = mode
+        # Resume managing any positions that were open when we last ran, before
+        # the monitor loop starts. Failures here must not block startup.
+        try:
+            self.reconcile_active_trades()
+        except Exception as e:
+            self._push_log(f"Reconcile on start failed: {e}", level="error")
+
         self.running = True
         self.thread = threading.Thread(target=self._run_loop)
         self.thread.daemon = True
@@ -374,6 +490,7 @@ class TradingEngine:
                     "exit_order_id": None,
                     "exchange": position.get("exchange", exchange),
                 }
+            self._persist_trades()
             return True
         except Exception as e:
             with self._trade_lock:
@@ -496,6 +613,8 @@ class TradingEngine:
                     self._place_exit_order(live, symbol, reason)
         except Exception as e:
             self._push_log(f"Error monitoring positions: {e}")
+        finally:
+            self._persist_trades()
 
     def _find_live_position_by_symbol(self, symbol: str) -> dict:
         """Fetch the current open position for a symbol, or {} if flat/closed."""
@@ -714,6 +833,8 @@ class TradingEngine:
                 except Exception:
                     pass
 
+        self._persist_trades()
+
     def _tighten_to_breakeven(self, symbol: str):
         """Move the stop-loss to the entry price (breakeven), both in-memory and broker-side."""
         with self._trade_lock:
@@ -790,6 +911,8 @@ class TradingEngine:
                     self._place_exit_order(p, p["tradingsymbol"], "Square off")
         except Exception as e:
             self._push_log(f"Error in square off: {e}")
+        finally:
+            self._persist_trades()
 
     def _wait_for_entry_fill(
         self, signal: dict, order_id: str, baseline_quantity: int = 0
