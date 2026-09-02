@@ -13,6 +13,7 @@ def temp_journal(tmp_path):
     journal = TradeJournal(db_path=str(db_file))
     return journal
 
+
 def test_journal_open_close_trade(temp_journal):
     trade_id = "test_123"
 
@@ -32,7 +33,7 @@ def test_journal_open_close_trade(temp_journal):
         reasoning="MACD crossed above signal line",
         confidence=85,
         confluence_snapshot={"MACD_Crossover": "BUY"},
-        indicator_snapshot={"RSI": 60}
+        indicator_snapshot={"RSI": 60},
     )
 
     # Check if trade exists
@@ -72,14 +73,21 @@ def test_journal_open_close_trade(temp_journal):
     assert events[2]["event_type"] == "exit_filled"
     assert json.loads(events[2]["details"])["exit_price"] == 2520.00
 
+
 def test_get_trades_ordering(temp_journal):
     # Insert multiple trades to test ordering
     # We will just insert directly via conn to simulate different entry times
     conn = temp_journal._get_conn()
     with conn:
-        conn.execute("INSERT INTO trades (id, entry_time) VALUES ('t1', '2026-09-01T10:00:00')")
-        conn.execute("INSERT INTO trades (id, entry_time) VALUES ('t2', '2026-09-02T10:00:00')")
-        conn.execute("INSERT INTO trades (id, entry_time) VALUES ('t3', '2026-08-30T10:00:00')")
+        conn.execute(
+            "INSERT INTO trades (id, entry_time) VALUES ('t1', '2026-09-01T10:00:00')"
+        )
+        conn.execute(
+            "INSERT INTO trades (id, entry_time) VALUES ('t2', '2026-09-02T10:00:00')"
+        )
+        conn.execute(
+            "INSERT INTO trades (id, entry_time) VALUES ('t3', '2026-08-30T10:00:00')"
+        )
 
     trades = temp_journal.get_trades()
     assert len(trades) == 3
