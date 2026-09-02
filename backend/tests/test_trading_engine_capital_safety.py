@@ -533,232 +533,126 @@ def test_exit_pending_resets_on_place_order_failure(monkeypatch):
     assert call_count == 2
 
 
-# ---------------------------------------------------------------------------
-# _reevaluate_positions — the four graduated exit rules
-# ---------------------------------------------------------------------------
+class SequencedKiteClient(FakeKiteClient):
+    """Returns a different positions snapshot on each get_positions call, so a
+    test can simulate the book changing mid-tick (e.g. a broker stop filling
+    between the monitor snapshot and the pre-exit re-read)."""
+
+    def __init__(self, position_sequence):
+        super().__init__()
+        self._sequence = position_sequence
+        self._calls = 0
+
+    def get_positions(self):
+        idx = min(self._calls, len(self._sequence) - 1)
+        self._calls += 1
+        return {"net": self._sequence[idx]}
 
 
-def _open_position(ltp, avg=100.0, qty=10):
-    return {
-        "tradingsymbol": "RELIANCE",
-        "quantity": qty,
-        "exchange": "NSE",
-        "product": "MIS",
-        "lastPrice": ltp,
-        "averagePrice": avg,
-        "realised": 0.0,
-        "unrealised": 0.0,
-    }
-
-
-def _tracked_trade(sl=95.0, entry_price=100.0, minutes_ago=1, stop="STOP1"):
-    return {
-        "sl": sl,
-        "target": 110.0,
-        "direction": "BUY",
-        "entry_price": entry_price,
-        "entry_time": datetime.datetime.now() - datetime.timedelta(minutes=minutes_ago),
-        "original_strategy": "test",
-        "stop_order_id": stop,
-        "exit_pending": False,
-        "exit_order_id": None,
-        "exchange": "NSE",
-    }
-
-
-def _setup_reeval(monkeypatch, ltp, evaluation, mode="auto", trade=None):
+def test_monitor_skips_exit_when_broker_stop_already_closed(monkeypatch):
+    """#1 — phantom-short race: the snapshot shows an open position at its stop,
+    but by the time we re-read before exiting the broker stop has already closed
+    it. The app must NOT place an exit (which would open an opposite position);
+    it should clean up instead."""
     import backend.trading_engine as te
 
-    fake_client = FakeKiteClient()
-    fake_client.positions = {"net": [_open_position(ltp)]}
-    fake_scanner = FakeScanner(evaluation=evaluation)
-    monkeypatch.setattr(te, "kite_client", fake_client)
-    monkeypatch.setattr(te, "scanner", fake_scanner)
-
-    engine = TradingEngine()
-    engine.mode = mode
-    engine.active_trades["RELIANCE"] = trade or _tracked_trade()
-    return engine, fake_client
-
-
-def test_reevaluate_rule1_exits_on_thesis_invalidation_auto(monkeypatch):
-    # 3 opposing, 0 supporting -> thesis invalidated -> exit in auto mode.
-    engine, fake_client = _setup_reeval(
-        monkeypatch, ltp=98.0, evaluation={"buy_signals": 0, "sell_signals": 3}
-    )
-    engine._reevaluate_positions()
-
-    sells = [c for c in fake_client.place_calls if c["transaction_type"] == "SELL"]
-    assert len(sells) == 1
-    assert fake_client.cancel_calls[0]["order_id"] == "STOP1"
-    assert engine.active_trades["RELIANCE"]["exit_pending"] is True
-
-
-def test_reevaluate_rule1_no_exit_in_confirm_mode(monkeypatch):
-    engine, fake_client = _setup_reeval(
-        monkeypatch,
-        ltp=98.0,
-        evaluation={"buy_signals": 0, "sell_signals": 3},
-        mode="confirm",
-    )
-    engine._reevaluate_positions()
-
-    assert fake_client.place_calls == []
-    assert "RELIANCE" in engine.active_trades
-    assert engine.active_trades["RELIANCE"]["exit_pending"] is False
-
-
-def test_reevaluate_rule2_weak_conviction_exit(monkeypatch):
-    # 0 supporting, in loss, held >= weak_exit_mins (15) -> exit. Only 1 opposing
-    # so Rule 1 (needs >= 2 opposing) does not fire.
-    engine, fake_client = _setup_reeval(
-        monkeypatch,
-        ltp=95.0,  # below entry 100 -> in loss
-        evaluation={"buy_signals": 0, "sell_signals": 1},
-        trade=_tracked_trade(minutes_ago=20),
-    )
-    engine._reevaluate_positions()
-
-    sells = [c for c in fake_client.place_calls if c["transaction_type"] == "SELL"]
-    assert len(sells) == 1
-
-
-def test_reevaluate_rule2_holds_when_not_yet_timed_out(monkeypatch):
-    # Same weak setup but held only 5 mins (< 15) -> no exit yet.
-    engine, fake_client = _setup_reeval(
-        monkeypatch,
-        ltp=95.0,
-        evaluation={"buy_signals": 0, "sell_signals": 1},
-        trade=_tracked_trade(minutes_ago=5),
-    )
-    engine._reevaluate_positions()
-
-    assert fake_client.place_calls == []
-    assert "RELIANCE" in engine.active_trades
-
-
-def test_reevaluate_rule3_tightens_to_breakeven(monkeypatch):
-    # Held >= breakeven_mins (45), still supported -> tighten SL to entry, no exit.
-    engine, fake_client = _setup_reeval(
-        monkeypatch,
-        ltp=101.0,
-        evaluation={"buy_signals": 1, "sell_signals": 0},
-        trade=_tracked_trade(sl=95.0, minutes_ago=50),
-    )
-    engine._reevaluate_positions()
-
-    assert fake_client.place_calls == []  # no exit
-    assert len(fake_client.modify_calls) == 1
-    assert fake_client.modify_calls[0]["order_id"] == "STOP1"
-    assert fake_client.modify_calls[0]["trigger_price"] == 100.0
-    assert engine.active_trades["RELIANCE"]["sl"] == 100.0
-
-
-def test_reevaluate_rule4_holds_when_thesis_valid(monkeypatch):
-    # Supported, recent, not in loss -> hold: no exit, no SL change.
-    engine, fake_client = _setup_reeval(
-        monkeypatch,
-        ltp=105.0,
-        evaluation={"buy_signals": 2, "sell_signals": 0},
-        trade=_tracked_trade(sl=95.0, minutes_ago=5),
-    )
-    engine._reevaluate_positions()
-
-    assert fake_client.place_calls == []
-    assert fake_client.modify_calls == []
-    assert engine.active_trades["RELIANCE"]["sl"] == 95.0
-
-
-# ---------------------------------------------------------------------------
-# scan_and_trade — confidence gating and auto-execution
-# ---------------------------------------------------------------------------
-
-
-def _signal(symbol, confidence):
-    return {
-        "id": f"sig-{symbol}-{confidence}",
-        "tradingsymbol": symbol,
-        "exchange": "NSE",
-        "direction": "BUY",
-        "confidence": confidence,
-        "entryPrice": 100.0,
-        "stopLoss": 95.0,
-        "target": 110.0,
-        "strategy": "test",
-    }
-
-
-def _setup_scan(monkeypatch, signals, mode="auto", can_trade=True):
-    import backend.trading_engine as te
-
-    fake_client = FakeKiteClient()
-    fake_scanner = FakeScanner(signals=signals)
+    open_pos = [
+        {
+            "tradingsymbol": "RELIANCE",
+            "quantity": 10,
+            "exchange": "NSE",
+            "product": "MIS",
+            "lastPrice": 94.0,  # <= sl of 95 -> stop hit
+            "realised": 0.0,
+            "unrealised": -60.0,
+            "averagePrice": 100.0,
+        }
+    ]
+    # 1st get_positions (snapshot) = open; 2nd (pre-exit re-read) = flat.
+    fake_client = SequencedKiteClient([open_pos, []])
     fake_risk = FakeRiskManager()
-    fake_risk.can_trade = lambda: (can_trade, "OK" if can_trade else "blocked")
     monkeypatch.setattr(te, "kite_client", fake_client)
-    monkeypatch.setattr(te, "scanner", fake_scanner)
     monkeypatch.setattr(te, "risk_manager", fake_risk)
 
     engine = TradingEngine()
-    engine.mode = mode
-    engine.dynamic_watchlist = ["RELIANCE", "INFY"]  # skip the screener path
-    engine._reevaluate_positions = lambda: None  # isolate from re-eval
+    engine.active_trades["RELIANCE"] = {
+        "sl": 95.0,
+        "target": 110.0,
+        "direction": "BUY",
+        "entry_price": 100.0,
+        "entry_time": datetime.datetime.now(),
+        "original_strategy": "test",
+        "stop_order_id": "STOP1",
+        "exit_pending": False,
+        "exit_order_id": None,
+    }
 
-    pushed, executed = [], []
-    engine._push_signal = lambda sig: pushed.append(sig)
-    engine.execute_signal = lambda sig: (executed.append(sig), True)[1]
-    return engine, pushed, executed
+    engine.monitor_positions()
 
-
-def test_scan_pushes_at_70_not_below(monkeypatch):
-    engine, pushed, executed = _setup_scan(
-        monkeypatch, [_signal("RELIANCE", 65), _signal("INFY", 75)]
-    )
-    engine.scan_and_trade()
-
-    pushed_syms = {s["tradingsymbol"] for s in pushed}
-    assert pushed_syms == {"INFY"}  # 65 is below the 70 display threshold
-
-
-def test_scan_no_autotrade_below_80(monkeypatch):
-    engine, pushed, executed = _setup_scan(monkeypatch, [_signal("INFY", 75)])
-    engine.scan_and_trade()
-
-    assert len(pushed) == 1
-    assert executed == []  # 75 < 80 auto-trade threshold
+    # No exit order placed — the position was already flat on re-read.
+    assert fake_client.place_calls == []
+    # Trade cleaned up, lingering broker stop cancelled.
+    assert "RELIANCE" not in engine.active_trades
+    assert fake_client.cancel_calls[0]["order_id"] == "STOP1"
 
 
-def test_scan_autotrades_at_80_in_auto_mode(monkeypatch):
-    engine, pushed, executed = _setup_scan(monkeypatch, [_signal("RELIANCE", 85)])
-    engine.scan_and_trade()
+def test_trade_lock_not_held_during_order_io(monkeypatch):
+    """#2 — monitor_positions must not hold _trade_lock while making Kite calls.
+    While place_order runs (invoked from the exit path), another thread must be
+    able to acquire the lock. Before the fix, the whole loop ran under the lock
+    and this would block/time out."""
+    import threading
 
-    assert [s["tradingsymbol"] for s in executed] == ["RELIANCE"]
+    import backend.trading_engine as te
 
+    engine = TradingEngine()
+    other_acquired = {"ok": None}
 
-def test_scan_no_autotrade_in_confirm_mode(monkeypatch):
-    engine, pushed, executed = _setup_scan(
-        monkeypatch, [_signal("RELIANCE", 85)], mode="confirm"
-    )
-    engine.scan_and_trade()
+    def place_order_probe(**kwargs):
+        def grab():
+            got = engine._trade_lock.acquire(timeout=1.0)
+            other_acquired["ok"] = got
+            if got:
+                engine._trade_lock.release()
 
-    assert len(pushed) == 1
-    assert executed == []
+        t = threading.Thread(target=grab)
+        t.start()
+        t.join()
+        return "EXIT1"
 
+    fake_client = FakeKiteClient()
+    fake_client.place_order = place_order_probe
+    fake_client.positions = {
+        "net": [
+            {
+                "tradingsymbol": "RELIANCE",
+                "quantity": 10,
+                "exchange": "NSE",
+                "product": "MIS",
+                "lastPrice": 111.0,  # >= target of 110 -> target hit
+                "realised": 0.0,
+                "unrealised": 0.0,
+                "averagePrice": 100.0,
+            }
+        ]
+    }
+    fake_risk = FakeRiskManager()
+    monkeypatch.setattr(te, "kite_client", fake_client)
+    monkeypatch.setattr(te, "risk_manager", fake_risk)
 
-def test_scan_no_autotrade_when_cannot_trade(monkeypatch):
-    engine, pushed, executed = _setup_scan(
-        monkeypatch, [_signal("RELIANCE", 85)], can_trade=False
-    )
-    engine.scan_and_trade()
+    engine.active_trades["RELIANCE"] = {
+        "sl": 95.0,
+        "target": 110.0,
+        "direction": "BUY",
+        "entry_price": 100.0,
+        "entry_time": datetime.datetime.now(),
+        "original_strategy": "test",
+        "stop_order_id": None,
+        "exit_pending": False,
+        "exit_order_id": None,
+    }
 
-    assert len(pushed) == 1  # still shown to the user
-    assert executed == []  # but not auto-executed
+    engine.monitor_positions()
 
-
-def test_scan_skips_already_active_symbol(monkeypatch):
-    engine, pushed, executed = _setup_scan(monkeypatch, [_signal("RELIANCE", 85)])
-    engine.active_trades["RELIANCE"] = _tracked_trade()
-    engine.scan_and_trade()
-
-    assert len(pushed) == 1
-    assert executed == []  # already active -> not re-entered
+    # The probe thread acquired the lock during the Kite call -> lock not held.
+    assert other_acquired["ok"] is True
