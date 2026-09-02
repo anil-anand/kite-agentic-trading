@@ -112,7 +112,7 @@ def handle_request(req):
             return success(kite_client.search_instruments(params.get("query", "")))
 
         elif method == "start_agent":
-            mode = params.get("mode", "confirm")
+            mode = params.get("mode", "auto")
             trading_engine.start(mode)
             return success({"status": "started", "mode": mode})
 

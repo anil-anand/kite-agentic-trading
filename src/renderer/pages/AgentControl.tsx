@@ -15,7 +15,7 @@ const AgentControl: React.FC = () => {
         setAgentState({ running: false });
         useTradingStore.getState().setSignals([]); // Clear live signals on stop
       } else {
-        await startAgent(agentState.mode || 'confirm');
+        await startAgent(agentState.mode || 'auto');
         setAgentState({ running: true });
       }
     } catch (e) {

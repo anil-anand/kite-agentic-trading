@@ -48,7 +48,7 @@ export const useTradingStore = create<TradingState>()(
       margins: null,
       agentState: {
         running: false,
-        mode: 'confirm',
+        mode: 'auto',
         enabledStrategies: [],
         tradesToday: 0,
         signalsGenerated: 0,
@@ -109,7 +109,12 @@ export const useTradingStore = create<TradingState>()(
         watchlist: state.watchlist,
         settings: state.settings,
         agentState: {
-          ...state.agentState,
+          enabledStrategies: state.agentState.enabledStrategies,
+          tradesToday: state.agentState.tradesToday,
+          signalsGenerated: state.agentState.signalsGenerated,
+          currentPnl: state.agentState.currentPnl,
+          maxDrawdownToday: state.agentState.maxDrawdownToday,
+          lastScanTime: state.agentState.lastScanTime,
           running: false,
           status: 'idle',
           statusMessage: ''

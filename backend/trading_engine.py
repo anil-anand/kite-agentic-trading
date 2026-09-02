@@ -20,7 +20,7 @@ class TradingEngine:
     def __init__(self):
         self.running = False
         self.thread = None
-        self.mode = "confirm"  # auto or confirm
+        self.mode = "auto"  # auto or confirm
         self.interval = 60  # seconds
         self.active_trades = {}  # tradingsymbol -> { sl, target, direction, entry_price, entry_time, original_strategy, stop_order_id, exit_pending, exit_order_id }
         self._instrument_map = {}  # cached symbol -> instrument_token map
@@ -58,7 +58,7 @@ class TradingEngine:
     def _round_to_tick(self, price: float, tick_size: float) -> float:
         return round(round(price / tick_size) * tick_size, 2)
 
-    def start(self, mode: str = "confirm"):
+    def start(self, mode: str = "auto"):
         if self.running:
             return
 

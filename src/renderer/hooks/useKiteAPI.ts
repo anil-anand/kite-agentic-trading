@@ -46,12 +46,19 @@ export const useKiteAPI = () => {
         }
         const agentStat = await window.electronAPI?.invoke(IPC.AGENT_STATUS);
         if (agentStat) {
-          store.setAgentState({ running: agentStat.running, mode: agentStat.mode || 'confirm' });
+          store.setAgentState({ running: agentStat.running, mode: agentStat.mode || 'auto' });
         }
         const settings = await window.electronAPI?.invoke(IPC.SETTINGS_GET);
-        if (settings && settings.strategies) {
-           const enabledStrats = Object.keys(settings.strategies).filter(s => settings.strategies[s].enabled);
-           store.setAgentState({ enabledStrategies: enabledStrats });
+        if (settings) {
+           if (settings.strategies) {
+             const enabledStrats = Object.keys(settings.strategies).filter(s => settings.strategies[s].enabled);
+             store.setAgentState({ enabledStrategies: enabledStrats });
+           }
+           if (settings.mode) {
+             store.setAgentState({ mode: settings.mode });
+           } else {
+             store.setAgentState({ mode: 'auto' });
+           }
            store.setSettings(settings);
         }
       } catch (e) {

@@ -66,6 +66,7 @@ class ConfigManager:
                 "NESTLEIND",
             ],
             "credentials": {"apiKey": "", "apiSecret": ""},
+            "mode": "auto",
         }
 
         self._init_dir()
