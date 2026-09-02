@@ -4,7 +4,7 @@ import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, List, Optional
 
 
 class TradeJournal:
