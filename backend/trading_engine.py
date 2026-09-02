@@ -337,106 +337,164 @@ class TradingEngine:
             # Get symbols of currently open positions to track manual closures
             open_symbols = {p["tradingsymbol"] for p in positions if p["quantity"] != 0}
 
+            # Snapshot in-memory state under a short lock. All Kite calls below
+            # run WITHOUT the lock held, so a slow broker API can't freeze the
+            # JSON-RPC thread or the scanner callback (both need this lock).
             with self._trade_lock:
-                # Clean up active_trades if position was closed manually via Kite App
                 symbols_to_remove = [
                     s for s in self.active_trades if s not in open_symbols
                 ]
-                for symbol in symbols_to_remove:
+                tracked = set(self.active_trades.keys())
+                pending = set(self._pending_entries)
+
+            # Manual closures: cancel the broker stop (network), then drop tracking.
+            for symbol in symbols_to_remove:
+                self._push_log(
+                    f"Detected manual closure for {symbol}. Removing from tracking."
+                )
+                self._cancel_protective_stop(symbol)
+                with self._trade_lock:
+                    self.active_trades.pop(symbol, None)
+
+            # Evaluate each open position. Trade state is re-read under a short
+            # lock immediately before each decision.
+            for p in positions:
+                if p["quantity"] == 0:
+                    continue
+                symbol = p["tradingsymbol"]
+
+                if (
+                    symbol not in tracked
+                    and symbol not in pending
+                    and self.mode == "auto"
+                ):
+                    self._adopt_position(p)
+                    continue
+
+                with self._trade_lock:
+                    trade = self.active_trades.get(symbol)
+                    if not trade:
+                        continue
+                    exit_pending = trade.get("exit_pending")
+                    direction = trade["direction"]
+                    sl = trade["sl"]
+                    target = trade["target"]
+
+                if exit_pending:
+                    self._sync_exit_pending_status(symbol)
+                    continue
+
+                ltp = p.get("lastPrice", 0)
+                if ltp == 0:
+                    continue
+
+                if direction == "BUY":
+                    hit_sl = ltp <= sl
+                    hit_target = ltp >= target
+                else:
+                    hit_sl = ltp >= sl
+                    hit_target = ltp <= target
+
+                if hit_sl or hit_target:
+                    reason = "Stop Loss" if hit_sl else "Target"
                     self._push_log(
-                        f"Detected manual closure for {symbol}. Removing from tracking."
+                        f"{reason} hit for {symbol} at {ltp}. Exiting position."
                     )
-                    self._cancel_protective_stop(symbol)
-                    del self.active_trades[symbol]
-
-                # Evaluate SL and Targets
-                for p in positions:
-                    if p["quantity"] != 0:
-                        symbol = p["tradingsymbol"]
-
-                        # Adopt untracked positions in auto mode
-                        if (
-                            symbol not in self.active_trades
-                            and symbol not in self._pending_entries
-                            and self.mode == "auto"
-                        ):
-                            avg_price = p.get("averagePrice", 0)
-                            if avg_price > 0:
-                                direction = "BUY" if p["quantity"] > 0 else "SELL"
-                                risk_config = config_manager.get_risk_config()
-                                sl_pct = risk_config.get("defaultStopLossPercent", 1.5)
-                                tgt_pct = risk_config.get("defaultTargetPercent", 3.0)
-                                exchange = p.get("exchange", "NSE")
-                                tick_size = self._get_tick_size(symbol, exchange)
-
-                                if direction == "BUY":
-                                    sl = avg_price * (1 - sl_pct / 100)
-                                    target = avg_price * (1 + tgt_pct / 100)
-                                else:
-                                    sl = avg_price * (1 + sl_pct / 100)
-                                    target = avg_price * (1 - tgt_pct / 100)
-
-                                sl = self._round_to_tick(sl, tick_size)
-                                target = self._round_to_tick(target, tick_size)
-
-                                adopted_signal = {
-                                    "tradingsymbol": symbol,
-                                    "direction": direction,
-                                    "stopLoss": sl,
-                                }
-                                stop_order_id = self._place_protective_stop(
-                                    adopted_signal,
-                                    abs(p["quantity"]),
-                                    exchange,
-                                    p.get("product", "MIS"),
-                                )
-                                self.active_trades[symbol] = {
-                                    "sl": sl,
-                                    "target": target,
-                                    "direction": direction,
-                                    "entry_price": avg_price,
-                                    "entry_time": datetime.datetime.now(),
-                                    "original_strategy": "manual",
-                                    "stop_order_id": stop_order_id,
-                                    "exit_pending": False,
-                                    "exit_order_id": None,
-                                    "exchange": exchange,
-                                }
-                                self._push_log(
-                                    f"Adopted open position {symbol} ({direction}) at ₹{avg_price}. Auto-calculated SL: ₹{sl}, Target: ₹{target}"
-                                )
-
-                        if symbol in self.active_trades:
-                            trade = self.active_trades[symbol]
-                            if trade.get("exit_pending"):
-                                self._sync_exit_pending_status(symbol)
-                                continue
-                            ltp = p.get("lastPrice", 0)
-                            if ltp == 0:
-                                continue
-
-                            hit_sl = False
-                            hit_target = False
-
-                            if trade["direction"] == "BUY":
-                                if ltp <= trade["sl"]:
-                                    hit_sl = True
-                                if ltp >= trade["target"]:
-                                    hit_target = True
-                            else:
-                                if ltp >= trade["sl"]:
-                                    hit_sl = True
-                                if ltp <= trade["target"]:
-                                    hit_target = True
-
-                            if hit_sl or hit_target:
-                                reason = "Stop Loss" if hit_sl else "Target"
-                                self._push_log(
-                                    f"{reason} hit for {symbol} at {ltp}. Exiting position."
-                                )
-                                self._place_exit_order(p, symbol)
+                    # Re-read the live position right before exiting. If the
+                    # broker's protective stop already closed it, our snapshot is
+                    # stale — placing an exit now would sell a flat position into
+                    # a new (opposite) position. Skip and clean up in that case;
+                    # otherwise exit against the actual live position.
+                    live = self._find_live_position_by_symbol(symbol)
+                    if not live:
+                        self._push_log(
+                            f"{symbol} already flat before exit (broker stop likely filled). Cleaning up.",
+                            level="warning",
+                        )
+                        self._cancel_protective_stop(symbol)
+                        with self._trade_lock:
+                            self.active_trades.pop(symbol, None)
+                        continue
+                    self._place_exit_order(live, symbol, reason)
         except Exception as e:
             self._push_log(f"Error monitoring positions: {e}")
+
+    def _find_live_position_by_symbol(self, symbol: str) -> dict:
+        """Fetch the current open position for a symbol, or {} if flat/closed."""
+        try:
+            positions = kite_client.get_positions().get("net", [])
+        except Exception:
+            return {}
+        for p in positions:
+            if p.get("tradingsymbol") == symbol and p.get("quantity", 0) != 0:
+                return p
+        return {}
+
+    def _adopt_position(self, p: dict):
+        """Adopt an untracked open position (auto mode) with a protective stop.
+
+        Kite calls run without the trade lock held; the trade is registered under
+        a short lock, and a lost race (another path started tracking the symbol)
+        cancels the just-placed stop to avoid an orphaned broker order.
+        """
+        symbol = p["tradingsymbol"]
+        avg_price = p.get("averagePrice", 0)
+        if avg_price <= 0:
+            return
+
+        direction = "BUY" if p["quantity"] > 0 else "SELL"
+        risk_config = config_manager.get_risk_config()
+        sl_pct = risk_config.get("defaultStopLossPercent", 1.5)
+        tgt_pct = risk_config.get("defaultTargetPercent", 3.0)
+        exchange = p.get("exchange", "NSE")
+        tick_size = self._get_tick_size(symbol, exchange)
+
+        if direction == "BUY":
+            sl = avg_price * (1 - sl_pct / 100)
+            target = avg_price * (1 + tgt_pct / 100)
+        else:
+            sl = avg_price * (1 + sl_pct / 100)
+            target = avg_price * (1 - tgt_pct / 100)
+
+        sl = self._round_to_tick(sl, tick_size)
+        target = self._round_to_tick(target, tick_size)
+
+        adopted_signal = {
+            "tradingsymbol": symbol,
+            "direction": direction,
+            "stopLoss": sl,
+        }
+        stop_order_id = self._place_protective_stop(
+            adopted_signal, abs(p["quantity"]), exchange, p.get("product", "MIS")
+        )
+
+        with self._trade_lock:
+            lost_race = symbol in self.active_trades or symbol in self._pending_entries
+            if not lost_race:
+                self.active_trades[symbol] = {
+                    "sl": sl,
+                    "target": target,
+                    "direction": direction,
+                    "entry_price": avg_price,
+                    "entry_time": datetime.datetime.now(),
+                    "original_strategy": "manual",
+                    "stop_order_id": stop_order_id,
+                    "exit_pending": False,
+                    "exit_order_id": None,
+                    "exchange": exchange,
+                }
+
+        if lost_race:
+            if stop_order_id:
+                try:
+                    kite_client.cancel_order("regular", stop_order_id)
+                except Exception:
+                    pass
+            return
+
+        self._push_log(
+            f"Adopted open position {symbol} ({direction}) at ₹{avg_price}. Auto-calculated SL: ₹{sl}, Target: ₹{target}"
+        )
 
     def _reevaluate_positions(self):
         """Re-evaluate open positions against current strategy signals (thesis invalidation)."""

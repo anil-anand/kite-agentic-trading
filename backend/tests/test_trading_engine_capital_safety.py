@@ -505,3 +505,128 @@ def test_exit_pending_resets_on_place_order_failure(monkeypatch):
     # exit_pending must be reset so the next cycle can retry
     assert engine.active_trades["RELIANCE"]["exit_pending"] is False
     assert call_count == 2
+
+
+class SequencedKiteClient(FakeKiteClient):
+    """Returns a different positions snapshot on each get_positions call, so a
+    test can simulate the book changing mid-tick (e.g. a broker stop filling
+    between the monitor snapshot and the pre-exit re-read)."""
+
+    def __init__(self, position_sequence):
+        super().__init__()
+        self._sequence = position_sequence
+        self._calls = 0
+
+    def get_positions(self):
+        idx = min(self._calls, len(self._sequence) - 1)
+        self._calls += 1
+        return {"net": self._sequence[idx]}
+
+
+def test_monitor_skips_exit_when_broker_stop_already_closed(monkeypatch):
+    """#1 — phantom-short race: the snapshot shows an open position at its stop,
+    but by the time we re-read before exiting the broker stop has already closed
+    it. The app must NOT place an exit (which would open an opposite position);
+    it should clean up instead."""
+    import backend.trading_engine as te
+
+    open_pos = [
+        {
+            "tradingsymbol": "RELIANCE",
+            "quantity": 10,
+            "exchange": "NSE",
+            "product": "MIS",
+            "lastPrice": 94.0,  # <= sl of 95 -> stop hit
+            "realised": 0.0,
+            "unrealised": -60.0,
+            "averagePrice": 100.0,
+        }
+    ]
+    # 1st get_positions (snapshot) = open; 2nd (pre-exit re-read) = flat.
+    fake_client = SequencedKiteClient([open_pos, []])
+    fake_risk = FakeRiskManager()
+    monkeypatch.setattr(te, "kite_client", fake_client)
+    monkeypatch.setattr(te, "risk_manager", fake_risk)
+
+    engine = TradingEngine()
+    engine.active_trades["RELIANCE"] = {
+        "sl": 95.0,
+        "target": 110.0,
+        "direction": "BUY",
+        "entry_price": 100.0,
+        "entry_time": datetime.datetime.now(),
+        "original_strategy": "test",
+        "stop_order_id": "STOP1",
+        "exit_pending": False,
+        "exit_order_id": None,
+    }
+
+    engine.monitor_positions()
+
+    # No exit order placed — the position was already flat on re-read.
+    assert fake_client.place_calls == []
+    # Trade cleaned up, lingering broker stop cancelled.
+    assert "RELIANCE" not in engine.active_trades
+    assert fake_client.cancel_calls[0]["order_id"] == "STOP1"
+
+
+def test_trade_lock_not_held_during_order_io(monkeypatch):
+    """#2 — monitor_positions must not hold _trade_lock while making Kite calls.
+    While place_order runs (invoked from the exit path), another thread must be
+    able to acquire the lock. Before the fix, the whole loop ran under the lock
+    and this would block/time out."""
+    import threading
+
+    import backend.trading_engine as te
+
+    engine = TradingEngine()
+    other_acquired = {"ok": None}
+
+    def place_order_probe(**kwargs):
+        def grab():
+            got = engine._trade_lock.acquire(timeout=1.0)
+            other_acquired["ok"] = got
+            if got:
+                engine._trade_lock.release()
+
+        t = threading.Thread(target=grab)
+        t.start()
+        t.join()
+        return "EXIT1"
+
+    fake_client = FakeKiteClient()
+    fake_client.place_order = place_order_probe
+    fake_client.positions = {
+        "net": [
+            {
+                "tradingsymbol": "RELIANCE",
+                "quantity": 10,
+                "exchange": "NSE",
+                "product": "MIS",
+                "lastPrice": 111.0,  # >= target of 110 -> target hit
+                "realised": 0.0,
+                "unrealised": 0.0,
+                "averagePrice": 100.0,
+            }
+        ]
+    }
+    fake_risk = FakeRiskManager()
+    monkeypatch.setattr(te, "kite_client", fake_client)
+    monkeypatch.setattr(te, "risk_manager", fake_risk)
+
+    engine.active_trades["RELIANCE"] = {
+        "sl": 95.0,
+        "target": 110.0,
+        "direction": "BUY",
+        "entry_price": 100.0,
+        "entry_time": datetime.datetime.now(),
+        "original_strategy": "test",
+        "stop_order_id": None,
+        "exit_pending": False,
+        "exit_order_id": None,
+    }
+
+    engine.monitor_positions()
+
+    # The probe thread acquired the lock during the Kite call -> lock not held.
+    assert other_acquired["ok"] is True
