@@ -144,7 +144,7 @@ class PythonBridge {
     else if (msg && typeof msg.event === 'string') {
       const eventMsg = msg as RPCEvent;
       // Broadcast to renderer
-      let channel = eventMsg.event;
+      const channel = eventMsg.event;
       // Map event names to channels if necessary, or assume they match
       this.broadcastToRenderer(channel, eventMsg.data);
     }
