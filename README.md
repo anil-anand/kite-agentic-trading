@@ -78,6 +78,16 @@ To enable Journal post-mortems, open **Settings > BYOK LLM Post-Mortems**, choos
 
 The OpenCode preset supports two plans: **Zen** and **Go**. Zen uses the `opencode` provider identity at the `https://opencode.ai/zen/v1` endpoint; Go uses the `opencode-go` provider identity at `https://opencode.ai/zen/go/v1`. Use **Refresh** in Settings to discover the models exposed by the selected plan. This integration currently exposes only models compatible with the OpenAI Chat Completions API.
 
+### Developing without a Kite login (`KITE_DEV_MODE`)
+
+Kite access tokens expire daily, so live development normally means re-doing the Zerodha OAuth login each day. To develop the UI and engine with **no login, no credentials, and no network**, start the app with `KITE_DEV_MODE=1`:
+
+```bash
+KITE_DEV_MODE=1 npm run dev
+```
+
+In dev mode the backend swaps the real Kite client for a **mock** that serves synthetic-but-plausible market data (instruments, quotes, LTP, and deterministic historical candles), the login screen is skipped entirely, and the scanner/strategies produce real signals off the synthetic candles. The account book starts empty and orders are accepted but sent nowhere — for a simulated trading book, use **Paper** mode. Dev mode is off by default and has no effect in production.
+
 ## 🧰 Installing the Application
 
 On macOS or Linux, run the installer from the repository root:

@@ -4,6 +4,7 @@ import traceback
 
 from .analytics import analytics
 from .config import config_manager
+from .dev_mode import is_dev_mode
 from .journal import journal
 from .kite_client import kite_client
 from .llm_client import OPENCODE_PLANS, OpenAICompatibleClient
@@ -42,6 +43,11 @@ def handle_request(req):
             return success({"login_url": kite_client.login_url()})
 
         elif method == "check_session":
+            # Development bypass: no Zerodha login required, and no real ticker
+            # websocket to start — the mock client serves everything.
+            if is_dev_mode():
+                return success({"is_valid": True})
+
             creds = config_manager.get_credentials()
             api_key = creds.get("apiKey")
             access_token = creds.get("accessToken")
