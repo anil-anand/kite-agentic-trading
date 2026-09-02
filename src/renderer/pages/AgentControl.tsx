@@ -23,7 +23,7 @@ const AgentControl: React.FC = () => {
     }
   };
 
-  const handleModeChange = (mode: 'auto' | 'confirm') => {
+  const handleModeChange = (mode: 'auto' | 'confirm' | 'paper') => {
     setAgentState({ mode });
     window.electronAPI?.invoke('settings:save', { mode });
   };
@@ -124,7 +124,22 @@ const AgentControl: React.FC = () => {
                   <div className="text-xs text-surface-400">Agent generates signals but waits for manual execution.</div>
                 </div>
               </label>
+              <label className="flex-1 cursor-pointer" onClick={() => handleModeChange('paper')}>
+                <input type="radio" name="mode" value="paper" checked={agentState.mode === 'paper'} readOnly className="hidden" />
+                <div className={`p-4 rounded-lg border-2 transition-colors ${agentState.mode === 'paper' ? 'border-accent-light bg-surface-700' : 'border-surface-600 bg-surface-900'}`}>
+                  <div className="flex items-center gap-2 mb-1">
+                    <span className="font-bold text-white">Paper</span>
+                    <span className="text-[10px] font-bold uppercase tracking-wide bg-profit-fade text-profit-light px-1.5 py-0.5 rounded">No risk</span>
+                  </div>
+                  <div className="text-xs text-surface-400">Runs on live prices with simulated fills — no real orders.</div>
+                </div>
+              </label>
             </div>
+            {agentState.mode === 'paper' && (
+              <div className="mt-4 text-xs text-profit-light bg-profit-fade border border-profit-dark/40 rounded-lg px-3 py-2">
+                Paper trading is active. The agent will trade a simulated account against live market prices — no real orders will be placed and no capital is at risk.
+              </div>
+            )}
           </div>
 
           <div className="bg-surface-800 border border-surface-700 rounded-xl p-6">
