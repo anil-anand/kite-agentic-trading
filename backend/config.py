@@ -1,5 +1,7 @@
 import datetime
 import json
+import os
+import tempfile
 from copy import deepcopy
 from pathlib import Path
 
@@ -271,8 +273,32 @@ class ConfigManager:
             if isinstance(entry_time, (datetime.datetime, datetime.date)):
                 record["entry_time"] = entry_time.isoformat()
             serializable[symbol] = record
-        with open(path, "w") as f:
-            json.dump(serializable, f, indent=4, default=str)
+        self._atomic_write_json(path, serializable)
+
+    @staticmethod
+    def _atomic_write_json(path: Path, data):
+        """Write JSON atomically: serialize to a temp file in the same dir, then
+        os.replace() it into place. A crash mid-write (the exact scenario this
+        persistence guards against) or a concurrent write can never leave a
+        truncated/corrupt file — the previous complete version stays until the
+        rename succeeds. A unique temp name keeps concurrent writers from
+        clobbering each other's temp file.
+        """
+        fd, tmp = tempfile.mkstemp(
+            dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f, indent=4, default=str)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     def load_active_trades(self) -> dict:
         """Load persisted active_trades, restoring entry_time to a datetime.

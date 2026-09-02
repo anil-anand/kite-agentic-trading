@@ -136,6 +136,38 @@ class TestConfigPersistence:
         loaded = config_manager.load_active_trades()
         assert isinstance(loaded["RELIANCE"]["entry_time"], datetime.datetime)
 
+    def test_write_is_atomic_no_temp_file_left(self, isolated_config_dir):
+        config_manager.save_active_trades({"RELIANCE": _trade()})
+        leftovers = list(isolated_config_dir.glob(".active_trades.json.*"))
+        assert leftovers == []
+        # The real file is present and valid JSON.
+        assert (isolated_config_dir / "active_trades.json").exists()
+        assert "RELIANCE" in config_manager.load_active_trades()
+
+    def test_concurrent_writes_never_corrupt(self, isolated_config_dir):
+        import threading
+
+        def writer(n):
+            config_manager.save_active_trades({f"SYM{n}": _trade(sl=float(n))})
+
+        threads = [threading.Thread(target=writer, args=(i,)) for i in range(20)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # File is always complete/parseable (one writer's snapshot won), and no
+        # temp files leaked.
+        loaded = config_manager.load_active_trades()
+        assert len(loaded) == 1
+        assert list(isolated_config_dir.glob(".active_trades.json.*")) == []
+
+    def test_overwrites_previous_content(self, isolated_config_dir):
+        config_manager.save_active_trades({"RELIANCE": _trade()})
+        config_manager.save_active_trades({"INFY": _trade()})
+        loaded = config_manager.load_active_trades()
+        assert set(loaded.keys()) == {"INFY"}
+
 
 # ---------------------------------------------------------------------------
 # reconcile_active_trades
@@ -303,6 +335,64 @@ def test_reconcile_preserves_entry_time(monkeypatch):
     engine.reconcile_active_trades()
 
     assert engine.active_trades["RELIANCE"]["entry_time"] == et
+
+
+def test_reconcile_drops_on_direction_flip(monkeypatch):
+    # Persisted as BUY, but the live position is now short -> the record is
+    # stale; drop it (and cancel a lingering live stop) rather than protect a
+    # position with a wrong-side stop.
+    engine, fake_client, _ = _setup_reconcile(
+        monkeypatch,
+        persisted={"RELIANCE": _trade(direction="BUY", stop_order_id="STOP1")},
+        positions_net=[_open_position(-5)],  # now short
+        orders=[{"orderId": "STOP1", "status": "TRIGGER PENDING"}],
+    )
+    engine.reconcile_active_trades()
+
+    assert "RELIANCE" not in engine.active_trades
+    assert fake_client.cancel_calls[0]["order_id"] == "STOP1"
+    assert fake_client.place_calls == []  # no wrong-side stop placed
+
+
+def test_reconcile_isolates_a_malformed_record(monkeypatch):
+    # BAD is missing 'sl', which raises when re-placing its stop. It must be
+    # skipped without aborting reconciliation of GOOD.
+    good = _trade(stop_order_id="GOODSTOP")
+    bad = _trade(stop_order_id=None)
+    del bad["sl"]
+    engine, fake_client, _ = _setup_reconcile(
+        monkeypatch,
+        persisted={"GOOD": good, "BAD": bad},
+        positions_net=[
+            {**_open_position(10), "tradingsymbol": "GOOD"},
+            {**_open_position(10), "tradingsymbol": "BAD"},
+        ],
+        orders=[{"orderId": "GOODSTOP", "status": "TRIGGER PENDING"}],
+    )
+    engine.reconcile_active_trades()
+
+    assert "GOOD" in engine.active_trades
+    assert "BAD" not in engine.active_trades
+
+
+def test_reconcile_keeps_trade_when_stop_replace_fails(monkeypatch):
+    # If re-placing the protective stop fails, the position is still tracked
+    # (with no broker stop) so the app-side monitor keeps watching it.
+    engine, fake_client, _ = _setup_reconcile(
+        monkeypatch,
+        persisted={"RELIANCE": _trade(stop_order_id=None)},
+        positions_net=[_open_position(10)],
+        orders=[],
+    )
+
+    def boom(**kwargs):
+        raise RuntimeError("order rejected")
+
+    fake_client.place_order = boom  # _place_protective_stop swallows -> ""
+    engine.reconcile_active_trades()
+
+    assert "RELIANCE" in engine.active_trades
+    assert engine.active_trades["RELIANCE"]["stop_order_id"] is None
 
 
 # ---------------------------------------------------------------------------

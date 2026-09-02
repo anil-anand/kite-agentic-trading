@@ -100,48 +100,17 @@ class TradingEngine:
 
         reconciled = {}
         for symbol, trade in persisted.items():
-            pos = open_map.get(symbol)
-            if not pos:
-                stop_id = trade.get("stop_order_id")
-                if stop_id and str(stop_id) in open_orders:
-                    try:
-                        kite_client.cancel_order("regular", stop_id)
-                    except Exception:
-                        pass
+            try:
+                keep = self._reconcile_one(symbol, trade, open_map, open_orders)
+            except Exception as e:
+                # A single malformed record must not abort reconciliation of the
+                # rest — skip it and keep going.
                 self._push_log(
-                    f"Reconcile: {symbol} no longer open; dropping stale tracking."
+                    f"Reconcile: skipping {symbol} due to error: {e}", level="warning"
                 )
                 continue
-
-            # Position still open — ensure a live protective stop.
-            stop_id = trade.get("stop_order_id")
-            if not stop_id or str(stop_id) not in open_orders:
-                self._push_log(
-                    f"Reconcile: {symbol} is open with no live protective stop; re-placing.",
-                    level="warning",
-                )
-                new_stop_id = self._place_protective_stop(
-                    {
-                        "tradingsymbol": symbol,
-                        "direction": trade["direction"],
-                        "stopLoss": trade["sl"],
-                    },
-                    abs(pos["quantity"]),
-                    pos.get("exchange", trade.get("exchange", "NSE")),
-                    pos.get("product", "MIS"),
-                )
-                trade["stop_order_id"] = new_stop_id or None
-
-            # Keep waiting on an exit that's still working; otherwise clear it.
-            exit_id = trade.get("exit_order_id")
-            if exit_id and str(exit_id) in open_orders:
-                trade["exit_pending"] = True
-            else:
-                trade["exit_pending"] = False
-                trade["exit_order_id"] = None
-
-            trade.setdefault("exchange", pos.get("exchange", "NSE"))
-            reconciled[symbol] = trade
+            if keep:
+                reconciled[symbol] = trade
 
         with self._trade_lock:
             self.active_trades = reconciled
@@ -149,6 +118,69 @@ class TradingEngine:
         self._push_log(
             f"Reconcile complete: {len(reconciled)} active trade(s) resumed."
         )
+
+    def _cancel_stop_if_live(self, trade: dict, open_orders: set):
+        stop_id = trade.get("stop_order_id")
+        if stop_id and str(stop_id) in open_orders:
+            try:
+                kite_client.cancel_order("regular", stop_id)
+            except Exception:
+                pass
+
+    def _reconcile_one(
+        self, symbol: str, trade: dict, open_map: dict, open_orders: set
+    ) -> bool:
+        """Reconcile a single persisted trade. Returns True to keep tracking it."""
+        pos = open_map.get(symbol)
+        if not pos:
+            self._cancel_stop_if_live(trade, open_orders)
+            self._push_log(
+                f"Reconcile: {symbol} no longer open; dropping stale tracking."
+            )
+            return False
+
+        # If the live position's side no longer matches the recorded trade, the
+        # record is stale (position was closed and reopened the other way). Drop
+        # it rather than protect it with a wrong-side stop.
+        live_direction = "BUY" if pos["quantity"] > 0 else "SELL"
+        if trade.get("direction") != live_direction:
+            self._cancel_stop_if_live(trade, open_orders)
+            self._push_log(
+                f"Reconcile: {symbol} direction changed "
+                f"(was {trade.get('direction')}, now {live_direction}); dropping.",
+                level="warning",
+            )
+            return False
+
+        # Position still open — ensure a live protective stop.
+        stop_id = trade.get("stop_order_id")
+        if not stop_id or str(stop_id) not in open_orders:
+            self._push_log(
+                f"Reconcile: {symbol} is open with no live protective stop; re-placing.",
+                level="warning",
+            )
+            new_stop_id = self._place_protective_stop(
+                {
+                    "tradingsymbol": symbol,
+                    "direction": trade["direction"],
+                    "stopLoss": trade["sl"],
+                },
+                abs(pos["quantity"]),
+                pos.get("exchange", trade.get("exchange", "NSE")),
+                pos.get("product", "MIS"),
+            )
+            trade["stop_order_id"] = new_stop_id or None
+
+        # Keep waiting on an exit that's still working; otherwise clear it.
+        exit_id = trade.get("exit_order_id")
+        if exit_id and str(exit_id) in open_orders:
+            trade["exit_pending"] = True
+        else:
+            trade["exit_pending"] = False
+            trade["exit_order_id"] = None
+
+        trade.setdefault("exchange", pos.get("exchange", "NSE"))
+        return True
 
     def _get_tick_size(self, symbol: str, exchange: str = "NSE") -> float:
         if symbol in self._tick_size_map:
