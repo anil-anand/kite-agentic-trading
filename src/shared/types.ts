@@ -6,6 +6,7 @@ export interface KiteCredentials {
   accessToken?: string;
   userId?: string;
   userName?: string;
+  llmApiKey?: string;
 }
 
 export interface AuthState {
@@ -409,4 +410,24 @@ export interface ExitReasonEffectiveness {
   total_trades: number;
   win_rate_pct: number;
   total_pnl: number;
+}
+
+export interface TradeReplayData {
+  trade: JournalTrade;
+  candles: Candle[];
+}
+
+export interface WhatIfAnalysis {
+  eod_pnl: number;
+  target_hit: boolean;
+  target_hit_time: string | null;
+  wider_stop_price: number;
+  wider_stop_hit: boolean;
+  wider_stop_pnl: number;
+  actual_pnl: number;
+}
+
+export interface LLMPostMortem {
+  analysis?: string;
+  error?: string;
 }

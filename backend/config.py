@@ -65,7 +65,7 @@ class ConfigManager:
                 "ULTRACEMCO",
                 "NESTLEIND",
             ],
-            "credentials": {"apiKey": "", "apiSecret": ""},
+            "credentials": {"apiKey": "", "apiSecret": "", "llmApiKey": ""},
             "mode": "auto",
         }
 
@@ -127,6 +127,7 @@ class ConfigManager:
             "apiKey": self._decrypt(creds.get("apiKey", "")),
             "apiSecret": self._decrypt(creds.get("apiSecret", "")),
             "accessToken": self._decrypt(creds.get("accessToken", "")),
+            "llmApiKey": self._decrypt(creds.get("llmApiKey", "")),
         }
 
     def save_credentials(self, api_key: str, api_secret: str, access_token: str = ""):
@@ -137,6 +138,13 @@ class ConfigManager:
         self.config["credentials"]["apiSecret"] = self._encrypt(api_secret)
         if access_token:
             self.config["credentials"]["accessToken"] = self._encrypt(access_token)
+        self.save()
+
+    def save_llm_api_key(self, llm_api_key: str):
+        if "credentials" not in self.config:
+            self.config["credentials"] = {}
+
+        self.config["credentials"]["llmApiKey"] = self._encrypt(llm_api_key)
         self.save()
 
     def get_risk_config(self):

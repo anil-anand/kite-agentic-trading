@@ -82,6 +82,7 @@ try {
     settings: {
       get: () => electron.ipcRenderer.invoke(channels.SETTINGS_GET),
       save: (settings: any) => electron.ipcRenderer.invoke(channels.SETTINGS_SAVE, settings),
+      saveLlmKey: (key: string) => electron.ipcRenderer.invoke(channels.SETTINGS_SAVE_LLM_KEY, key),
       reset: () => electron.ipcRenderer.invoke(channels.SETTINGS_RESET),
     },
     watchlist: {
@@ -106,6 +107,9 @@ try {
       getConfluenceValidation: () => electron.ipcRenderer.invoke(channels.ANALYTICS_CONFLUENCE_VALIDATION),
       getConfidenceCalibration: () => electron.ipcRenderer.invoke(channels.ANALYTICS_CONFIDENCE_CALIBRATION),
       getExitReasonEffectiveness: () => electron.ipcRenderer.invoke(channels.ANALYTICS_EXIT_REASON),
+      getTradeReplay: (tradeId: string) => electron.ipcRenderer.invoke(channels.ANALYTICS_TRADE_REPLAY, tradeId),
+      getWhatIfAnalysis: (tradeId: string) => electron.ipcRenderer.invoke(channels.ANALYTICS_WHAT_IF, tradeId),
+      getLlmPostMortem: (tradeId: string) => electron.ipcRenderer.invoke(channels.ANALYTICS_LLM_POST_MORTEM, tradeId),
     },
     app: {
       onPythonStatus: (callback: (data: any) => void) => {

@@ -247,5 +247,225 @@ class TradeAnalytics:
             for row in rows:
                 writer.writerow(row)
 
+    def get_trade_replay(self, trade_id: str) -> Dict[str, Any]:
+        """
+        Fetches historical minute-level candle data around the trade's timeframe
+        and returns it for frontend charting.
+        """
+        from .kite_client import kite_client
+
+        conn = self._get_conn()
+        query = "SELECT * FROM trades WHERE id = ?"
+        trade = conn.execute(query, (trade_id,)).fetchone()
+
+        if not trade:
+            return {"error": "Trade not found"}
+
+        tradingsymbol = trade["tradingsymbol"]
+        entry_time_str = trade["entry_time"]
+
+        if not entry_time_str:
+            return {"error": "Trade has no entry time"}
+
+        try:
+            entry_time = datetime.fromisoformat(entry_time_str)
+            # Fetch data for the whole day of the trade
+            from_date = entry_time.strftime("%Y-%m-%d 09:15:00")
+            to_date = entry_time.strftime("%Y-%m-%d 15:30:00")
+        except ValueError:
+            return {"error": "Invalid entry time format"}
+
+        # Get instrument token
+        instruments = kite_client.get_instruments(trade["exchange"] or "NSE")
+        instrument_token = next(
+            (
+                i["instrument_token"]
+                for i in instruments
+                if i["tradingsymbol"] == tradingsymbol
+            ),
+            None,
+        )
+
+        if not instrument_token:
+            return {"error": f"Could not find instrument token for {tradingsymbol}"}
+
+        # Fetch historical data (1 minute interval)
+        try:
+            candles = kite_client.get_historical_data(
+                instrument_token=instrument_token,
+                from_date=from_date,
+                to_date=to_date,
+                interval="minute",
+            )
+        except Exception as e:
+            return {"error": f"Failed to fetch historical data: {str(e)}"}
+
+        return {"trade": dict(trade), "candles": candles}
+
+    def get_what_if_analysis(self, trade_id: str) -> Dict[str, Any]:
+        """
+        Simulates alternative exit scenarios based on historical data.
+        """
+        replay_data = self.get_trade_replay(trade_id)
+        if "error" in replay_data:
+            return replay_data
+
+        trade = replay_data["trade"]
+        candles = replay_data["candles"]
+
+        if not candles:
+            return {"error": "No historical data available"}
+
+        entry_price = trade["entry_price"]
+        direction = trade["direction"]
+        quantity = trade["quantity"]
+        target = trade["target"]
+        stop_loss = trade["stop_loss"]
+
+        try:
+            entry_time = datetime.fromisoformat(trade["entry_time"])
+        except Exception:
+            return {"error": "Invalid entry time"}
+
+        # Filter candles to only those after entry
+        post_entry_candles = []
+        for c in candles:
+            # c["date"] is usually a datetime object from kiteconnect
+            candle_time = (
+                c["date"]
+                if isinstance(c["date"], datetime)
+                else datetime.fromisoformat(str(c["date"]).replace("+05:30", ""))
+            )
+            if candle_time.timestamp() >= entry_time.timestamp():
+                post_entry_candles.append(c)
+
+        # 1. Hold to EOD (last candle of the day)
+        eod_pnl = 0
+        eod_price = (
+            post_entry_candles[-1]["close"] if post_entry_candles else entry_price
+        )
+        if direction == "BUY":
+            eod_pnl = (eod_price - entry_price) * quantity
+        else:
+            eod_pnl = (entry_price - eod_price) * quantity
+
+        # 2. Target Hit
+        target_hit = False
+        target_hit_time = None
+        for c in post_entry_candles:
+            if direction == "BUY" and c["high"] >= target:
+                target_hit = True
+                target_hit_time = str(c["date"])
+                break
+            elif direction == "SELL" and c["low"] <= target:
+                target_hit = True
+                target_hit_time = str(c["date"])
+                break
+
+        # 3. Wider Stop (1.5x)
+        original_risk = abs(entry_price - stop_loss)
+        wider_stop = (
+            entry_price - (original_risk * 1.5)
+            if direction == "BUY"
+            else entry_price + (original_risk * 1.5)
+        )
+        wider_stop_hit = False
+        wider_stop_pnl = 0
+        for c in post_entry_candles:
+            if direction == "BUY" and c["low"] <= wider_stop:
+                wider_stop_hit = True
+                wider_stop_pnl = (wider_stop - entry_price) * quantity
+                break
+            elif direction == "SELL" and c["high"] >= wider_stop:
+                wider_stop_hit = True
+                wider_stop_pnl = (entry_price - wider_stop) * quantity
+                break
+
+        if not wider_stop_hit:
+            wider_stop_pnl = eod_pnl
+
+        return {
+            "eod_pnl": eod_pnl,
+            "target_hit": target_hit,
+            "target_hit_time": target_hit_time,
+            "wider_stop_price": wider_stop,
+            "wider_stop_hit": wider_stop_hit,
+            "wider_stop_pnl": wider_stop_pnl,
+            "actual_pnl": trade["pnl"],
+        }
+
+    def generate_llm_post_mortem(self, trade_id: str) -> Dict[str, Any]:
+        """
+        Uses google-genai to generate a post-mortem analysis of the trade.
+        """
+        from .config import config_manager
+
+        creds = config_manager.get_credentials()
+        api_key = creds.get("llmApiKey")
+        if not api_key:
+            return {"error": "LLM API Key not configured in settings."}
+
+        try:
+            from google import genai
+        except ImportError:
+            return {"error": "google-genai package not installed."}
+
+        conn = self._get_conn()
+        trade = conn.execute(
+            "SELECT * FROM trades WHERE id = ?", (trade_id,)
+        ).fetchone()
+        if not trade:
+            return {"error": "Trade not found"}
+
+        events = conn.execute(
+            "SELECT * FROM trade_events WHERE trade_id = ? ORDER BY timestamp ASC",
+            (trade_id,),
+        ).fetchall()
+
+        trade_dict = dict(trade)
+        events_list = [dict(e) for e in events]
+
+        prompt = f"""
+Analyze this intraday trade from a systematic trading algorithm and provide a short, insightful post-mortem.
+Focus on:
+1. Why we likely entered based on the strategy and confluence snapshot.
+2. What happened during the trade lifecycle (events).
+3. Why the exit happened and if it was optimal based on the MAE/MFE (if deducible) and exit reason.
+4. Key takeaway for future trades.
+
+Trade Details:
+- Symbol: {trade_dict.get("tradingsymbol")}
+- Strategy: {trade_dict.get("strategy")}
+- Direction: {trade_dict.get("direction")}
+- Entry Time: {trade_dict.get("entry_time")}
+- Exit Time: {trade_dict.get("exit_time")}
+- Entry Price: {trade_dict.get("entry_price")}
+- Exit Price: {trade_dict.get("exit_price")}
+- Target: {trade_dict.get("target")}
+- Stop Loss: {trade_dict.get("stop_loss")}
+- PnL: {trade_dict.get("pnl")}
+- Exit Reason: {trade_dict.get("exit_reason")}
+
+Confluence Snapshot:
+{trade_dict.get("confluence_snapshot")}
+
+Indicator Snapshot:
+{trade_dict.get("indicator_snapshot")}
+
+Trade Timeline Events:
+"""
+        for event in events_list:
+            prompt += f"- {event.get('timestamp')}: {event.get('event_type')} - {event.get('details')}\\n"
+
+        try:
+            client = genai.Client(api_key=api_key)
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt,
+            )
+            return {"analysis": response.text}
+        except Exception as e:
+            return {"error": f"LLM Generation failed: {str(e)}"}
+
 
 analytics = TradeAnalytics()

@@ -133,6 +133,10 @@ def handle_request(req):
             config_manager.save()
             return success({"status": "saved"})
 
+        elif method == "save_llm_api_key":
+            config_manager.save_llm_api_key(params.get("llmApiKey", ""))
+            return success({"status": "saved"})
+
         elif method == "scan_now":
             from .nifty_universe import get_nifty100_universe
             from .screener import screener_engine
@@ -212,6 +216,15 @@ def handle_request(req):
 
         elif method == "analytics_exit_reason_effectiveness":
             return success(analytics.get_exit_reason_effectiveness())
+
+        elif method == "analytics_trade_replay":
+            return success(analytics.get_trade_replay(params.get("trade_id")))
+
+        elif method == "analytics_what_if":
+            return success(analytics.get_what_if_analysis(params.get("trade_id")))
+
+        elif method == "analytics_llm_post_mortem":
+            return success(analytics.generate_llm_post_mortem(params.get("trade_id")))
 
         else:
             return error(-32601, f"Method '{method}' not found")
