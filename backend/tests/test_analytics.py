@@ -120,7 +120,9 @@ def test_exit_reason_effectiveness(temp_db):
 @patch("backend.kite_client.kite_client.get_historical_data")
 @patch("backend.kite_client.kite_client.get_instruments")
 def test_trade_replay(mock_instruments, mock_historical, temp_db):
-    mock_instruments.return_value = [{"tradingsymbol": "TCS", "instrument_token": 12345}]
+    mock_instruments.return_value = [
+        {"tradingsymbol": "TCS", "instrument_token": 12345}
+    ]
     mock_historical.return_value = [
         {"date": datetime.now(), "open": 100, "high": 105, "low": 95, "close": 102}
     ]
