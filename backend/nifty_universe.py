@@ -5,65 +5,115 @@ from urllib.error import HTTPError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
-NIFTY_50 = [
-    "ADANIPORTS",
-    "ITC",
-    "BHARTIARTL",
-    "BAJAJ-AUTO",
-    "HCLTECH",
-    "RELIANCE",
+NIFTY_100 = [
+    "ABB",
     "ADANIENT",
+    "ADANIENSOL",
+    "ADANIGREEN",
+    "ADANIPORTS",
+    "ADANIPOWER",
+    "AMBUJACEM",
+    "APOLLOHOSP",
+    "ASIANPAINT",
+    "AXISBANK",
+    "BAJAJ-AUTO",
+    "BAJAJFINSV",
+    "BAJAJHLDNG",
+    "BAJFINANCE",
+    "BANKBARODA",
+    "BEL",
+    "BHARTIARTL",
+    "BOSCHLTD",
+    "BPCL",
+    "BRITANNIA",
+    "CANBK",
+    "CGPOWER",
+    "CHOLAFIN",
+    "CIPLA",
+    "COALINDIA",
+    "CUMMINSIND",
+    "DIVISLAB",
+    "DLF",
+    "DMART",
     "DRREDDY",
-    "TMPV",
-    "HINDUNILVR",
-    "ONGC",
-    "INFY",
+    "EICHERMOT",
+    "ENRIN",
+    "ETERNAL",
+    "GAIL",
+    "GODREJCP",
+    "GRASIM",
+    "HAL",
+    "HCLTECH",
+    "HDFCAMC",
+    "HDFCBANK",
+    "HDFCLIFE",
     "HINDALCO",
+    "HINDUNILVR",
+    "HINDZINC",
+    "HYUNDAI",
+    "ICICIBANK",
+    "INDHOTEL",
+    "INDIGO",
+    "INFY",
+    "IOC",
+    "IRFC",
+    "ITC",
+    "JINDALSTEL",
+    "JIOFIN",
     "JSWSTEEL",
     "KOTAKBANK",
-    "EICHERMOT",
-    "M&M",
-    "ULTRACEMCO",
-    "COALINDIA",
-    "SBILIFE",
-    "TECHM",
-    "CIPLA",
-    "HDFCBANK",
-    "TRENT",
-    "HDFCLIFE",
-    "NTPC",
-    "TATACONSUM",
-    "BAJFINANCE",
-    "POWERGRID",
-    "ETERNAL",
-    "BEL",
-    "TATASTEEL",
+    "LODHA",
     "LT",
-    "ICICIBANK",
-    "TITAN",
-    "APOLLOHOSP",
+    "LTM",
+    "M&M",
     "MARUTI",
-    "JIOFIN",
-    "SBIN",
-    "GRASIM",
-    "WIPRO",
-    "TCS",
-    "SUNPHARMA",
-    "AXISBANK",
-    "BAJAJFINSV",
-    "ASIANPAINT",
     "MAXHEALTH",
+    "MAZDOCK",
+    "MOTHERSON",
+    "MUTHOOTFIN",
     "NESTLEIND",
-    "INDIGO",
+    "NTPC",
+    "ONGC",
+    "PFC",
+    "PIDILITIND",
+    "PNB",
+    "POWERGRID",
+    "RECLTD",
+    "RELIANCE",
+    "SBILIFE",
+    "SBIN",
+    "SHREECEM",
     "SHRIRAMFIN",
+    "SIEMENS",
+    "SOLARINDS",
+    "SUNPHARMA",
+    "TATACAP",
+    "TATACONSUM",
+    "TATAPOWER",
+    "TATASTEEL",
+    "TCS",
+    "TECHM",
+    "TITAN",
+    "TMCV",
+    "TMPV",
+    "TORNTPHARM",
+    "TRENT",
+    "TVSMOTOR",
+    "ULTRACEMCO",
+    "UNIONBANK",
+    "UNITDSPR",
+    "VBL",
+    "VEDL",
+    "WIPRO",
+    "ZYDUSLIFE",
 ]
 
-_cached_nifty50 = None
+_cached_nifty100 = None
 _cached_on = None
 
 
-def _fetch_nifty50_from_nse():
-    """Fetch current NIFTY 50 constituents from NSE's public index endpoint."""
+def _fetch_nifty100_from_nse():
+    """Fetch current NIFTY 100 constituents from NSE's public index endpoint."""
     user_agent = "Mozilla/5.0 (compatible; KiteAgenticTrading/1.0)"
     homepage_request = Request(
         "https://www.nseindia.com/",
@@ -89,7 +139,7 @@ def _fetch_nifty50_from_nse():
     if cookies:
         headers["Cookie"] = "; ".join(cookies)
 
-    index = quote("NIFTY 50")
+    index = quote("NIFTY 100")
     endpoints = (
         f"https://www.nseindia.com/api/equity-stock-indices?index={index}",
         f"https://www.nseindia.com/api/equity-stockIndices?index={index}",
@@ -105,7 +155,7 @@ def _fetch_nifty50_from_nse():
                 raise
 
     if not isinstance(response_data, dict):
-        raise ValueError("NSE returned an unexpected NIFTY 50 response")
+        raise ValueError("NSE returned an unexpected NIFTY 100 response")
 
     rows = response_data.get("data", response_data.get("records", []))
     symbols = []
@@ -116,31 +166,31 @@ def _fetch_nifty50_from_nse():
         if (
             isinstance(symbol, str)
             and symbol
-            and symbol.upper() != "NIFTY 50"
+            and symbol.upper() != "NIFTY 100"
             and symbol not in symbols
         ):
             symbols.append(symbol)
 
-    if len(symbols) != 50:
-        raise ValueError(f"NSE returned {len(symbols)} NIFTY 50 constituents")
+    if len(symbols) != 100:
+        raise ValueError(f"NSE returned {len(symbols)} NIFTY 100 constituents")
     return symbols
 
 
-def get_nifty50_universe():
-    """Return today's live NIFTY 50 list, falling back to the bundled list."""
-    global _cached_nifty50, _cached_on
+def get_nifty100_universe():
+    """Return today's live NIFTY 100 list, falling back to the bundled list."""
+    global _cached_nifty100, _cached_on
 
     today = date.today()
-    if _cached_nifty50 is not None and _cached_on == today:
-        return list(_cached_nifty50)
+    if _cached_nifty100 is not None and _cached_on == today:
+        return list(_cached_nifty100)
 
     try:
-        _cached_nifty50 = _fetch_nifty50_from_nse()
+        _cached_nifty100 = _fetch_nifty100_from_nse()
         _cached_on = today
-        logging.info("Loaded current NIFTY 50 constituents from NSE")
+        logging.info("Loaded current NIFTY 100 constituents from NSE")
     except Exception as error:
-        logging.warning("Using bundled NIFTY 50 list: %s", error)
-        _cached_nifty50 = list(NIFTY_50)
+        logging.warning("Using bundled NIFTY 100 list: %s", error)
+        _cached_nifty100 = list(NIFTY_100)
         _cached_on = today
 
-    return list(_cached_nifty50)
+    return list(_cached_nifty100)

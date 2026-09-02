@@ -2,7 +2,7 @@ import logging
 from typing import List
 
 from .kite_client import kite_client
-from .nifty_universe import NIFTY_50
+from .nifty_universe import NIFTY_100
 
 
 class DynamicScreener:
@@ -10,7 +10,7 @@ class DynamicScreener:
         self.daily_watchlist = []
 
     def generate_daily_watchlist(
-        self, universe: List[str] = NIFTY_50, limit: int = 10
+        self, universe: List[str] = NIFTY_100, limit: int = 10
     ) -> List[str]:
         """
         AI/Algorithmic screener that selects the best stocks to trade today based on volatility,

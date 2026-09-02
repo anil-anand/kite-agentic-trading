@@ -1,4 +1,4 @@
-"""Tests for loading and caching the live NIFTY 50 universe."""
+"""Tests for loading and caching the live NIFTY 100 universe."""
 
 import io
 import json
@@ -31,10 +31,10 @@ class FakeHeaders:
 
 
 def live_symbols():
-    return [f"SYMBOL{index:02d}" for index in range(50)]
+    return [f"SYMBOL{index:03d}" for index in range(100)]
 
 
-def test_fetches_and_parses_nifty50_from_nse(monkeypatch):
+def test_fetches_and_parses_nifty100_from_nse(monkeypatch):
     symbols = live_symbols()
     responses = iter(
         [
@@ -42,7 +42,7 @@ def test_fetches_and_parses_nifty50_from_nse(monkeypatch):
             FakeResponse(
                 {
                     "data": [
-                        {"symbol": "NIFTY 50"},
+                        {"symbol": "NIFTY 100"},
                         *[{"symbol": symbol} for symbol in symbols],
                     ]
                 }
@@ -57,18 +57,18 @@ def test_fetches_and_parses_nifty50_from_nse(monkeypatch):
 
     monkeypatch.setattr(nifty_universe, "urlopen", fake_urlopen)
 
-    result = nifty_universe._fetch_nifty50_from_nse()
+    result = nifty_universe._fetch_nifty100_from_nse()
 
     assert result == symbols
     assert len(requests) == 2
-    assert requests[1].full_url.endswith("index=NIFTY%2050")
+    assert requests[1].full_url.endswith("index=NIFTY%20100")
     assert requests[1].headers["Cookie"] == "nse cookie=value"
 
 
 def test_uses_second_nse_endpoint_after_first_returns_404(monkeypatch):
     symbols = live_symbols()
     not_found = HTTPError(
-        "https://www.nseindia.com/api/equity-stock-indices?index=NIFTY%2050",
+        "https://www.nseindia.com/api/equity-stock-indices?index=NIFTY%20100",
         404,
         "Not Found",
         {},
@@ -90,21 +90,21 @@ def test_uses_second_nse_endpoint_after_first_returns_404(monkeypatch):
 
     monkeypatch.setattr(nifty_universe, "urlopen", fake_urlopen)
 
-    assert nifty_universe._fetch_nifty50_from_nse() == symbols
+    assert nifty_universe._fetch_nifty100_from_nse() == symbols
 
 
 def test_falls_back_to_bundled_list_and_caches_result(monkeypatch):
-    monkeypatch.setattr(nifty_universe, "_cached_nifty50", None)
+    monkeypatch.setattr(nifty_universe, "_cached_nifty100", None)
     monkeypatch.setattr(nifty_universe, "_cached_on", None)
     monkeypatch.setattr(
         nifty_universe,
-        "_fetch_nifty50_from_nse",
+        "_fetch_nifty100_from_nse",
         lambda: (_ for _ in ()).throw(RuntimeError("NSE unavailable")),
     )
 
-    first = nifty_universe.get_nifty50_universe()
-    second = nifty_universe.get_nifty50_universe()
+    first = nifty_universe.get_nifty100_universe()
+    second = nifty_universe.get_nifty100_universe()
 
-    assert first == nifty_universe.NIFTY_50
+    assert first == nifty_universe.NIFTY_100
     assert second == first
     assert second is not first
