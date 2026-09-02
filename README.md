@@ -72,6 +72,26 @@ npm run dev
 
 On your first launch, navigate to the **Settings** tab to enter your Kite API Key and API Secret. The app will encrypt and save them locally.
 
+## 🧰 Installing the Application
+
+On macOS or Linux, run the installer from the repository root:
+
+```bash
+./scripts/install.sh
+```
+
+The script verifies the required tools, installs frontend and backend
+dependencies, and runs the production packaging flow. The generated installer
+artifacts are placed in `release/`. Use `--dry-run` to inspect the commands
+without executing them:
+
+```bash
+./scripts/install.sh --dry-run
+```
+
+The installer never asks for or modifies Kite API credentials. Configure
+credentials through the app's login screen after installation.
+
 ## 🧪 Running Tests
 
 The backend test suite (`pytest`) covers the trading strategies. The strategy
