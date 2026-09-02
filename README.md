@@ -16,6 +16,7 @@ The app features a modern Electron/React frontend communicating with a high-perf
 * **Agentic Execution Modes**:
   * **Full Auto**: The agent strictly executes trades automatically based on risk configurations.
   * **Signal + Confirm**: The agent generates setups and targets, but waits for manual 1-click execution.
+  * **Paper Trading**: The agent runs fully autonomously against **live market prices** but simulates all fills internally — no real orders are placed and no capital is at risk. Ideal for validating strategies and the agent end-to-end before going live.
 * **Parallel Scanning**: The Python engine uses intelligent ThreadPool execution to scan the entire market in parallel while strictly respecting Kite Connect's 3 req/sec rate limit.
 * **Local Persistence**: All trade histories, activity logs, and pending signals are securely stored locally across sessions.
 
