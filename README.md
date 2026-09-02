@@ -72,6 +72,16 @@ npm run dev
 
 On your first launch, navigate to the **Settings** tab to enter your Kite API Key and API Secret. The app will encrypt and save them locally.
 
+### Developing without a Kite login (`KITE_DEV_MODE`)
+
+Kite access tokens expire daily, so live development normally means re-doing the Zerodha OAuth login each day. To develop the UI and engine with **no login, no credentials, and no network**, start the app with `KITE_DEV_MODE=1`:
+
+```bash
+KITE_DEV_MODE=1 npm run dev
+```
+
+In dev mode the backend swaps the real Kite client for a **mock** that serves synthetic-but-plausible market data (instruments, quotes, LTP, and deterministic historical candles), the login screen is skipped entirely, and the scanner/strategies produce real signals off the synthetic candles. The account book starts empty and orders are accepted but sent nowhere — for a simulated trading book, use **Paper** mode. Dev mode is off by default and has no effect in production.
+
 ## 🧰 Installing the Application
 
 On macOS or Linux, run the installer from the repository root:
