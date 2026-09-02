@@ -9,6 +9,7 @@ import Orders from './pages/Orders';
 import Watchlist from './pages/Watchlist';
 import ActivityLog from './pages/ActivityLog';
 import Settings from './pages/Settings';
+import Journal from './pages/Journal';
 import LoginModal from './components/LoginModal';
 import { useTradingStore } from './stores/trading-store';
 import { useKiteAPI } from './hooks/useKiteAPI';
@@ -25,6 +26,7 @@ const App: React.FC = () => {
           <Routes>
             <Route path="/" element={<Navigate to="/dashboard" replace />} />
             <Route path="/dashboard" element={<Dashboard />} />
+            <Route path="/journal" element={<Journal />} />
             <Route path="/agent" element={<AgentControl />} />
             <Route path="/chart" element={<Chart />} />
             <Route path="/orders" element={<Orders />} />

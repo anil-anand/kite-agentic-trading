@@ -347,3 +347,66 @@ export interface DashboardSummary {
   availableMargin: number;
   usedMargin: number;
 }
+
+// ─── Journal & Analytics ──────────────────────────────────────────
+
+export interface JournalTrade {
+  id: string;
+  tradingsymbol: string;
+  exchange: string;
+  direction: 'BUY' | 'SELL';
+  product: string;
+  strategy: string;
+  signal_id: string | null;
+  reasoning: string | null;
+  confidence: number | null;
+  entry_price: number;
+  quantity: number;
+  stop_loss: number;
+  target: number;
+  entry_time: string;
+  exit_price: number | null;
+  exit_time: string | null;
+  exit_reason: string | null;
+  pnl: number | null;
+  status: 'OPEN' | 'CLOSED';
+  confluence_snapshot: string | null;
+  indicator_snapshot: string | null;
+}
+
+export interface TradeEvent {
+  id: string;
+  trade_id: string;
+  timestamp: string;
+  event_type: string;
+  details: string; // JSON string
+}
+
+export interface StrategyExpectancy {
+  strategy: string;
+  total_trades: number;
+  win_rate_pct: number;
+  profit_factor: number | null;
+  avg_r_multiple: number;
+  avg_hold_time_mins: number;
+}
+
+export interface ConfluenceValidation {
+  confluence_count: number;
+  total_trades: number;
+  win_rate_pct: number;
+  total_pnl: number;
+}
+
+export interface ConfidenceCalibration {
+  confidence_bucket: string;
+  total_trades: number;
+  actual_win_rate_pct: number;
+}
+
+export interface ExitReasonEffectiveness {
+  exit_reason: string;
+  total_trades: number;
+  win_rate_pct: number;
+  total_pnl: number;
+}

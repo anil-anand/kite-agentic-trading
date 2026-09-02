@@ -177,4 +177,30 @@ export function setupIpcHandlers() {
   ipcMain.handle(channels.DASHBOARD_SUMMARY, async () => {
     return await pythonBridge.call('dashboard_summary');
   });
+
+  // ─── Journal & Analytics ──────────────────────────────────────────
+
+  ipcMain.handle(channels.JOURNAL_GET_TRADES, async () => {
+    return await pythonBridge.call('journal_get_trades');
+  });
+
+  ipcMain.handle(channels.JOURNAL_GET_EVENTS, async (_, trade_id: string) => {
+    return await pythonBridge.call('journal_get_events', { trade_id });
+  });
+
+  ipcMain.handle(channels.ANALYTICS_STRATEGY_EXPECTANCY, async () => {
+    return await pythonBridge.call('analytics_strategy_expectancy');
+  });
+
+  ipcMain.handle(channels.ANALYTICS_CONFLUENCE_VALIDATION, async () => {
+    return await pythonBridge.call('analytics_confluence_validation');
+  });
+
+  ipcMain.handle(channels.ANALYTICS_CONFIDENCE_CALIBRATION, async () => {
+    return await pythonBridge.call('analytics_confidence_calibration');
+  });
+
+  ipcMain.handle(channels.ANALYTICS_EXIT_REASON, async () => {
+    return await pythonBridge.call('analytics_exit_reason_effectiveness');
+  });
 }

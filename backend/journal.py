@@ -4,12 +4,15 @@ import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 
 class TradeJournal:
-    def __init__(self):
-        self.db_path = Path.home() / ".kite-agentic-trading" / "journal.db"
+    def __init__(self, db_path: str = None):
+        if db_path is None:
+            self.db_path = Path.home() / ".kite-agentic-trading" / "journal.db"
+        else:
+            self.db_path = Path(db_path)
         self._local = threading.local()
         self._init_db()
 
@@ -183,6 +186,23 @@ class TradeJournal:
                 "exit_filled",
                 {"exit_price": exit_price, "exit_reason": exit_reason, "pnl": pnl},
             )
+
+    def get_trades(self) -> List[Dict[str, Any]]:
+        """Get all trades ordered by entry time descending."""
+        conn = self._get_conn()
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute("SELECT * FROM trades ORDER BY entry_time DESC")
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_trade_events(self, trade_id: str) -> List[Dict[str, Any]]:
+        """Get timeline events for a specific trade, ordered by timestamp."""
+        conn = self._get_conn()
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute(
+            "SELECT * FROM trade_events WHERE trade_id = ? ORDER BY timestamp ASC",
+            (trade_id,),
+        )
+        return [dict(row) for row in cursor.fetchall()]
 
 
 journal = TradeJournal()

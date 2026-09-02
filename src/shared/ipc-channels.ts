@@ -70,3 +70,11 @@ export const APP_PYTHON_STATUS = 'app:python-status';
 
 // ─── Dashboard ────────────────────────────────────────────────────
 export const DASHBOARD_SUMMARY = 'dashboard:summary';
+
+// ─── Journal & Analytics ──────────────────────────────────────────
+export const JOURNAL_GET_TRADES = 'journal:get-trades';
+export const JOURNAL_GET_EVENTS = 'journal:get-events';
+export const ANALYTICS_STRATEGY_EXPECTANCY = 'analytics:strategy-expectancy';
+export const ANALYTICS_CONFLUENCE_VALIDATION = 'analytics:confluence-validation';
+export const ANALYTICS_CONFIDENCE_CALIBRATION = 'analytics:confidence-calibration';
+export const ANALYTICS_EXIT_REASON = 'analytics:exit-reason';

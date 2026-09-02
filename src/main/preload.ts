@@ -93,6 +93,16 @@ try {
     dashboard: {
       summary: () => electron.ipcRenderer.invoke(channels.DASHBOARD_SUMMARY),
     },
+    journal: {
+      getTrades: () => electron.ipcRenderer.invoke(channels.JOURNAL_GET_TRADES),
+      getEvents: (tradeId: string) => electron.ipcRenderer.invoke(channels.JOURNAL_GET_EVENTS, tradeId),
+    },
+    analytics: {
+      getStrategyExpectancy: () => electron.ipcRenderer.invoke(channels.ANALYTICS_STRATEGY_EXPECTANCY),
+      getConfluenceValidation: () => electron.ipcRenderer.invoke(channels.ANALYTICS_CONFLUENCE_VALIDATION),
+      getConfidenceCalibration: () => electron.ipcRenderer.invoke(channels.ANALYTICS_CONFIDENCE_CALIBRATION),
+      getExitReasonEffectiveness: () => electron.ipcRenderer.invoke(channels.ANALYTICS_EXIT_REASON),
+    },
     app: {
       onPythonStatus: (callback: (data: any) => void) => {
         const listener = (_: any, data: any) => callback(data);
