@@ -2,7 +2,11 @@ try {
   const electron = require('electron');
   const channels = require('../shared/ipc-channels');
 
+  const devModeFlag = (process.env.KITE_DEV_MODE || '').toLowerCase();
+  const isDevMode = ['1', 'true', 'yes', 'on'].includes(devModeFlag);
+
   electron.contextBridge.exposeInMainWorld('electronAPI', {
+    isDevMode,
     invoke: (channel: string, ...args: any[]) => electron.ipcRenderer.invoke(channel, ...args),
     on: (channel: string, listener: (...args: any[]) => void) => electron.ipcRenderer.on(channel, listener),
     removeListener: (channel: string, listener: (...args: any[]) => void) => electron.ipcRenderer.removeListener(channel, listener),
