@@ -9,6 +9,7 @@ class FakeKiteClient:
         self.orders = []
         self.place_calls = []
         self.cancel_calls = []
+        self.modify_calls = []
         self._next_id = 1
 
     def place_order(self, **kwargs):
@@ -25,6 +26,9 @@ class FakeKiteClient:
                 "parent_order_id": parent_order_id,
             }
         )
+
+    def modify_order(self, **kwargs):
+        self.modify_calls.append(kwargs)
 
     def get_positions(self):
         return self.positions
@@ -165,3 +169,336 @@ def test_monitor_positions_updates_pnl_and_prevents_double_exit(monkeypatch):
 
     engine.monitor_positions()
     assert len(fake_client.place_calls) == 1
+
+
+def test_tighten_to_breakeven_modifies_broker_side_stop(monkeypatch):
+    """_tighten_to_breakeven must call modify_order to move the SL-M trigger."""
+    import backend.trading_engine as te
+
+    fake_client = FakeKiteClient()
+    monkeypatch.setattr(te, "kite_client", fake_client)
+
+    engine = TradingEngine()
+    engine.active_trades["RELIANCE"] = {
+        "sl": 95.0,
+        "target": 110.0,
+        "direction": "BUY",
+        "entry_price": 100.0,
+        "entry_time": datetime.datetime.now(),
+        "original_strategy": "test",
+        "stop_order_id": "STOP1",
+        "exit_pending": False,
+        "exit_order_id": None,
+    }
+
+    engine._tighten_to_breakeven("RELIANCE")
+
+    # In-memory SL updated
+    assert engine.active_trades["RELIANCE"]["sl"] == 100.0
+    # Broker-side SL-M order modified
+    assert len(fake_client.modify_calls) == 1
+    assert fake_client.modify_calls[0]["order_id"] == "STOP1"
+    assert fake_client.modify_calls[0]["trigger_price"] == 100.0
+
+
+def test_adopted_position_gets_protective_stop(monkeypatch):
+    """Positions adopted in auto mode must get a broker-side SL-M placed."""
+    import backend.trading_engine as te
+    from backend.config import config_manager
+
+    fake_client = FakeKiteClient()
+    fake_client.positions = {
+        "net": [
+            {
+                "tradingsymbol": "INFY",
+                "quantity": 5,
+                "exchange": "NSE",
+                "product": "MIS",
+                "lastPrice": 200.0,
+                "averagePrice": 200.0,
+                "realised": 0.0,
+                "unrealised": 0.0,
+            }
+        ]
+    }
+    fake_risk = FakeRiskManager()
+    monkeypatch.setattr(te, "kite_client", fake_client)
+    monkeypatch.setattr(te, "risk_manager", fake_risk)
+
+    engine = TradingEngine()
+    engine.mode = "auto"
+    engine.monitor_positions()
+
+    # Should have adopted INFY
+    assert "INFY" in engine.active_trades
+    trade = engine.active_trades["INFY"]
+    # Protective stop order should have been placed
+    assert trade["stop_order_id"] is not None
+    assert len(fake_client.place_calls) == 1
+    assert fake_client.place_calls[0]["order_type"] == "SL-M"
+    # Stop trigger should match the calculated SL
+    risk_config = config_manager.get_risk_config()
+    sl_pct = risk_config.get("defaultStopLossPercent", 1.5)
+    expected_sl = round(200.0 * (1 - sl_pct / 100), 2)
+    assert fake_client.place_calls[0]["trigger_price"] == expected_sl
+    assert trade["exit_pending"] is False
+    assert trade["exit_order_id"] is None
+
+
+def test_exit_order_uses_market_when_ltp_zero(monkeypatch):
+    """When LTP is 0, _place_exit_order should use MARKET order type instead of LIMIT at price 0."""
+    import backend.trading_engine as te
+
+    fake_client = FakeKiteClient()
+    monkeypatch.setattr(te, "kite_client", fake_client)
+
+    engine = TradingEngine()
+
+    position = {
+        "tradingsymbol": "RELIANCE",
+        "quantity": 10,
+        "exchange": "NSE",
+        "product": "MIS",
+        "lastPrice": 0,
+    }
+
+    engine._place_exit_order(position, "RELIANCE", "Square off")
+
+    assert len(fake_client.place_calls) == 1
+    call = fake_client.place_calls[0]
+    assert call["order_type"] == "MARKET"
+    assert "price" not in call
+
+
+def test_exit_order_uses_limit_when_ltp_available(monkeypatch):
+    """When LTP is available, _place_exit_order should use LIMIT order type."""
+    import backend.trading_engine as te
+
+    fake_client = FakeKiteClient()
+    monkeypatch.setattr(te, "kite_client", fake_client)
+
+    engine = TradingEngine()
+
+    position = {
+        "tradingsymbol": "RELIANCE",
+        "quantity": 10,
+        "exchange": "NSE",
+        "product": "MIS",
+        "lastPrice": 100.0,
+    }
+
+    engine._place_exit_order(position, "RELIANCE", "Target")
+
+    assert len(fake_client.place_calls) == 1
+    call = fake_client.place_calls[0]
+    assert call["order_type"] == "LIMIT"
+    assert call["price"] > 0
+
+
+def test_sync_exit_pending_removes_trade_on_complete(monkeypatch):
+    """When an exit order is COMPLETE, _sync_exit_pending_status should remove the trade."""
+    import backend.trading_engine as te
+
+    fake_client = FakeKiteClient()
+    fake_client.orders = [
+        {"orderId": "EXIT1", "status": "COMPLETE", "filledQuantity": 10}
+    ]
+    monkeypatch.setattr(te, "kite_client", fake_client)
+
+    engine = TradingEngine()
+    engine.active_trades["RELIANCE"] = {
+        "sl": 95.0,
+        "target": 110.0,
+        "direction": "BUY",
+        "entry_price": 100.0,
+        "entry_time": datetime.datetime.now(),
+        "original_strategy": "test",
+        "stop_order_id": None,
+        "exit_pending": True,
+        "exit_order_id": "EXIT1",
+    }
+
+    engine._sync_exit_pending_status("RELIANCE")
+
+    # Trade should be removed entirely
+    assert "RELIANCE" not in engine.active_trades
+
+
+def test_duplicate_execute_signal_is_blocked(monkeypatch):
+    """Concurrent execute_signal calls for the same symbol must not both proceed."""
+    import threading
+
+    import backend.trading_engine as te
+
+    fake_client = FakeKiteClient()
+    fake_client.positions = {
+        "net": [
+            {
+                "tradingsymbol": "RELIANCE",
+                "quantity": 10,
+                "exchange": "NSE",
+                "product": "MIS",
+                "lastPrice": 100.0,
+            }
+        ]
+    }
+    fake_risk = FakeRiskManager()
+    monkeypatch.setattr(te, "kite_client", fake_client)
+    monkeypatch.setattr(te, "risk_manager", fake_risk)
+
+    engine = TradingEngine()
+    engine._entry_fill_timeout_seconds = 1
+    engine._entry_fill_poll_seconds = 0
+
+    results = []
+
+    def call_execute():
+        res = engine.execute_signal(_sample_signal())
+        results.append(res)
+
+    t1 = threading.Thread(target=call_execute)
+    t2 = threading.Thread(target=call_execute)
+    t1.start()
+    t2.start()
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+
+    # Exactly one should succeed, the other should be skipped
+    assert results.count(True) == 1
+    assert results.count(False) == 1
+
+    # Only one entry order should have been placed
+    entry_orders = [c for c in fake_client.place_calls if c["order_type"] == "LIMIT"]
+    assert len(entry_orders) == 1
+
+
+def test_concurrent_place_exit_order_only_fires_once(monkeypatch):
+    """Two threads calling _place_exit_order for the same symbol must produce only one exit order."""
+    import threading
+
+    import backend.trading_engine as te
+
+    fake_client = FakeKiteClient()
+    monkeypatch.setattr(te, "kite_client", fake_client)
+
+    engine = TradingEngine()
+    engine.active_trades["RELIANCE"] = {
+        "sl": 95.0,
+        "target": 110.0,
+        "direction": "BUY",
+        "entry_price": 100.0,
+        "entry_time": datetime.datetime.now(),
+        "original_strategy": "test",
+        "stop_order_id": None,
+        "exit_pending": False,
+        "exit_order_id": None,
+    }
+
+    position = {
+        "tradingsymbol": "RELIANCE",
+        "quantity": 10,
+        "exchange": "NSE",
+        "product": "MIS",
+        "lastPrice": 94.0,
+    }
+
+    barrier = threading.Barrier(2)
+
+    def call_exit():
+        barrier.wait()
+        engine._place_exit_order(position, "RELIANCE", "SL")
+
+    t1 = threading.Thread(target=call_exit)
+    t2 = threading.Thread(target=call_exit)
+    t1.start()
+    t2.start()
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+
+    # Only one exit order should be placed
+    exit_orders = [
+        c for c in fake_client.place_calls if c["transaction_type"] == "SELL"
+    ]
+    assert len(exit_orders) == 1
+
+
+def test_pending_entries_prevents_adoption(monkeypatch):
+    """monitor_positions must not adopt a position whose symbol is in _pending_entries."""
+    import backend.trading_engine as te
+
+    fake_client = FakeKiteClient()
+    fake_client.positions = {
+        "net": [
+            {
+                "tradingsymbol": "RELIANCE",
+                "quantity": 10,
+                "exchange": "NSE",
+                "product": "MIS",
+                "lastPrice": 100.0,
+                "averagePrice": 100.0,
+                "realised": 0.0,
+                "unrealised": 0.0,
+            }
+        ]
+    }
+    fake_risk = FakeRiskManager()
+    monkeypatch.setattr(te, "kite_client", fake_client)
+    monkeypatch.setattr(te, "risk_manager", fake_risk)
+
+    engine = TradingEngine()
+    engine.mode = "auto"
+    # Simulate an in-flight entry for RELIANCE
+    engine._pending_entries.add("RELIANCE")
+
+    engine.monitor_positions()
+
+    # Should NOT have adopted RELIANCE
+    assert "RELIANCE" not in engine.active_trades
+    # No protective stop should have been placed
+    assert len(fake_client.place_calls) == 0
+
+
+def test_exit_pending_resets_on_place_order_failure(monkeypatch):
+    """If place_order raises during exit, exit_pending must be reset so the next cycle can retry."""
+    import backend.trading_engine as te
+
+    call_count = 0
+
+    def failing_place_order(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        raise Exception("Network error")
+
+    fake_client = FakeKiteClient()
+    fake_client.place_order = failing_place_order
+    monkeypatch.setattr(te, "kite_client", fake_client)
+
+    engine = TradingEngine()
+    engine.active_trades["RELIANCE"] = {
+        "sl": 95.0,
+        "target": 110.0,
+        "direction": "BUY",
+        "entry_price": 100.0,
+        "entry_time": datetime.datetime.now(),
+        "original_strategy": "test",
+        "stop_order_id": None,
+        "exit_pending": False,
+        "exit_order_id": None,
+    }
+
+    position = {
+        "tradingsymbol": "RELIANCE",
+        "quantity": 10,
+        "exchange": "NSE",
+        "product": "MIS",
+        "lastPrice": 94.0,
+    }
+
+    try:
+        engine._place_exit_order(position, "RELIANCE", "SL")
+    except Exception:
+        pass
+
+    # exit_pending must be reset so the next cycle can retry
+    assert engine.active_trades["RELIANCE"]["exit_pending"] is False
+    assert call_count == 1

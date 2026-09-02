@@ -201,6 +201,8 @@ def handle_request(req):
 
 
 def main():
+    from .trading_engine import _stdout_lock
+
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -214,13 +216,15 @@ def main():
                 "error": {"code": -32700, "message": "Parse error"},
                 "id": None,
             }
-            print(json.dumps(res))
-            sys.stdout.flush()
+            with _stdout_lock:
+                print(json.dumps(res))
+                sys.stdout.flush()
             continue
 
         res = handle_request(req)
-        print(json.dumps(res, cls=DateTimeEncoder))
-        sys.stdout.flush()
+        with _stdout_lock:
+            print(json.dumps(res, cls=DateTimeEncoder))
+            sys.stdout.flush()
 
 
 if __name__ == "__main__":
