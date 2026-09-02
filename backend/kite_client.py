@@ -87,35 +87,19 @@ class KiteClient:
         quantity,
         product,
         order_type,
-        price=None,
-        validity=None,
-        validity_ttl=None,
-        disclosed_quantity=None,
-        trigger_price=None,
-        squareoff=None,
-        stoploss=None,
-        trailing_stoploss=None,
-        tag=None,
+        **kwargs,
     ) -> str:
         from .config import config_manager
 
         order_id = self.kite.place_order(
-            variety,
-            exchange,
-            tradingsymbol,
-            transaction_type,
-            quantity,
-            product,
-            order_type,
-            price,
-            validity,
-            validity_ttl,
-            disclosed_quantity,
-            trigger_price,
-            squareoff,
-            stoploss,
-            trailing_stoploss,
-            tag,
+            variety=variety,
+            exchange=exchange,
+            tradingsymbol=tradingsymbol,
+            transaction_type=transaction_type,
+            quantity=quantity,
+            product=product,
+            order_type=order_type,
+            **kwargs,
         )
         config_manager.add_app_order_id(order_id)
         return order_id
@@ -123,37 +107,8 @@ class KiteClient:
     def cancel_order(self, variety, order_id, parent_order_id=None):
         return self.kite.cancel_order(variety, order_id, parent_order_id)
 
-    def modify_order(
-        self,
-        variety,
-        order_id,
-        parent_order_id=None,
-        exchange=None,
-        tradingsymbol=None,
-        transaction_type=None,
-        quantity=None,
-        price=None,
-        order_type=None,
-        product=None,
-        trigger_price=None,
-        validity=None,
-        disclosed_quantity=None,
-    ):
-        return self.kite.modify_order(
-            variety,
-            order_id,
-            parent_order_id,
-            exchange,
-            tradingsymbol,
-            transaction_type,
-            quantity,
-            price,
-            order_type,
-            product,
-            trigger_price,
-            validity,
-            disclosed_quantity,
-        )
+    def modify_order(self, variety, order_id, **kwargs):
+        return self.kite.modify_order(variety=variety, order_id=order_id, **kwargs)
 
     def get_margins(self) -> Dict[str, Any]:
         return self.kite.margins() if self.kite else {}
