@@ -6,6 +6,7 @@ import time
 import uuid
 
 from .config import config_manager
+from .journal import journal
 from .kite_client import kite_client
 from .risk_manager import risk_manager
 from .scanner import scanner
@@ -291,8 +292,44 @@ class TradingEngine:
                 )
                 return False
 
+            # Get confluence snapshot for journal
+            try:
+                token = self._ensure_instrument_map().get(symbol)
+                evaluation = scanner.evaluate_position(symbol, token) if token else {}
+            except Exception as e:
+                self._push_log(
+                    f"Error fetching confluence snapshot for {symbol}: {e}",
+                    level="warning",
+                )
+                evaluation = {}
+
+            trade_id = str(uuid.uuid4())
+            try:
+                journal.open_trade(
+                    trade_id=trade_id,
+                    tradingsymbol=symbol,
+                    exchange=position.get("exchange", exchange),
+                    direction=signal["direction"],
+                    product=position.get("product", "MIS"),
+                    strategy=signal.get("strategy", "unknown"),
+                    entry_price=position.get("averagePrice", signal["entryPrice"]),
+                    quantity=abs(position.get("quantity", qty)) or qty,
+                    stop_loss=signal["stopLoss"],
+                    target=signal["target"],
+                    signal_id=signal.get("id"),
+                    reasoning=signal.get("reasoning"),
+                    confidence=signal.get("confidence"),
+                    confluence_snapshot=evaluation,
+                    indicator_snapshot=signal.get("indicators"),
+                )
+            except Exception as e:
+                self._push_log(
+                    f"Failed to log trade open for {symbol}: {e}", level="error"
+                )
+
             with self._trade_lock:
                 self.active_trades[symbol] = {
+                    "trade_id": trade_id,
                     "sl": signal["stopLoss"],
                     "target": signal["target"],
                     "direction": signal["direction"],
@@ -468,10 +505,30 @@ class TradingEngine:
             adopted_signal, abs(p["quantity"]), exchange, p.get("product", "MIS")
         )
 
+        trade_id = str(uuid.uuid4())
+        try:
+            journal.open_trade(
+                trade_id=trade_id,
+                tradingsymbol=symbol,
+                exchange=exchange,
+                direction=direction,
+                product=p.get("product", "MIS"),
+                strategy="manual",
+                entry_price=avg_price,
+                quantity=abs(p["quantity"]),
+                stop_loss=sl,
+                target=target,
+            )
+        except Exception as e:
+            self._push_log(
+                f"Failed to log adopted trade for {symbol}: {e}", level="error"
+            )
+
         with self._trade_lock:
             lost_race = symbol in self.active_trades or symbol in self._pending_entries
             if not lost_race:
                 self.active_trades[symbol] = {
+                    "trade_id": trade_id,
                     "sl": sl,
                     "target": target,
                     "direction": direction,
@@ -597,6 +654,25 @@ class TradingEngine:
                     f"Thesis valid for {symbol}: {supporting} supporting, {opposing} opposing. Holding."
                 )
 
+            with self._trade_lock:
+                trade = self.active_trades.get(symbol)
+                trade_id = trade.get("trade_id") if trade else None
+
+            if trade_id:
+                try:
+                    journal.log_event(
+                        trade_id,
+                        "thesis_reevaluation",
+                        {
+                            "supporting": supporting,
+                            "opposing": opposing,
+                            "ltp": ltp,
+                            "mins_held": mins_held,
+                        },
+                    )
+                except Exception:
+                    pass
+
     def _tighten_to_breakeven(self, symbol: str):
         """Move the stop-loss to the entry price (breakeven), both in-memory and broker-side."""
         with self._trade_lock:
@@ -630,6 +706,23 @@ class TradingEngine:
                     trigger_price=trigger_price,
                     price=limit_price,
                 )
+                with self._trade_lock:
+                    trade = self.active_trades.get(symbol, {})
+                    trade_id = trade.get("trade_id")
+
+                if trade_id:
+                    try:
+                        journal.log_event(
+                            trade_id,
+                            "stop_modified",
+                            {
+                                "trigger_price": trigger_price,
+                                "limit_price": limit_price,
+                                "reason": "breakeven",
+                            },
+                        )
+                    except Exception:
+                        pass
             except Exception as e:
                 self._push_log(
                     f"Failed to modify broker-side stop for {symbol} to breakeven ₹{entry_price}: {e}",
@@ -729,6 +822,23 @@ class TradingEngine:
             self._push_log(
                 f"Placed protective stop for {symbol} at trigger ₹{trigger_price}, limit ₹{limit_price}, order_id {order_id}"
             )
+            with self._trade_lock:
+                trade = self.active_trades.get(symbol, {})
+                trade_id = trade.get("trade_id")
+
+            if trade_id:
+                try:
+                    journal.log_event(
+                        trade_id,
+                        "stop_placed",
+                        {
+                            "trigger_price": trigger_price,
+                            "limit_price": limit_price,
+                            "order_id": order_id,
+                        },
+                    )
+                except Exception:
+                    pass
             return order_id
         except Exception as e:
             self._push_log(
@@ -815,6 +925,7 @@ class TradingEngine:
         with self._trade_lock:
             if symbol in self.active_trades:
                 self.active_trades[symbol]["exit_order_id"] = order_id
+                self.active_trades[symbol]["exit_reason"] = reason
         reason_prefix = f"{reason}: " if reason else ""
         self._push_log(f"{reason_prefix}exit order placed for {symbol} ({tx_type})")
 
@@ -843,6 +954,21 @@ class TradingEngine:
                         level="warning",
                     )
                 elif status == "COMPLETE":
+                    trade_id = self.active_trades[symbol].get("trade_id")
+                    exit_reason = self.active_trades[symbol].get(
+                        "exit_reason", "unknown"
+                    )
+                    avg_price = float(order.get("averagePrice") or 0)
+
+                    if trade_id:
+                        try:
+                            journal.close_trade(trade_id, avg_price, exit_reason)
+                        except Exception as e:
+                            self._push_log(
+                                f"Error closing trade in journal for {symbol}: {e}",
+                                level="error",
+                            )
+
                     self._push_log(
                         f"Exit order {order_id} for {symbol} filled. Removing from tracking."
                     )
