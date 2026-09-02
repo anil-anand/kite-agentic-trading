@@ -96,8 +96,9 @@ def test_execute_signal_places_protective_stop_and_tracks_trade(monkeypatch):
     assert engine.execute_signal(_sample_signal()) is True
     assert len(fake_client.place_calls) == 2
     assert fake_client.place_calls[0]["order_type"] == "LIMIT"
-    assert fake_client.place_calls[1]["order_type"] == "SL-M"
+    assert fake_client.place_calls[1]["order_type"] == "SL"
     assert fake_client.place_calls[1]["trigger_price"] == 95.0
+    assert fake_client.place_calls[1]["price"] == 94.05
     assert "RELIANCE" in engine.active_trades
     assert engine.active_trades["RELIANCE"]["stop_order_id"] == "OID2"
 
@@ -235,7 +236,9 @@ def test_adopted_position_gets_protective_stop(monkeypatch):
     # Protective stop order should have been placed
     assert trade["stop_order_id"] is not None
     assert len(fake_client.place_calls) == 1
-    assert fake_client.place_calls[0]["order_type"] == "SL-M"
+    assert fake_client.place_calls[0]["order_type"] == "SL"
+    assert fake_client.place_calls[0]["trigger_price"] == 197.0
+    assert fake_client.place_calls[0]["price"] == 195.05
     # Stop trigger should match the calculated SL
     risk_config = config_manager.get_risk_config()
     sl_pct = risk_config.get("defaultStopLossPercent", 1.5)
@@ -501,4 +504,4 @@ def test_exit_pending_resets_on_place_order_failure(monkeypatch):
 
     # exit_pending must be reset so the next cycle can retry
     assert engine.active_trades["RELIANCE"]["exit_pending"] is False
-    assert call_count == 1
+    assert call_count == 2

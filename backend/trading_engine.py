@@ -37,6 +37,24 @@ class TradingEngine:
         # active_trades. Prevents monitor_positions from adopting a position
         # that execute_signal is still setting up.
         self._pending_entries: set = set()
+        self._tick_size_map = {}
+
+    def _get_tick_size(self, symbol: str, exchange: str = "NSE") -> float:
+        if symbol in self._tick_size_map:
+            return self._tick_size_map[symbol]
+        try:
+            instruments = kite_client.get_instruments(exchange)
+            for i in instruments:
+                self._tick_size_map[i["tradingsymbol"]] = float(
+                    i.get("tick_size", 0.05)
+                )
+            return self._tick_size_map.get(symbol, 0.05)
+        except Exception as e:
+            self._push_log(f"Error fetching tick size for {symbol}: {e}", level="warning")
+            return 0.05
+
+    def _round_to_tick(self, price: float, tick_size: float) -> float:
+        return round(round(price / tick_size) * tick_size, 2)
 
     def start(self, mode: str = "confirm"):
         if self.running:
@@ -221,17 +239,20 @@ class TradingEngine:
         )
 
         transaction_type = "BUY" if signal["direction"] == "BUY" else "SELL"
+        exchange = signal.get("exchange", "NSE")
+        tick_size = self._get_tick_size(symbol, exchange)
+        entry_price = self._round_to_tick(signal["entryPrice"], tick_size)
 
         try:
             order_id = kite_client.place_order(
                 variety="regular",
-                exchange=signal["exchange"],
+                exchange=exchange,
                 tradingsymbol=symbol,
                 transaction_type=transaction_type,
                 quantity=qty,
                 product="MIS",
                 order_type="LIMIT",
-                price=signal["entryPrice"],
+                price=entry_price,
             )
             self._push_log(
                 f"Executed {transaction_type} for {symbol}, qty {qty}, order_id {order_id}"
@@ -273,26 +294,31 @@ class TradingEngine:
                     "sl": signal["stopLoss"],
                     "target": signal["target"],
                     "direction": signal["direction"],
-                    "entry_price": signal["entryPrice"],
+                    "entry_price": position.get("averagePrice", signal["entryPrice"]),
                     "entry_time": datetime.datetime.now(),
                     "original_strategy": signal.get("strategy", "unknown"),
                     "entry_order_id": order_id,
                     "stop_order_id": stop_order_id,
                     "exit_pending": False,
                     "exit_order_id": None,
+                    "exchange": position.get("exchange", exchange),
                 }
             return True
         except Exception as e:
             self._push_log(f"Failed to execute signal: {e}")
             return False
 
-    def _get_exit_limit_price(self, ltp: float, tx_type: str) -> float:
+    def _get_exit_limit_price(
+        self, symbol: str, exchange: str, ltp: float, tx_type: str
+    ) -> float:
         # A pseudo-market limit order to ensure immediate fill without Kite MARKET restrictions
         buffer = 0.01  # 1% buffer
+        tick_size = self._get_tick_size(symbol, exchange)
         if tx_type == "BUY":
-            return round(ltp * (1 + buffer), 2)
+            price = ltp * (1 + buffer)
         else:
-            return round(ltp * (1 - buffer), 2)
+            price = ltp * (1 - buffer)
+        return self._round_to_tick(price, tick_size)
 
     def monitor_positions(self):
         try:
@@ -338,13 +364,18 @@ class TradingEngine:
                                 risk_config = config_manager.get_risk_config()
                                 sl_pct = risk_config.get("defaultStopLossPercent", 1.5)
                                 tgt_pct = risk_config.get("defaultTargetPercent", 3.0)
+                                exchange = p.get("exchange", "NSE")
+                                tick_size = self._get_tick_size(symbol, exchange)
 
                                 if direction == "BUY":
-                                    sl = round(avg_price * (1 - sl_pct / 100), 2)
-                                    target = round(avg_price * (1 + tgt_pct / 100), 2)
+                                    sl = avg_price * (1 - sl_pct / 100)
+                                    target = avg_price * (1 + tgt_pct / 100)
                                 else:
-                                    sl = round(avg_price * (1 + sl_pct / 100), 2)
-                                    target = round(avg_price * (1 - tgt_pct / 100), 2)
+                                    sl = avg_price * (1 + sl_pct / 100)
+                                    target = avg_price * (1 - tgt_pct / 100)
+
+                                sl = self._round_to_tick(sl, tick_size)
+                                target = self._round_to_tick(target, tick_size)
 
                                 adopted_signal = {
                                     "tradingsymbol": symbol,
@@ -354,7 +385,7 @@ class TradingEngine:
                                 stop_order_id = self._place_protective_stop(
                                     adopted_signal,
                                     abs(p["quantity"]),
-                                    p.get("exchange", "NSE"),
+                                    exchange,
                                     p.get("product", "MIS"),
                                 )
                                 self.active_trades[symbol] = {
@@ -363,10 +394,11 @@ class TradingEngine:
                                     "direction": direction,
                                     "entry_price": avg_price,
                                     "entry_time": datetime.datetime.now(),
-                                    "original_strategy": "adopted",
-                                    "stop_order_id": stop_order_id or None,
+                                    "original_strategy": "manual",
+                                    "stop_order_id": stop_order_id,
                                     "exit_pending": False,
                                     "exit_order_id": None,
+                                    "exchange": exchange,
                                 }
                                 self._push_log(
                                     f"Adopted open position {symbol} ({direction}) at ₹{avg_price}. Auto-calculated SL: ₹{sl}, Target: ₹{target}"
@@ -516,12 +548,27 @@ class TradingEngine:
                 return
             trade["sl"] = entry_price
             stop_order_id = trade.get("stop_order_id")
+            exchange = trade.get("exchange", "NSE")
+            direction = trade.get("direction")
         if stop_order_id:
+            tick_size = self._get_tick_size(symbol, exchange)
+            trigger_price = self._round_to_tick(entry_price, tick_size)
+            stop_tx = "SELL" if direction == "BUY" else "BUY"
+            buffer_pct = 0.01
+
+            if stop_tx == "SELL":
+                limit_price = trigger_price * (1 - buffer_pct)
+            else:
+                limit_price = trigger_price * (1 + buffer_pct)
+
+            limit_price = self._round_to_tick(limit_price, tick_size)
+
             try:
                 kite_client.modify_order(
                     variety="regular",
                     order_id=stop_order_id,
-                    trigger_price=entry_price,
+                    trigger_price=trigger_price,
+                    price=limit_price,
                 )
             except Exception as e:
                 self._push_log(
@@ -595,26 +642,37 @@ class TradingEngine:
         self, signal: dict, quantity: int, exchange: str, product: str
     ) -> str:
         try:
+            symbol = signal["tradingsymbol"]
             direction = signal["direction"]
             stop_tx = "SELL" if direction == "BUY" else "BUY"
-            trigger_price = signal["stopLoss"]
+            tick_size = self._get_tick_size(symbol, exchange)
+            trigger_price = self._round_to_tick(signal["stopLoss"], tick_size)
+
+            buffer_pct = 0.01
+            if stop_tx == "SELL":
+                limit_price = trigger_price * (1 - buffer_pct)
+            else:
+                limit_price = trigger_price * (1 + buffer_pct)
+            limit_price = self._round_to_tick(limit_price, tick_size)
+
             order_id = kite_client.place_order(
                 variety="regular",
                 exchange=exchange,
-                tradingsymbol=signal["tradingsymbol"],
+                tradingsymbol=symbol,
                 transaction_type=stop_tx,
                 quantity=quantity,
                 product=product,
-                order_type="SL-M",
+                order_type="SL",
+                price=limit_price,
                 trigger_price=trigger_price,
             )
             self._push_log(
-                f"Placed protective stop for {signal['tradingsymbol']} at trigger ₹{trigger_price}, order_id {order_id}"
+                f"Placed protective stop for {symbol} at trigger ₹{trigger_price}, limit ₹{limit_price}, order_id {order_id}"
             )
             return order_id
         except Exception as e:
             self._push_log(
-                f"Failed to place protective stop for {signal['tradingsymbol']}: {e}",
+                f"Failed to place protective stop for {signal.get('tradingsymbol', 'unknown')}: {e}",
                 level="error",
             )
             return ""
@@ -652,7 +710,8 @@ class TradingEngine:
 
         if ltp > 0:
             order_type = "LIMIT"
-            price = self._get_exit_limit_price(ltp, tx_type)
+            exchange = position.get("exchange", "NSE")
+            price = self._get_exit_limit_price(symbol, exchange, ltp, tx_type)
         else:
             order_type = "MARKET"
             price = None
@@ -671,12 +730,24 @@ class TradingEngine:
 
         try:
             order_id = kite_client.place_order(**order_kwargs)
-        except Exception:
-            # Reset exit_pending so the next cycle can retry
-            with self._trade_lock:
-                if symbol in self.active_trades:
-                    self.active_trades[symbol]["exit_pending"] = False
-            raise
+        except Exception as e:
+            if order_type == "LIMIT":
+                self._push_log(f"Failed to place LIMIT exit order for {symbol}: {e}. Retrying with MARKET order.", level="warning")
+                order_kwargs["order_type"] = "MARKET"
+                if "price" in order_kwargs:
+                    del order_kwargs["price"]
+                try:
+                    order_id = kite_client.place_order(**order_kwargs)
+                except Exception as e2:
+                    with self._trade_lock:
+                        if symbol in self.active_trades:
+                            self.active_trades[symbol]["exit_pending"] = False
+                    raise e2
+            else:
+                with self._trade_lock:
+                    if symbol in self.active_trades:
+                        self.active_trades[symbol]["exit_pending"] = False
+                raise
 
         with self._trade_lock:
             if symbol in self.active_trades:

@@ -180,11 +180,19 @@ class KiteClient:
 
     def get_instruments(self, exchange=None):
         if not self.instruments_cache:
-            self.instruments_cache = self.kite.instruments() if self.kite else []
+            self.instruments_cache = {}
 
         if exchange:
-            return [i for i in self.instruments_cache if i["exchange"] == exchange]
-        return self.instruments_cache
+            if exchange not in self.instruments_cache:
+                self.instruments_cache[exchange] = (
+                    self.kite.instruments(exchange) if self.kite else []
+                )
+            return self.instruments_cache[exchange]
+
+        # If no exchange is specified, fetch all (not recommended due to size)
+        if "all" not in self.instruments_cache:
+            self.instruments_cache["all"] = self.kite.instruments() if self.kite else []
+        return self.instruments_cache["all"]
 
     def search_instruments(self, query: str) -> List[Dict[str, Any]]:
         query = query.upper()
