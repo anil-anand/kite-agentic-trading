@@ -23,6 +23,16 @@ export interface ElectronAPI {
     getAll(): Promise<any>;
     getTrades(): Promise<any>;
   };
+  journal: {
+    getTrades(): Promise<any>;
+    getEvents(tradeId: string): Promise<any>;
+  };
+  analytics: {
+    getStrategyExpectancy(): Promise<any>;
+    getConfluenceValidation(): Promise<any>;
+    getConfidenceCalibration(): Promise<any>;
+    getExitReasonEffectiveness(): Promise<any>;
+  };
 }
 
 declare global {

@@ -2,7 +2,9 @@ import json
 import sys
 import traceback
 
+from .analytics import analytics
 from .config import config_manager
+from .journal import journal
 from .kite_client import kite_client
 from .scanner import scanner
 from .ticker import ticker_manager
@@ -192,6 +194,24 @@ def handle_request(req):
         elif method == "execute_signal":
             res = trading_engine.execute_signal(params.get("signal", {}))
             return success({"executed": res})
+
+        elif method == "journal_get_trades":
+            return success(journal.get_trades())
+
+        elif method == "journal_get_events":
+            return success(journal.get_trade_events(params.get("trade_id")))
+
+        elif method == "analytics_strategy_expectancy":
+            return success(analytics.get_strategy_expectancy())
+
+        elif method == "analytics_confluence_validation":
+            return success(analytics.get_confluence_validation())
+
+        elif method == "analytics_confidence_calibration":
+            return success(analytics.get_confidence_calibration())
+
+        elif method == "analytics_exit_reason_effectiveness":
+            return success(analytics.get_exit_reason_effectiveness())
 
         else:
             return error(-32601, f"Method '{method}' not found")
