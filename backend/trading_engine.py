@@ -50,7 +50,9 @@ class TradingEngine:
                 )
             return self._tick_size_map.get(symbol, 0.05)
         except Exception as e:
-            self._push_log(f"Error fetching tick size for {symbol}: {e}", level="warning")
+            self._push_log(
+                f"Error fetching tick size for {symbol}: {e}", level="warning"
+            )
             return 0.05
 
     def _round_to_tick(self, price: float, tick_size: float) -> float:
@@ -732,7 +734,10 @@ class TradingEngine:
             order_id = kite_client.place_order(**order_kwargs)
         except Exception as e:
             if order_type == "LIMIT":
-                self._push_log(f"Failed to place LIMIT exit order for {symbol}: {e}. Retrying with MARKET order.", level="warning")
+                self._push_log(
+                    f"Failed to place LIMIT exit order for {symbol}: {e}. Retrying with MARKET order.",
+                    level="warning",
+                )
                 order_kwargs["order_type"] = "MARKET"
                 if "price" in order_kwargs:
                     del order_kwargs["price"]
