@@ -36,6 +36,32 @@ class FakeKiteClient:
     def get_orders(self):
         return self.orders
 
+    def get_instruments(self, exchange=None):
+        return [
+            {"tradingsymbol": "RELIANCE", "instrument_token": 111, "tick_size": 0.05},
+            {"tradingsymbol": "INFY", "instrument_token": 222, "tick_size": 0.05},
+        ]
+
+
+class FakeScanner:
+    """Stub scanner: replays preset signals to on_signal, and returns a fixed
+    evaluation for _reevaluate_positions."""
+
+    def __init__(self, signals=None, evaluation=None):
+        self._signals = signals or []
+        self._evaluation = evaluation or {"buy_signals": 0, "sell_signals": 0}
+        self.scan_calls = []
+
+    def scan_watchlist(self, watchlist, on_signal=None):
+        self.scan_calls.append(list(watchlist))
+        if on_signal:
+            for sig in self._signals:
+                on_signal(sig)
+        return []
+
+    def evaluate_position(self, symbol, token):
+        return self._evaluation
+
 
 class FakeRiskManager:
     def __init__(self):
