@@ -20,7 +20,7 @@ const Settings: React.FC = () => {
 
   const handleRiskChange = (key: string, value: string | boolean) => {
     setLocalSettings((prev: any) => {
-      let finalValue = value;
+      let finalValue: string | number | boolean = value;
       if (typeof value === 'string' && !value.includes(':')) {
         finalValue = parseFloat(value) || 0;
       }

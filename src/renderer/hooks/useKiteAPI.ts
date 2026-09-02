@@ -1,13 +1,28 @@
 import { useEffect } from 'react';
 import { useTradingStore } from '../stores/trading-store';
 import * as IPC from '@shared/ipc-channels';
-import { OrderRequest, KiteCredentials } from '@shared/types';
+import { OrderRequest, KiteCredentials, StrategyName } from '@shared/types';
 
 export interface ElectronAPI {
   invoke(channel: string, ...args: any[]): Promise<any>;
   on(channel: string, listener: (...args: any[]) => void): void;
   removeListener(channel: string, listener: (...args: any[]) => void): void;
   removeAllListeners(channel: string): void;
+  dashboard: {
+    summary(): Promise<any>;
+  };
+  portfolio: {
+    positions(): Promise<any>;
+    holdings(): Promise<any>;
+    margins(): Promise<any>;
+  };
+  orders: {
+    place(orderParams: any): Promise<any>;
+    modify(orderParams: any): Promise<any>;
+    cancel(orderId: string, variety: string): Promise<any>;
+    getAll(): Promise<any>;
+    getTrades(): Promise<any>;
+  };
 }
 
 declare global {
@@ -51,7 +66,9 @@ export const useKiteAPI = () => {
         const settings = await window.electronAPI?.invoke(IPC.SETTINGS_GET);
         if (settings) {
            if (settings.strategies) {
-             const enabledStrats = Object.keys(settings.strategies).filter(s => settings.strategies[s].enabled);
+             const enabledStrats = Object.keys(settings.strategies).filter(
+               s => settings.strategies[s].enabled
+             ) as StrategyName[];
              store.setAgentState({ enabledStrategies: enabledStrats });
            }
            if (settings.mode) {
