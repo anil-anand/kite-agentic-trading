@@ -51,4 +51,7 @@ jobs:
         run: npm run typecheck
 
       - name: Build
-        run: npm run build
+        # build:main + build:renderer are the TypeScript/renderer compile. The
+        # full `build` also runs build:icon, which needs Python + Pillow to
+        # generate a packaging asset — not relevant to a compile/type gate.
+        run: npm run build:main && npm run build:renderer
