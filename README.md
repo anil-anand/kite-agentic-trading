@@ -2,7 +2,7 @@
 
 An automated, quantitative algorithmic trading application built on top of the **Zerodha Kite Connect API**. 
 
-The app features a modern Electron/React frontend communicating with a high-performance, multi-threaded Python backend. It acts as an autonomous agent that continuously scans the NIFTY 50 universe (plus custom watchlists) using 17 distinct technical analysis strategies, grouping them by **Confluence** to generate high-probability trade signals.
+The app features a modern Electron/React frontend communicating with a high-performance, multi-threaded Python backend. It acts as an autonomous agent that continuously scans the NIFTY 100 universe (plus custom watchlists) using 17 distinct technical analysis strategies, grouping them by **Confluence** to generate high-probability trade signals.
 
 ## 🚀 Features
 
@@ -60,7 +60,7 @@ Copy and paste the following prompt into Claude, Codex, or another coding agent 
 Set up this repository for local development. First verify that Node.js and uv are installed. Run `npm install` for the frontend, then run `uv sync` to provision the Python environment and install backend dependencies. After setup, run `npm run lint`, `npm run typecheck`, `npm run build`, and `uv run pytest`, and report any failures with their causes. Do not request, print, commit, or modify real Kite API credentials; credentials must be configured locally through the app's Settings screen.
 ```
 
-The NIFTY 50 universe is refreshed from NSE's live index constituents endpoint once per day. If NSE is unavailable or blocks the request, the bundled list in `backend/nifty_universe.py` is used instead.
+The NIFTY 100 universe is refreshed from NSE's live index constituents endpoint once per day. If NSE is unavailable or blocks the request, the bundled list in `backend/nifty_universe.py` is used instead.
 
 ## 🚀 Running the App
 

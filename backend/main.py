@@ -132,11 +132,11 @@ def handle_request(req):
             return success({"status": "saved"})
 
         elif method == "scan_now":
-            from .nifty_universe import get_nifty50_universe
+            from .nifty_universe import get_nifty100_universe
             from .screener import screener_engine
 
             custom_watchlist = config_manager.get_watchlist()
-            full_universe = list(set(get_nifty50_universe() + custom_watchlist))
+            full_universe = list(set(get_nifty100_universe() + custom_watchlist))
 
             # Run the AI screener
             top_stocks = screener_engine.generate_daily_watchlist(

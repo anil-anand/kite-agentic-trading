@@ -93,7 +93,7 @@ const AgentControl: React.FC = () => {
         <div>
           <h1 className="text-2xl font-bold text-white">Agent Control</h1>
           <p className="text-sm text-surface-400 mt-1">
-            Scanning NIFTY 50 universe + your Custom Watchlist using all active strategies below.
+            Scanning NIFTY 100 universe + your Custom Watchlist using all active strategies below.
           </p>
         </div>
         <button 
