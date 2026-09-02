@@ -6,11 +6,15 @@ const Settings: React.FC = () => {
   const { settings, setSettings } = useTradingStore();
   const [localSettings, setLocalSettings] = useState<any>(settings);
   const [saveStatus, setSaveStatus] = useState<string>('');
+  const [llmKey, setLlmKey] = useState<string>('');
 
   // Sync local state when global settings load
   useEffect(() => {
     if (settings) {
       setLocalSettings(settings);
+      if (settings.credentials?.llmApiKey) {
+        setLlmKey(settings.credentials.llmApiKey);
+      }
     }
   }, [settings]);
 
@@ -38,6 +42,16 @@ const Settings: React.FC = () => {
     try {
       setSaveStatus('Saving...');
       await window.electronAPI?.invoke(SETTINGS_SAVE, localSettings);
+      
+      // Save LLM key via specific endpoint if it changed
+      if (llmKey !== (settings?.credentials?.llmApiKey || '')) {
+        await window.electronAPI?.settings.saveLlmKey(llmKey);
+        // Optimistically update the store copy
+        if (localSettings.credentials) {
+          localSettings.credentials.llmApiKey = llmKey;
+        }
+      }
+      
       setSettings(localSettings);
       setSaveStatus('Saved successfully!');
       setTimeout(() => setSaveStatus(''), 3000);
@@ -87,6 +101,23 @@ const Settings: React.FC = () => {
                 <input type="password" value="••••••••••••••••" readOnly className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white" />
               </div>
               <p className="text-xs text-surface-500">To update credentials, log out and enter them on the login screen.</p>
+            </div>
+          </section>
+
+          <section className="bg-surface-800 p-6 rounded-xl border border-surface-700">
+            <h2 className="text-lg font-semibold text-white mb-4">Google Gemini API (LLM Post-Mortems)</h2>
+            <div className="space-y-4">
+              <div>
+                <label className="block text-surface-400 text-sm mb-1">Gemini API Key</label>
+                <input 
+                  type="password" 
+                  value={llmKey} 
+                  onChange={(e) => setLlmKey(e.target.value)}
+                  placeholder="AIzaSy..."
+                  className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white focus:border-accent-light outline-none" 
+                />
+              </div>
+              <p className="text-xs text-surface-500">Used for generating AI-powered trade post-mortems in the Journal. Stored securely and encrypted.</p>
             </div>
           </section>
 

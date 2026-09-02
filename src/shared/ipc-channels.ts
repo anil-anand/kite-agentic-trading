@@ -55,6 +55,7 @@ export const LOG_CLEAR = 'log:clear';
 // ─── Settings ─────────────────────────────────────────────────────
 export const SETTINGS_GET = 'settings:get';
 export const SETTINGS_SAVE = 'settings:save';
+export const SETTINGS_SAVE_LLM_KEY = 'settings:save-llm-key';
 export const SETTINGS_RESET = 'settings:reset';
 
 // ─── Watchlist ────────────────────────────────────────────────────
@@ -78,3 +79,6 @@ export const ANALYTICS_STRATEGY_EXPECTANCY = 'analytics:strategy-expectancy';
 export const ANALYTICS_CONFLUENCE_VALIDATION = 'analytics:confluence-validation';
 export const ANALYTICS_CONFIDENCE_CALIBRATION = 'analytics:confidence-calibration';
 export const ANALYTICS_EXIT_REASON = 'analytics:exit-reason';
+export const ANALYTICS_TRADE_REPLAY = 'analytics:trade-replay';
+export const ANALYTICS_WHAT_IF = 'analytics:what-if';
+export const ANALYTICS_LLM_POST_MORTEM = 'analytics:llm-post-mortem';

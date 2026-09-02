@@ -5,15 +5,25 @@ import {
   StrategyExpectancy, 
   ConfluenceValidation, 
   ConfidenceCalibration, 
-  ExitReasonEffectiveness 
+  ExitReasonEffectiveness,
+  TradeReplayData,
+  WhatIfAnalysis,
+  LLMPostMortem
 } from '../../shared/types';
-import { ChevronDown, ChevronRight, Activity, PieChart, BarChart3, Clock, AlertTriangle } from 'lucide-react';
+import { ChevronDown, ChevronRight, Activity, PieChart, BarChart3, Clock, AlertTriangle, LineChart, Cpu, Lightbulb } from 'lucide-react';
+import TradeReplayChart from '../components/TradeReplayChart';
 
 const Journal: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'trades' | 'analytics'>('trades');
   const [trades, setTrades] = useState<JournalTrade[]>([]);
   const [expandedTradeId, setExpandedTradeId] = useState<string | null>(null);
+  const [activeTradeTab, setActiveTradeTab] = useState<'overview' | 'replay' | 'whatif' | 'ai'>('overview');
+  
+  // Per-trade data
   const [tradeEvents, setTradeEvents] = useState<Record<string, TradeEvent[]>>({});
+  const [tradeReplays, setTradeReplays] = useState<Record<string, TradeReplayData>>({});
+  const [whatIfs, setWhatIfs] = useState<Record<string, WhatIfAnalysis>>({});
+  const [llmPostMortems, setLlmPostMortems] = useState<Record<string, LLMPostMortem>>({});
   
   // Analytics State
   const [expectancy, setExpectancy] = useState<StrategyExpectancy[]>([]);
@@ -56,13 +66,34 @@ const Journal: React.FC = () => {
       return;
     }
     setExpandedTradeId(tradeId);
+    setActiveTradeTab('overview');
     
-    if (!tradeEvents[tradeId] && window.electronAPI) {
+    if (window.electronAPI) {
       try {
-        const events = await window.electronAPI.journal.getEvents(tradeId);
-        setTradeEvents(prev => ({ ...prev, [tradeId]: events }));
+        if (!tradeEvents[tradeId]) {
+          const events = await window.electronAPI.journal.getEvents(tradeId);
+          setTradeEvents(prev => ({ ...prev, [tradeId]: events }));
+        }
+        if (!tradeReplays[tradeId]) {
+          const replay = await window.electronAPI.analytics.getTradeReplay(tradeId);
+          if (replay && !replay.error) {
+            setTradeReplays(prev => ({ ...prev, [tradeId]: replay }));
+          }
+        }
+        if (!whatIfs[tradeId]) {
+          const whatif = await window.electronAPI.analytics.getWhatIfAnalysis(tradeId);
+          if (whatif && !whatif.error) {
+            setWhatIfs(prev => ({ ...prev, [tradeId]: whatif }));
+          }
+        }
+        if (!llmPostMortems[tradeId]) {
+          const llm = await window.electronAPI.analytics.getLlmPostMortem(tradeId);
+          if (llm) {
+            setLlmPostMortems(prev => ({ ...prev, [tradeId]: llm }));
+          }
+        }
       } catch (e) {
-        console.error('Error fetching trade events', e);
+        console.error('Error fetching trade details', e);
       }
     }
   };
@@ -110,60 +141,179 @@ const Journal: React.FC = () => {
                 {/* Expanded Details */}
                 {expandedTradeId === t.id && (
                   <tr className="bg-surface-900 border-b border-surface-700 shadow-inner">
-                    <td colSpan={7} className="p-6">
-                      <div className="grid grid-cols-2 gap-8">
-                        <div>
-                          <h4 className="text-sm font-semibold text-surface-200 mb-4 flex items-center">
-                            <Clock size={16} className="mr-2 text-accent-light" /> Timeline
-                          </h4>
-                          <div className="space-y-4 pl-2 border-l-2 border-surface-700/50">
-                            {(tradeEvents[t.id] || []).map(e => {
-                              const details = JSON.parse(e.details || '{}');
-                              return (
-                                <div key={e.id} className="relative pl-6">
-                                  <div className="absolute w-3 h-3 bg-accent-light rounded-full -left-[23px] top-1.5 shadow-[0_0_8px_rgba(var(--color-accent-light),0.5)]" />
-                                  <div className="text-xs text-surface-400 mb-1">{new Date(e.timestamp).toLocaleTimeString()}</div>
-                                  <div className="text-sm font-medium text-white">{e.event_type.replace('_', ' ').toUpperCase()}</div>
-                                  <pre className="text-xs text-surface-300 mt-2 bg-surface-800 p-3 rounded-lg max-w-full overflow-x-auto whitespace-pre-wrap border border-surface-700/50">
-                                    {JSON.stringify(details, null, 2)}
-                                  </pre>
-                                </div>
-                              );
-                            })}
-                            {(!tradeEvents[t.id] || tradeEvents[t.id].length === 0) && (
-                              <div className="text-sm text-surface-400 pl-4">Loading events...</div>
-                            )}
-                          </div>
-                        </div>
-                        <div className="space-y-6">
-                          <div>
-                            <h4 className="text-sm font-semibold text-surface-200 mb-3 flex items-center">
-                              <Activity size={16} className="mr-2 text-accent-light" /> Context & Rationale
-                            </h4>
-                            <div className="bg-surface-800 p-4 rounded-lg border border-surface-700 text-sm text-surface-200 space-y-3">
-                              <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Reasoning</span> {t.reasoning || 'N/A'}</p>
-                              <div className="grid grid-cols-2 gap-4 pt-2 border-t border-surface-700/50">
-                                <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Confidence</span> {t.confidence ? `${t.confidence}%` : 'N/A'}</p>
-                                <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Status</span> {t.status}</p>
+                    <td colSpan={7} className="p-0">
+                      
+                      {/* Sub-tabs */}
+                      <div className="flex border-b border-surface-700 bg-surface-800/50 px-6 pt-4">
+                        <button 
+                          onClick={() => setActiveTradeTab('overview')}
+                          className={`pb-3 mr-6 text-sm font-semibold transition-all relative ${activeTradeTab === 'overview' ? 'text-accent-light' : 'text-surface-400 hover:text-white'}`}
+                        >
+                          Overview
+                          {activeTradeTab === 'overview' && <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-accent-light" />}
+                        </button>
+                        <button 
+                          onClick={() => setActiveTradeTab('replay')}
+                          className={`pb-3 mr-6 text-sm font-semibold transition-all relative ${activeTradeTab === 'replay' ? 'text-accent-light' : 'text-surface-400 hover:text-white'}`}
+                        >
+                          <div className="flex items-center"><LineChart size={14} className="mr-1"/> Replay</div>
+                          {activeTradeTab === 'replay' && <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-accent-light" />}
+                        </button>
+                        <button 
+                          onClick={() => setActiveTradeTab('whatif')}
+                          className={`pb-3 mr-6 text-sm font-semibold transition-all relative ${activeTradeTab === 'whatif' ? 'text-accent-light' : 'text-surface-400 hover:text-white'}`}
+                        >
+                          <div className="flex items-center"><Lightbulb size={14} className="mr-1"/> What-If</div>
+                          {activeTradeTab === 'whatif' && <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-accent-light" />}
+                        </button>
+                        <button 
+                          onClick={() => setActiveTradeTab('ai')}
+                          className={`pb-3 mr-6 text-sm font-semibold transition-all relative ${activeTradeTab === 'ai' ? 'text-accent-light' : 'text-surface-400 hover:text-white'}`}
+                        >
+                          <div className="flex items-center"><Cpu size={14} className="mr-1"/> AI Post-Mortem</div>
+                          {activeTradeTab === 'ai' && <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-accent-light" />}
+                        </button>
+                      </div>
+
+                      <div className="p-6">
+                        {activeTradeTab === 'overview' && (
+                          <div className="grid grid-cols-2 gap-8 animate-in fade-in duration-300">
+                            <div>
+                              <h4 className="text-sm font-semibold text-surface-200 mb-4 flex items-center">
+                                <Clock size={16} className="mr-2 text-accent-light" /> Timeline
+                              </h4>
+                              <div className="space-y-4 pl-2 border-l-2 border-surface-700/50">
+                                {(tradeEvents[t.id] || []).map(e => {
+                                  const details = JSON.parse(e.details || '{}');
+                                  return (
+                                    <div key={e.id} className="relative pl-6">
+                                      <div className="absolute w-3 h-3 bg-accent-light rounded-full -left-[23px] top-1.5 shadow-[0_0_8px_rgba(var(--color-accent-light),0.5)]" />
+                                      <div className="text-xs text-surface-400 mb-1">{new Date(e.timestamp).toLocaleTimeString()}</div>
+                                      <div className="text-sm font-medium text-white">{e.event_type.replace('_', ' ').toUpperCase()}</div>
+                                      <pre className="text-xs text-surface-300 mt-2 bg-surface-800 p-3 rounded-lg max-w-full overflow-x-auto whitespace-pre-wrap border border-surface-700/50">
+                                        {JSON.stringify(details, null, 2)}
+                                      </pre>
+                                    </div>
+                                  );
+                                })}
+                                {(!tradeEvents[t.id] || tradeEvents[t.id].length === 0) && (
+                                  <div className="text-sm text-surface-400 pl-4">Loading events...</div>
+                                )}
                               </div>
-                              {t.exit_reason && (
-                                <div className="pt-2 border-t border-surface-700/50">
-                                  <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Exit Reason</span> {t.exit_reason}</p>
+                            </div>
+                            <div className="space-y-6">
+                              <div>
+                                <h4 className="text-sm font-semibold text-surface-200 mb-3 flex items-center">
+                                  <Activity size={16} className="mr-2 text-accent-light" /> Context & Rationale
+                                </h4>
+                                <div className="bg-surface-800 p-4 rounded-lg border border-surface-700 text-sm text-surface-200 space-y-3">
+                                  <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Reasoning</span> {t.reasoning || 'N/A'}</p>
+                                  <div className="grid grid-cols-2 gap-4 pt-2 border-t border-surface-700/50">
+                                    <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Confidence</span> {t.confidence ? `${t.confidence}%` : 'N/A'}</p>
+                                    <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Status</span> {t.status}</p>
+                                  </div>
+                                  {t.exit_reason && (
+                                    <div className="pt-2 border-t border-surface-700/50">
+                                      <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Exit Reason</span> {t.exit_reason}</p>
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+                              {t.confluence_snapshot && (
+                                <div>
+                                  <h4 className="text-sm font-semibold text-surface-200 mb-3 flex items-center">
+                                    <AlertTriangle size={16} className="mr-2 text-warning-light" /> Confluence Snapshot
+                                  </h4>
+                                  <pre className="bg-surface-800 p-4 rounded-lg border border-surface-700 text-xs text-surface-300 overflow-x-auto">
+                                    {JSON.stringify(JSON.parse(t.confluence_snapshot), null, 2)}
+                                  </pre>
                                 </div>
                               )}
                             </div>
                           </div>
-                          {t.confluence_snapshot && (
-                             <div>
-                               <h4 className="text-sm font-semibold text-surface-200 mb-3 flex items-center">
-                                 <AlertTriangle size={16} className="mr-2 text-warning-light" /> Confluence Snapshot
-                               </h4>
-                               <pre className="bg-surface-800 p-4 rounded-lg border border-surface-700 text-xs text-surface-300 overflow-x-auto">
-                                 {JSON.stringify(JSON.parse(t.confluence_snapshot), null, 2)}
-                               </pre>
-                             </div>
-                          )}
-                        </div>
+                        )}
+
+                        {activeTradeTab === 'replay' && (
+                          <div className="animate-in fade-in duration-300">
+                            {tradeReplays[t.id] ? (
+                              <TradeReplayChart trade={t} candles={tradeReplays[t.id].candles} />
+                            ) : (
+                              <div className="text-surface-400 text-sm py-12 text-center">Loading chart data...</div>
+                            )}
+                          </div>
+                        )}
+
+                        {activeTradeTab === 'whatif' && (
+                          <div className="animate-in fade-in duration-300">
+                            {whatIfs[t.id] ? (
+                              <div className="grid grid-cols-3 gap-6">
+                                <div className="bg-surface-800 p-5 rounded-lg border border-surface-700 shadow-md">
+                                  <h4 className="text-sm font-semibold text-surface-300 mb-2">Held to End of Day</h4>
+                                  <div className={`text-2xl font-bold ${whatIfs[t.id].eod_pnl > 0 ? 'text-profit-light' : 'text-loss-light'}`}>
+                                    {whatIfs[t.id].eod_pnl > 0 ? '+' : ''}₹{whatIfs[t.id].eod_pnl.toFixed(2)}
+                                  </div>
+                                  <p className="text-xs text-surface-400 mt-2">Vs Actual: ₹{t.pnl?.toFixed(2) || 0}</p>
+                                </div>
+                                <div className="bg-surface-800 p-5 rounded-lg border border-surface-700 shadow-md">
+                                  <h4 className="text-sm font-semibold text-surface-300 mb-2">If Held to Target</h4>
+                                  {whatIfs[t.id].target_hit ? (
+                                    <>
+                                      <div className="text-2xl font-bold text-profit-light">Hit Target</div>
+                                      <p className="text-xs text-surface-400 mt-2">At {new Date(whatIfs[t.id].target_hit_time || '').toLocaleTimeString()}</p>
+                                    </>
+                                  ) : (
+                                    <div className="text-2xl font-bold text-surface-400">Target Not Hit</div>
+                                  )}
+                                </div>
+                                <div className="bg-surface-800 p-5 rounded-lg border border-surface-700 shadow-md">
+                                  <h4 className="text-sm font-semibold text-surface-300 mb-2">1.5x Wider Stop Loss</h4>
+                                  <div className="text-sm text-surface-200 mb-1">Stop: ₹{whatIfs[t.id].wider_stop_price.toFixed(2)}</div>
+                                  <div className={`text-xl font-bold ${whatIfs[t.id].wider_stop_pnl > 0 ? 'text-profit-light' : 'text-loss-light'}`}>
+                                    {whatIfs[t.id].wider_stop_pnl > 0 ? '+' : ''}₹{whatIfs[t.id].wider_stop_pnl.toFixed(2)}
+                                  </div>
+                                </div>
+                              </div>
+                            ) : (
+                              <div className="text-surface-400 text-sm py-12 text-center">Loading scenarios...</div>
+                            )}
+                          </div>
+                        )}
+
+                        {activeTradeTab === 'ai' && (
+                          <div className="animate-in fade-in duration-300">
+                            {llmPostMortems[t.id] ? (
+                              llmPostMortems[t.id].error ? (
+                                <div className="bg-red-500/10 border border-red-500/20 text-red-400 p-4 rounded-lg flex items-center">
+                                  <AlertTriangle className="mr-3" size={20} />
+                                  {llmPostMortems[t.id].error}
+                                </div>
+                              ) : (
+                                <div className="bg-surface-800 p-6 rounded-lg border border-surface-700 shadow-md">
+                                  <h4 className="flex items-center text-sm font-semibold text-accent-light mb-4 uppercase tracking-widest">
+                                    <Cpu size={16} className="mr-2" /> Gemini AI Analysis
+                                  </h4>
+                                  <div className="prose prose-invert prose-sm max-w-none prose-p:leading-relaxed prose-headings:text-white prose-a:text-accent-light">
+                                    {/* Using a simple replace for markdown since we don't have react-markdown */}
+                                    {llmPostMortems[t.id].analysis?.split('\n').map((line, i) => {
+                                      if (line.startsWith('## ')) return <h3 key={i} className="text-lg mt-4 mb-2">{line.replace('## ', '')}</h3>;
+                                      if (line.startsWith('# ')) return <h2 key={i} className="text-xl mt-4 mb-2">{line.replace('# ', '')}</h2>;
+                                      if (line.startsWith('* ') || line.startsWith('- ')) return <li key={i} className="ml-4">{line.substring(2)}</li>;
+                                      if (line.trim() === '') return <br key={i} />;
+                                      // Bold text replacement
+                                      const formattedLine = line.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+                                      return <p key={i} dangerouslySetInnerHTML={{ __html: formattedLine }} />;
+                                    })}
+                                  </div>
+                                </div>
+                              )
+                            ) : (
+                              <div className="text-surface-400 text-sm py-12 flex flex-col items-center justify-center">
+                                <div className="animate-spin h-6 w-6 border-2 border-surface-600 border-t-accent-light rounded-full mb-4" />
+                                Analyzing trade with AI...
+                              </div>
+                            )}
+                          </div>
+                        )}
                       </div>
                     </td>
                   </tr>

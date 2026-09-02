@@ -28,11 +28,20 @@ export interface ElectronAPI {
     getTrades(): Promise<any>;
     getEvents(tradeId: string): Promise<any>;
   };
+  settings: {
+    get(): Promise<any>;
+    save(settings: any): Promise<any>;
+    saveLlmKey(key: string): Promise<any>;
+    reset(): Promise<any>;
+  };
   analytics: {
     getStrategyExpectancy(): Promise<any>;
     getConfluenceValidation(): Promise<any>;
     getConfidenceCalibration(): Promise<any>;
     getExitReasonEffectiveness(): Promise<any>;
+    getTradeReplay(tradeId: string): Promise<any>;
+    getWhatIfAnalysis(tradeId: string): Promise<any>;
+    getLlmPostMortem(tradeId: string): Promise<any>;
   };
 }
 

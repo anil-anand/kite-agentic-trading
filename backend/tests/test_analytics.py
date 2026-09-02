@@ -1,5 +1,6 @@
 import sqlite3
 from datetime import datetime, timedelta
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -114,3 +115,84 @@ def test_exit_reason_effectiveness(temp_db):
     assert target["total_pnl"] == 100
     stop = next(r for r in res if r["exit_reason"] == "stop_hit")
     assert stop["total_pnl"] == -100
+
+
+@patch("backend.kite_client.kite_client.get_historical_data")
+@patch("backend.kite_client.kite_client.get_instruments")
+def test_trade_replay(mock_instruments, mock_historical, temp_db):
+    mock_instruments.return_value = [{"tradingsymbol": "TCS", "instrument_token": 12345}]
+    mock_historical.return_value = [
+        {"date": datetime.now(), "open": 100, "high": 105, "low": 95, "close": 102}
+    ]
+
+    analytics = TradeAnalytics(db_path=temp_db)
+    res = analytics.get_trade_replay("1")
+
+    assert "error" not in res
+    assert res["trade"]["tradingsymbol"] == "TCS"
+    assert len(res["candles"]) == 1
+
+
+@patch("backend.analytics.TradeAnalytics.get_trade_replay")
+def test_what_if_analysis(mock_replay, temp_db):
+    now = datetime.now()
+    mock_replay.return_value = {
+        "trade": {
+            "tradingsymbol": "TCS",
+            "entry_price": 100,
+            "direction": "BUY",
+            "quantity": 10,
+            "target": 110,
+            "stop_loss": 95,
+            "entry_time": (now - timedelta(minutes=10)).isoformat(),
+            "pnl": 100,
+        },
+        "candles": [
+            {
+                "date": now - timedelta(minutes=5),
+                "open": 100,
+                "high": 115,
+                "low": 98,
+                "close": 110,
+            },
+            {"date": now, "open": 110, "high": 112, "low": 105, "close": 108},
+        ],
+    }
+
+    analytics = TradeAnalytics(db_path=temp_db)
+    res = analytics.get_what_if_analysis("1")
+
+    assert "error" not in res
+    assert res["target_hit"] is True
+    assert res["eod_pnl"] == (108 - 100) * 10
+    assert res["wider_stop_hit"] is False
+
+
+@patch("backend.config.config_manager.get_credentials")
+@patch("google.genai.Client")
+def test_llm_post_mortem(mock_genai_client, mock_get_credentials, temp_db):
+    mock_get_credentials.return_value = {"llmApiKey": "fake_key"}
+
+    mock_client = MagicMock()
+    mock_response = MagicMock()
+    mock_response.text = "This is a post-mortem analysis."
+    mock_client.models.generate_content.return_value = mock_response
+    mock_genai_client.return_value = mock_client
+
+    analytics = TradeAnalytics(db_path=temp_db)
+    # create table trade_events in temp_db for this test to not crash
+    conn = sqlite3.connect(temp_db)
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS trade_events (
+            id TEXT PRIMARY KEY,
+            trade_id TEXT,
+            timestamp TIMESTAMP,
+            event_type TEXT,
+            details TEXT
+        );
+    """)
+    conn.close()
+
+    res = analytics.generate_llm_post_mortem("1")
+    assert "error" not in res
+    assert res["analysis"] == "This is a post-mortem analysis."

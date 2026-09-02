@@ -154,6 +154,10 @@ export function setupIpcHandlers() {
     return await pythonBridge.call('save_settings', settings);
   });
   
+  ipcMain.handle(channels.SETTINGS_SAVE_LLM_KEY, async (_, llmApiKey: string) => {
+    return await pythonBridge.call('save_llm_api_key', { llmApiKey });
+  });
+  
   ipcMain.handle(channels.SETTINGS_RESET, async () => {
     return await pythonBridge.call('settings_reset');
   });
@@ -202,5 +206,17 @@ export function setupIpcHandlers() {
 
   ipcMain.handle(channels.ANALYTICS_EXIT_REASON, async () => {
     return await pythonBridge.call('analytics_exit_reason_effectiveness');
+  });
+
+  ipcMain.handle(channels.ANALYTICS_TRADE_REPLAY, async (_, trade_id: string) => {
+    return await pythonBridge.call('analytics_trade_replay', { trade_id });
+  });
+
+  ipcMain.handle(channels.ANALYTICS_WHAT_IF, async (_, trade_id: string) => {
+    return await pythonBridge.call('analytics_what_if', { trade_id });
+  });
+
+  ipcMain.handle(channels.ANALYTICS_LLM_POST_MORTEM, async (_, trade_id: string) => {
+    return await pythonBridge.call('analytics_llm_post_mortem', { trade_id });
   });
 }
