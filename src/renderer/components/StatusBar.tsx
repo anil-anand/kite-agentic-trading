@@ -27,6 +27,15 @@ const StatusBar: React.FC = () => {
   return (
     <div className="h-8 bg-surface-950 border-t border-surface-800 flex items-center justify-between px-4 text-xs font-mono">
       <div className="flex items-center gap-4">
+        {window.electronAPI?.isDevMode && (
+          <div
+            className="flex items-center gap-1.5 px-2 py-0.5 rounded bg-amber-500/20 text-amber-400 font-bold tracking-wide"
+            title="KITE_DEV_MODE is on — mock market data, no real login or orders"
+          >
+            <div className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
+            DEV MODE
+          </div>
+        )}
         <div className="flex items-center gap-2">
           <div className={`w-2 h-2 rounded-full ${isConnected ? 'bg-profit-light' : 'bg-loss-light'}`} />
           <span className="text-surface-300 capitalize">{isConnected ? 'connected' : 'disconnected'}</span>

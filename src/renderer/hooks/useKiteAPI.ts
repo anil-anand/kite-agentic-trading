@@ -4,6 +4,7 @@ import * as IPC from '@shared/ipc-channels';
 import { OrderRequest, KiteCredentials, StrategyName } from '@shared/types';
 
 export interface ElectronAPI {
+  isDevMode?: boolean;
   invoke(channel: string, ...args: any[]): Promise<any>;
   on(channel: string, listener: (...args: any[]) => void): void;
   removeListener(channel: string, listener: (...args: any[]) => void): void;
