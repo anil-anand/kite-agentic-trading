@@ -135,19 +135,6 @@ const Settings: React.FC = () => {
           <section className="bg-surface-800 p-6 rounded-xl border border-surface-700">
             <h2 className="text-lg font-semibold text-white mb-4">API Credentials</h2>
             <div className="space-y-4">
-              {localSettings.llm?.provider === 'OpenCode' && (
-                <div>
-                  <label className="block text-surface-400 text-sm mb-1">OpenCode plan</label>
-                  <select
-                    value={localSettings.llm.openCodePlan || 'zen'}
-                    onChange={(e) => handleOpenCodePlanChange(e.target.value as OpenCodePlan)}
-                    className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white"
-                  >
-                    <option value="zen">Zen</option>
-                    <option value="go">Go</option>
-                  </select>
-                </div>
-              )}
               <div>
                 <label className="block text-surface-400 text-sm mb-1">Kite API Key</label>
                 <input type="password" value="••••••••••••••••" readOnly className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white" />
@@ -163,6 +150,19 @@ const Settings: React.FC = () => {
           <section className="bg-surface-800 p-6 rounded-xl border border-surface-700">
             <h2 className="text-lg font-semibold text-white mb-4">BYOK LLM Post-Mortems</h2>
             <div className="space-y-4">
+              {localSettings.llm?.provider === 'OpenCode' && (
+                <div>
+                  <label className="block text-surface-400 text-sm mb-1">OpenCode plan</label>
+                  <select
+                    value={localSettings.llm.openCodePlan || 'zen'}
+                    onChange={(e) => handleOpenCodePlanChange(e.target.value as OpenCodePlan)}
+                    className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white"
+                  >
+                    <option value="zen">Zen</option>
+                    <option value="go">Go</option>
+                  </select>
+                </div>
+              )}
               <div>
                 <label className="block text-surface-400 text-sm mb-1">Provider</label>
                 <select

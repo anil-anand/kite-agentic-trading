@@ -180,7 +180,11 @@ class OpenAICompatibleClient:
             ]
         else:
             body = self._request(
-                f"{base_url}/models", api_key, headers=self._headers(provider, api_key)
+                f"{base_url}/models",
+                api_key,
+                headers={}
+                if provider == "OpenCode"
+                else self._headers(provider, api_key),
             )
             catalog = body.get("data", [])
             if provider == "OpenCode":

@@ -153,7 +153,7 @@ def handle_request(req):
             if provider == "OpenCode":
                 plan = plan if plan in OPENCODE_PLANS else "zen"
                 base_url = OPENCODE_PLANS[plan]["baseUrl"]
-            if provider != "Ollama" and not api_key:
+            if provider not in {"Ollama", "OpenCode"} and not api_key:
                 return error(-32602, "LLM API Key not configured in settings.")
             if provider == "OpenCode":
                 models = OpenAICompatibleClient().discover_models(

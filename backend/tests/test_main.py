@@ -108,3 +108,25 @@ def test_discover_models_uses_selected_opencode_plan():
     discover.assert_called_once_with(
         "OpenCode", "https://opencode.ai/zen/go/v1", "key", plan="go"
     )
+
+
+def test_discover_models_allows_opencode_without_api_key():
+    with (
+        patch("backend.main.config_manager.get_llm_settings") as get_settings,
+        patch("backend.main.config_manager.get_credentials") as get_credentials,
+        patch("backend.main.OpenAICompatibleClient.discover_models") as discover,
+    ):
+        get_settings.return_value = {
+            "provider": "OpenCode",
+            "baseUrl": "https://opencode.ai/zen/v1",
+            "openCodePlan": "zen",
+        }
+        get_credentials.return_value = {"llmApiKey": ""}
+        discover.return_value = ["big-pickle"]
+
+        result = handle_request({"id": 6, "method": "discover_models", "params": {}})
+
+    assert result["result"] == ["big-pickle"]
+    discover.assert_called_once_with(
+        "OpenCode", "https://opencode.ai/zen/v1", "", plan="zen"
+    )

@@ -401,7 +401,22 @@ def test_discover_models_supports_all_provider_protocols(
     assert captured["request"].full_url == f"{base_url}{path}"
     if provider == "Anthropic":
         assert captured["request"].headers["X-api-key"] == api_key
-    elif provider == "Gemini":
+    elif provider == "Gemini" or provider == "OpenCode":
         assert "Authorization" not in captured["request"].headers
     else:
         assert captured["request"].headers["Authorization"] == f"Bearer {api_key}"
+
+
+def test_opencode_model_discovery_does_not_send_api_key(monkeypatch):
+    captured = {}
+
+    def fake_urlopen(req, timeout):
+        captured["request"] = req
+        return FakeResponse({"data": [{"id": "big-pickle"}]})
+
+    monkeypatch.setattr("backend.llm_client.request.urlopen", fake_urlopen)
+
+    assert OpenAICompatibleClient().discover_models(
+        "OpenCode", OPENCODE_PLANS["zen"]["baseUrl"], "expired-key"
+    ) == ["big-pickle"]
+    assert "Authorization" not in captured["request"].headers
