@@ -23,7 +23,7 @@ The app features a modern Electron/React frontend communicating with a high-perf
 
 * **Frontend**: Electron, React 18, TypeScript, Tailwind CSS, Zustand (with local persistence), Vite.
 * **Backend**: Python 3, `kiteconnect`, `pandas`, `ta` (Technical Analysis), custom JSON-RPC bridge.
-* **Security**: API keys are locally encrypted using `cryptography.fernet` and stored in `~/.kite-agentic-trading/config.json`.
+* **Security**: Kite and BYOK LLM API keys are locally encrypted using `cryptography.fernet` and stored in `~/.kite-agentic-trading/config.json`.
 
 ## 📦 Prerequisites
 
@@ -71,6 +71,8 @@ npm run dev
 ```
 
 On your first launch, navigate to the **Settings** tab to enter your Kite API Key and API Secret. The app will encrypt and save them locally.
+
+To enable Journal post-mortems, open **Settings > BYOK LLM Post-Mortems**, choose a provider, refresh its available models, and enter its API key. Supported presets are OpenAI (`gpt-4o-mini`), Anthropic (`claude-3-5-haiku-latest`), Gemini (`gemini-2.5-flash`), OpenRouter (`openai/gpt-4o-mini`), Ollama (`llama3.2`), and OpenCode (`big-pickle`). Ollama defaults to the local server at `http://localhost:11434` without a key; entering an Ollama API key switches model discovery and generation to Ollama Cloud. Provider endpoints and request authentication are selected by the preset; arbitrary endpoints are intentionally not accepted. API keys are encrypted locally and are never returned to the renderer in plaintext. Bedrock is deferred.
 
 ## 🧰 Installing the Application
 

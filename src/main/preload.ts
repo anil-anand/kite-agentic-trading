@@ -83,6 +83,7 @@ try {
       get: () => electron.ipcRenderer.invoke(channels.SETTINGS_GET),
       save: (settings: any) => electron.ipcRenderer.invoke(channels.SETTINGS_SAVE, settings),
       saveLlmKey: (key: string) => electron.ipcRenderer.invoke(channels.SETTINGS_SAVE_LLM_KEY, key),
+      discoverModels: (params: any) => electron.ipcRenderer.invoke(channels.SETTINGS_DISCOVER_MODELS, params),
       reset: () => electron.ipcRenderer.invoke(channels.SETTINGS_RESET),
     },
     watchlist: {

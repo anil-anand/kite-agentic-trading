@@ -6,6 +6,7 @@ from .analytics import analytics
 from .config import config_manager
 from .journal import journal
 from .kite_client import kite_client
+from .llm_client import OpenAICompatibleClient
 from .scanner import scanner
 from .ticker import ticker_manager
 from .trading_engine import trading_engine
@@ -132,16 +133,27 @@ def handle_request(req):
             return success(trading_engine.status())
 
         elif method == "get_settings":
-            return success(config_manager.config)
+            return success(config_manager.get_settings())
 
         elif method == "save_settings":
-            config_manager.config.update(params)
-            config_manager.save()
+            config_manager.save_settings(params)
             return success({"status": "saved"})
 
         elif method == "save_llm_api_key":
             config_manager.save_llm_api_key(params.get("llmApiKey", ""))
             return success({"status": "saved"})
+
+        elif method == "discover_models":
+            llm = config_manager.get_llm_settings()
+            credentials = config_manager.get_credentials()
+            api_key = params.get("apiKey") or credentials.get("llmApiKey", "")
+            provider = params.get("provider", llm.get("provider", "Gemini"))
+            base_url = params.get("baseUrl", llm.get("baseUrl", ""))
+            if provider != "Ollama" and not api_key:
+                return error(-32602, "LLM API Key not configured in settings.")
+            return success(
+                OpenAICompatibleClient().discover_models(provider, base_url, api_key)
+            )
 
         elif method == "scan_now":
             from .nifty_universe import get_nifty100_universe

@@ -6,7 +6,16 @@ export interface KiteCredentials {
   accessToken?: string;
   userId?: string;
   userName?: string;
-  llmApiKey?: string;
+}
+
+export interface LLMSettings {
+  provider: 'OpenAI' | 'Anthropic' | 'Gemini' | 'OpenRouter' | 'Ollama' | 'OpenCode';
+  baseUrl: string;
+  model: string;
+  apiKey: string;
+  apiKeyConfigured?: boolean;
+  temperature?: number;
+  maxTokens?: number;
 }
 
 export interface AuthState {
@@ -293,6 +302,7 @@ export interface WatchlistItem {
 
 export interface AppSettings {
   credentials: KiteCredentials;
+  llm: LLMSettings;
   risk: RiskConfig;
   strategies: StrategyConfig;
   watchlist: string[]; // ["NSE:RELIANCE", "NSE:INFY", ...]

@@ -5,6 +5,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
 
+from .llm_client import OpenAICompatibleClient
+
 
 class TradeAnalytics:
     def __init__(self, db_path: str = None):
@@ -396,19 +398,16 @@ class TradeAnalytics:
 
     def generate_llm_post_mortem(self, trade_id: str) -> Dict[str, Any]:
         """
-        Uses google-genai to generate a post-mortem analysis of the trade.
+        Uses the configured OpenAI-compatible provider to generate a post-mortem.
         """
         from .config import config_manager
 
         creds = config_manager.get_credentials()
+        llm = config_manager.get_llm_settings()
         api_key = creds.get("llmApiKey")
-        if not api_key:
+        provider = llm.get("provider", "Gemini")
+        if not api_key and provider != "Ollama":
             return {"error": "LLM API Key not configured in settings."}
-
-        try:
-            from google import genai
-        except ImportError:
-            return {"error": "google-genai package not installed."}
 
         conn = self._get_conn()
         trade = conn.execute(
@@ -458,12 +457,14 @@ Trade Timeline Events:
             prompt += f"- {event.get('timestamp')}: {event.get('event_type')} - {event.get('details')}\\n"
 
         try:
-            client = genai.Client(api_key=api_key)
-            response = client.models.generate_content(
-                model="gemini-3.6-flash",
-                contents=prompt,
+            analysis = OpenAICompatibleClient().generate(
+                base_url=llm.get("baseUrl", ""),
+                api_key=api_key,
+                model=llm.get("model", ""),
+                prompt=prompt,
+                provider=provider,
             )
-            return {"analysis": response.text}
+            return {"analysis": analysis}
         except Exception as e:
             return {"error": f"LLM Generation failed: {str(e)}"}
 

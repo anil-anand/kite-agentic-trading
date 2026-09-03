@@ -56,6 +56,7 @@ export const LOG_CLEAR = 'log:clear';
 export const SETTINGS_GET = 'settings:get';
 export const SETTINGS_SAVE = 'settings:save';
 export const SETTINGS_SAVE_LLM_KEY = 'settings:save-llm-key';
+export const SETTINGS_DISCOVER_MODELS = 'settings:discover-models';
 export const SETTINGS_RESET = 'settings:reset';
 
 // ─── Watchlist ────────────────────────────────────────────────────

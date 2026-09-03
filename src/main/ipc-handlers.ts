@@ -150,12 +150,16 @@ export function setupIpcHandlers() {
     return await pythonBridge.call('get_settings');
   });
   
-  ipcMain.handle(channels.SETTINGS_SAVE, async (_, settings: any) => {
-    return await pythonBridge.call('save_settings', settings);
+  ipcMain.handle(channels.SETTINGS_SAVE, async (_, settings: AppSettings) => {
+    return await pythonBridge.call('save_settings', settings as unknown as Record<string, unknown>);
   });
   
   ipcMain.handle(channels.SETTINGS_SAVE_LLM_KEY, async (_, llmApiKey: string) => {
     return await pythonBridge.call('save_llm_api_key', { llmApiKey });
+  });
+
+  ipcMain.handle(channels.SETTINGS_DISCOVER_MODELS, async (_, params: any) => {
+    return await pythonBridge.call('discover_models', params);
   });
   
   ipcMain.handle(channels.SETTINGS_RESET, async () => {
