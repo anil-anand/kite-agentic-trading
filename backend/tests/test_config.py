@@ -15,38 +15,10 @@ def test_default_llm_profile_is_gemini_compatible(tmp_path, monkeypatch):
         "provider": "Gemini",
         "baseUrl": "https://generativelanguage.googleapis.com/v1beta",
         "model": "gemini-2.5-flash",
-        "openCodePlan": "zen",
         "apiKey": "",
         "temperature": 0.2,
         "maxTokens": 1024,
     }
-
-
-def test_default_opencode_plan_is_zen(tmp_path, monkeypatch):
-    manager = make_manager(tmp_path, monkeypatch)
-
-    manager.save_settings({"llm": {"provider": "OpenCode", "model": "big-pickle"}})
-
-    assert manager.get_settings()["llm"]["openCodePlan"] == "zen"
-
-
-def test_existing_opencode_settings_without_plan_remain_zen(tmp_path, monkeypatch):
-    manager = make_manager(tmp_path, monkeypatch)
-    manager.config_file.write_text(
-        json.dumps(
-            {
-                "llm": {
-                    "provider": "OpenCode",
-                    "baseUrl": "https://opencode.ai/zen/v1",
-                    "model": "big-pickle",
-                    "apiKey": "",
-                }
-            }
-        )
-    )
-    manager.load()
-
-    assert manager.get_llm_settings()["openCodePlan"] == "zen"
 
 
 def test_legacy_llm_key_is_migrated_and_not_returned(tmp_path, monkeypatch):

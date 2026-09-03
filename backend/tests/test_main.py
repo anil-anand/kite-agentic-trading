@@ -86,24 +86,3 @@ def test_discover_models_uses_persisted_key_when_unsaved_key_is_absent():
     discover.assert_called_once_with(
         "OpenRouter", "https://example.test/v1", "persisted-key"
     )
-
-
-def test_discover_models_uses_selected_opencode_plan_endpoint():
-    with (
-        patch("backend.main.config_manager.get_llm_settings") as get_settings,
-        patch("backend.main.config_manager.get_credentials") as get_credentials,
-        patch("backend.main.OpenAICompatibleClient.discover_models") as discover,
-    ):
-        get_settings.return_value = {
-            "provider": "OpenCode",
-            "openCodePlan": "go",
-            "baseUrl": "https://opencode.ai/zen/v1",
-        }
-        get_credentials.return_value = {"llmApiKey": "go-key"}
-        discover.return_value = ["kimi-k3"]
-
-        handle_request({"id": 5, "method": "discover_models", "params": {}})
-
-    discover.assert_called_once_with(
-        "OpenCode", "https://opencode.ai/zen/go/v1", "go-key", plan="go"
-    )

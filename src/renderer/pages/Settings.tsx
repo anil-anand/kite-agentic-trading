@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useTradingStore } from '../stores/trading-store';
 import { SETTINGS_SAVE } from '@shared/ipc-channels';
-import { LLMSettings, OpenCodePlan } from '@shared/types';
+import { LLMSettings } from '@shared/types';
 
 const LLM_PROVIDERS = ['OpenAI', 'Anthropic', 'Gemini', 'OpenRouter', 'Ollama', 'OpenCode'] as const;
 const LLM_PRESETS: Record<string, Partial<LLMSettings>> = {
@@ -11,10 +11,6 @@ const LLM_PRESETS: Record<string, Partial<LLMSettings>> = {
   OpenRouter: { baseUrl: 'https://openrouter.ai/api/v1', model: 'openai/gpt-4o-mini' },
   Ollama: { baseUrl: 'http://localhost:11434', model: 'llama3.2' },
   OpenCode: { baseUrl: 'https://opencode.ai/zen/v1', model: 'big-pickle' },
-};
-const OPENCODE_PLAN_PRESETS: Record<OpenCodePlan, Partial<LLMSettings>> = {
-  zen: { baseUrl: 'https://opencode.ai/zen/v1', model: 'big-pickle', openCodePlan: 'zen' },
-  go: { baseUrl: 'https://opencode.ai/zen/go/v1', model: 'kimi-k3', openCodePlan: 'go' },
 };
 
 const Settings: React.FC = () => {
@@ -59,13 +55,7 @@ const Settings: React.FC = () => {
   };
 
   const handleProviderChange = (provider: string) => {
-    updateLlm({ provider: provider as LLMSettings['provider'], ...(provider === 'OpenCode' ? OPENCODE_PLAN_PRESETS.zen : LLM_PRESETS[provider] || {}) });
-    setModels([]);
-    setDiscoveryError('');
-  };
-
-  const handleOpenCodePlanChange = (plan: OpenCodePlan) => {
-    updateLlm(OPENCODE_PLAN_PRESETS[plan]);
+    updateLlm({ provider: provider as LLMSettings['provider'], ...(LLM_PRESETS[provider] || {}) });
     setModels([]);
     setDiscoveryError('');
   };
@@ -74,10 +64,9 @@ const Settings: React.FC = () => {
     try {
       setDiscovering(true);
       const result = await window.electronAPI?.settings.discoverModels({
-          provider: localSettings.llm.provider,
-          baseUrl: localSettings.llm.baseUrl,
-          openCodePlan: localSettings.llm.openCodePlan || 'zen',
-          apiKey: llmKey,
+         provider: localSettings.llm.provider,
+         baseUrl: localSettings.llm.baseUrl,
+         apiKey: llmKey,
        });
        if (Array.isArray(result)) setModels(result);
      } catch (error) {
@@ -150,19 +139,6 @@ const Settings: React.FC = () => {
           <section className="bg-surface-800 p-6 rounded-xl border border-surface-700">
             <h2 className="text-lg font-semibold text-white mb-4">BYOK LLM Post-Mortems</h2>
             <div className="space-y-4">
-              {localSettings.llm?.provider === 'OpenCode' && (
-                <div>
-                  <label className="block text-surface-400 text-sm mb-1">OpenCode plan</label>
-                  <select
-                    value={localSettings.llm.openCodePlan || 'zen'}
-                    onChange={(e) => handleOpenCodePlanChange(e.target.value as OpenCodePlan)}
-                    className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white"
-                  >
-                    <option value="zen">Zen</option>
-                    <option value="go">Go</option>
-                  </select>
-                </div>
-              )}
               <div>
                 <label className="block text-surface-400 text-sm mb-1">Provider</label>
                 <select
@@ -172,6 +148,11 @@ const Settings: React.FC = () => {
                 >
                    {LLM_PROVIDERS.map((provider) => <option key={provider}>{provider}</option>)}
                 </select>
+              </div>
+              <div>
+                <label className="block text-surface-400 text-sm mb-1">Base URL</label>
+                <input type="url" value={localSettings.llm?.baseUrl || ''} readOnly
+                  className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-surface-400 outline-none" />
               </div>
               <div>
                 <label className="block text-surface-400 text-sm mb-1">Model</label>

@@ -8,13 +8,10 @@ export interface KiteCredentials {
   userName?: string;
 }
 
-export type OpenCodePlan = 'zen' | 'go';
-
 export interface LLMSettings {
   provider: 'OpenAI' | 'Anthropic' | 'Gemini' | 'OpenRouter' | 'Ollama' | 'OpenCode';
   baseUrl: string;
   model: string;
-  openCodePlan?: OpenCodePlan;
   apiKey: string;
   apiKeyConfigured?: boolean;
   temperature?: number;
