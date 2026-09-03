@@ -20,6 +20,7 @@ const Settings: React.FC = () => {
   const [llmKey, setLlmKey] = useState<string>('');
   const [models, setModels] = useState<string[]>([]);
   const [discovering, setDiscovering] = useState(false);
+  const [discoveryError, setDiscoveryError] = useState('');
 
   // Sync local state when global settings load
   useEffect(() => {
@@ -56,17 +57,21 @@ const Settings: React.FC = () => {
   const handleProviderChange = (provider: string) => {
     updateLlm({ provider: provider as LLMSettings['provider'], ...(LLM_PRESETS[provider] || {}) });
     setModels([]);
+    setDiscoveryError('');
   };
 
   const discoverModels = async () => {
     try {
       setDiscovering(true);
       const result = await window.electronAPI?.settings.discoverModels({
-        provider: localSettings.llm.provider,
-        baseUrl: localSettings.llm.baseUrl,
-      });
-      if (Array.isArray(result)) setModels(result);
-    } finally {
+         provider: localSettings.llm.provider,
+         baseUrl: localSettings.llm.baseUrl,
+         apiKey: llmKey,
+       });
+       if (Array.isArray(result)) setModels(result);
+     } catch (error) {
+       setDiscoveryError(error instanceof Error ? error.message : 'Model discovery failed');
+     } finally {
       setDiscovering(false);
     }
   };
@@ -169,12 +174,14 @@ const Settings: React.FC = () => {
                    type="password"
                    value={llmKey}
                    onChange={(e) => setLlmKey(e.target.value)}
-                   disabled={localSettings.llm?.provider === 'Ollama'}
-                   placeholder={localSettings.llm?.apiKeyConfigured ? 'Key saved (enter to replace)' : 'Enter provider API key'}
+                   placeholder={localSettings.llm?.apiKeyConfigured ? 'Key saved (enter to replace)' : localSettings.llm?.provider === 'Ollama' ? 'Optional Ollama Cloud API key' : 'Enter provider API key'}
                   className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white focus:border-accent-light outline-none" 
                 />
               </div>
-               <p className="text-xs text-surface-500">Used for trade post-mortems in the Journal. Keys are encrypted locally. Ollama runs without a key.</p>
+               {discoveryError && (
+                 <p role="alert" className="text-sm text-loss-light">Model discovery failed: {discoveryError}</p>
+               )}
+                <p className="text-xs text-surface-500">Used for trade post-mortems in the Journal. Keys are encrypted locally. Ollama runs locally without a key, or use an Ollama Cloud key.</p>
             </div>
           </section>
 

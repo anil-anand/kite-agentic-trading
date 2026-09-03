@@ -104,6 +104,61 @@ def test_anthropic_request_uses_provider_auth_and_native_messages_api(monkeypatc
     ]
 
 
+@pytest.mark.parametrize(
+    ("provider", "base_url", "api_key", "model", "response", "expected", "path"),
+    [
+        (
+            "Gemini",
+            "https://generativelanguage.googleapis.com/v1beta",
+            "gemini-key",
+            "gemini-2.5-flash",
+            {"candidates": [{"content": {"parts": [{"text": "gemini"}]}}]},
+            "gemini",
+            "/models/gemini-2.5-flash:generateContent?key=gemini-key",
+        ),
+        (
+            "OpenRouter",
+            "https://openrouter.ai/api/v1",
+            "router-key",
+            "openai/gpt-4o-mini",
+            {"choices": [{"message": {"content": "router"}}]},
+            "router",
+            "/chat/completions",
+        ),
+        (
+            "OpenCode",
+            "https://opencode.ai/zen/v1",
+            "opencode-key",
+            "big-pickle",
+            {"choices": [{"message": {"content": "opencode"}}]},
+            "opencode",
+            "/chat/completions",
+        ),
+    ],
+)
+def test_generate_supports_provider_specific_paths(
+    monkeypatch, provider, base_url, api_key, model, response, expected, path
+):
+    captured = {}
+
+    def fake_urlopen(req, timeout):
+        captured["request"] = req
+        return FakeResponse(response)
+
+    monkeypatch.setattr("backend.llm_client.request.urlopen", fake_urlopen)
+
+    result = OpenAICompatibleClient().generate(
+        base_url, api_key, model, "prompt", provider=provider
+    )
+
+    assert result == expected
+    assert captured["request"].full_url == f"{base_url}{path}"
+    if provider == "Gemini":
+        assert "Authorization" not in captured["request"].headers
+    else:
+        assert captured["request"].headers["Authorization"] == f"Bearer {api_key}"
+
+
 def test_ollama_request_has_no_authorization_header(monkeypatch):
     captured = {}
 
@@ -183,3 +238,64 @@ def test_discover_models_uses_provider_endpoint_and_normalizes_models(monkeypatc
     ) == ["gpt-4o", "gpt-4o-mini"]
     assert captured["request"].full_url == "https://api.openai.com/v1/models"
     assert captured["request"].headers["Authorization"] == "Bearer secret-key"
+
+
+@pytest.mark.parametrize(
+    ("provider", "base_url", "api_key", "body", "expected", "path"),
+    [
+        (
+            "Anthropic",
+            "https://api.anthropic.com/v1",
+            "anthropic-key",
+            {"data": [{"id": "claude-sonnet"}]},
+            ["claude-sonnet"],
+            "/models",
+        ),
+        (
+            "Gemini",
+            "https://generativelanguage.googleapis.com/v1beta",
+            "gemini-key",
+            {"models": [{"name": "models/gemini-2.5-flash"}]},
+            ["gemini-2.5-flash"],
+            "/models?key=gemini-key",
+        ),
+        (
+            "OpenRouter",
+            "https://openrouter.ai/api/v1",
+            "router-key",
+            {"data": [{"id": "openai/gpt-4o-mini"}]},
+            ["openai/gpt-4o-mini"],
+            "/models",
+        ),
+        (
+            "OpenCode",
+            "https://opencode.ai/zen/v1",
+            "opencode-key",
+            {"data": [{"id": "big-pickle"}]},
+            ["big-pickle"],
+            "/models",
+        ),
+    ],
+)
+def test_discover_models_supports_all_provider_protocols(
+    monkeypatch, provider, base_url, api_key, body, expected, path
+):
+    captured = {}
+
+    def fake_urlopen(req, timeout):
+        captured["request"] = req
+        return FakeResponse(body)
+
+    monkeypatch.setattr("backend.llm_client.request.urlopen", fake_urlopen)
+
+    assert (
+        OpenAICompatibleClient().discover_models(provider, base_url, api_key)
+        == expected
+    )
+    assert captured["request"].full_url == f"{base_url}{path}"
+    if provider == "Anthropic":
+        assert captured["request"].headers["X-api-key"] == api_key
+    elif provider == "Gemini":
+        assert "Authorization" not in captured["request"].headers
+    else:
+        assert captured["request"].headers["Authorization"] == f"Bearer {api_key}"

@@ -13,6 +13,12 @@ import {
 import { ChevronDown, ChevronRight, Activity, PieChart, BarChart3, Clock, AlertTriangle, LineChart, Cpu, Lightbulb } from 'lucide-react';
 import TradeReplayChart from '../components/TradeReplayChart';
 
+export const renderAnalysisLine = (line: string) => line.split(/(\*\*.*?\*\*)/g).map((part, index) =>
+  part.startsWith('**') && part.endsWith('**')
+    ? <strong key={index}>{part.slice(2, -2)}</strong>
+    : part
+);
+
 const Journal: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'trades' | 'analytics'>('trades');
   const [trades, setTrades] = useState<JournalTrade[]>([]);
@@ -299,9 +305,7 @@ const Journal: React.FC = () => {
                                       if (line.startsWith('# ')) return <h2 key={i} className="text-xl mt-4 mb-2">{line.replace('# ', '')}</h2>;
                                       if (line.startsWith('* ') || line.startsWith('- ')) return <li key={i} className="ml-4">{line.substring(2)}</li>;
                                       if (line.trim() === '') return <br key={i} />;
-                                      // Bold text replacement
-                                      const formattedLine = line.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
-                                      return <p key={i} dangerouslySetInnerHTML={{ __html: formattedLine }} />;
+                                      return <p key={i}>{renderAnalysisLine(line)}</p>;
                                     })}
                                   </div>
                                 </div>

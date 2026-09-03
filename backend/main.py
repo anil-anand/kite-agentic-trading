@@ -146,7 +146,7 @@ def handle_request(req):
         elif method == "discover_models":
             llm = config_manager.get_llm_settings()
             credentials = config_manager.get_credentials()
-            api_key = credentials.get("llmApiKey", "")
+            api_key = params.get("apiKey") or credentials.get("llmApiKey", "")
             provider = params.get("provider", llm.get("provider", "Gemini"))
             base_url = params.get("baseUrl", llm.get("baseUrl", ""))
             if provider != "Ollama" and not api_key:
