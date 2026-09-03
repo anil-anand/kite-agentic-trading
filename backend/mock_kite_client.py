@@ -195,6 +195,7 @@ class MockKiteClient:
         self._order_seq += 1
         order_id = f"DEV{self._order_seq}"
         qty = int(quantity)
+        now = datetime.datetime.now().isoformat()
         order = {
             "orderId": order_id,
             "tradingsymbol": tradingsymbol,
@@ -207,6 +208,10 @@ class MockKiteClient:
             "price": price,
             "trigger_price": trigger_price,
             "status": "OPEN",
+            # The Orders UI renders new Date(orderTimestamp); without it dev-mode
+            # orders show "Invalid Date".
+            "orderTimestamp": now,
+            "exchangeTimestamp": now,
         }
         self._orders[order_id] = order
 
