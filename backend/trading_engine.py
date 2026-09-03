@@ -237,38 +237,43 @@ class TradingEngine:
             self._push_log(f"Cannot execute signal {signal['id']}: {reason}")
             return False
 
-        margins = kite_client.get_margins()
-        equity_margin = margins.get("equity", {})
-        available_margin = equity_margin.get("available", {}).get("live_balance", 0)
-        if not available_margin:
-            available_margin = equity_margin.get("net", 0)
-
-        qty = risk_manager.calculate_position_size(
-            signal["entryPrice"], signal["stopLoss"], available_margin
-        )
-        if qty <= 0:
-            self._push_log(
-                f"Cannot execute signal {signal['id']}: insufficient available margin",
-                level="warning",
-            )
-            return False
-
         transaction_type = "BUY" if signal["direction"] == "BUY" else "SELL"
         exchange = signal.get("exchange", "NSE")
         tick_size = self._get_tick_size(symbol, exchange)
         entry_price = self._round_to_tick(signal["entryPrice"], tick_size)
 
         try:
-            order_id = kite_client.place_order(
-                variety="regular",
-                exchange=exchange,
-                tradingsymbol=symbol,
-                transaction_type=transaction_type,
-                quantity=qty,
-                product="MIS",
-                order_type="LIMIT",
-                price=entry_price,
-            )
+            # Serialize the margin snapshot, sizing, and submission so concurrent
+            # scanner callbacks cannot reserve the same available margin.
+            with self._trade_lock:
+                margins = kite_client.get_margins()
+                equity_margin = margins.get("equity", {})
+                available = equity_margin.get("available", {})
+                if "live_balance" in available:
+                    available_margin = available["live_balance"]
+                else:
+                    available_margin = equity_margin.get("net", 0)
+
+                qty = risk_manager.calculate_position_size(
+                    entry_price, signal["stopLoss"], available_margin
+                )
+                if qty <= 0:
+                    self._push_log(
+                        f"Cannot execute signal {signal['id']}: insufficient available margin",
+                        level="warning",
+                    )
+                    return False
+
+                order_id = kite_client.place_order(
+                    variety="regular",
+                    exchange=exchange,
+                    tradingsymbol=symbol,
+                    transaction_type=transaction_type,
+                    quantity=qty,
+                    product="MIS",
+                    order_type="LIMIT",
+                    price=entry_price,
+                )
             self._push_log(
                 f"Executed {transaction_type} for {symbol}, qty {qty}, order_id {order_id}"
             )

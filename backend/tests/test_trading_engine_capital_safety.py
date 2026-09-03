@@ -149,6 +149,24 @@ def test_execute_signal_does_not_submit_when_margin_cannot_fund_entry(monkeypatc
     assert fake_client.place_calls == []
 
 
+def test_execute_signal_treats_explicit_zero_live_balance_as_unavailable_margin(
+    monkeypatch,
+):
+    import backend.trading_engine as te
+
+    fake_client = FakeKiteClient()
+    fake_client.margins = {"equity": {"available": {"live_balance": 0}, "net": 10_000}}
+    fake_risk = FakeRiskManager()
+    fake_risk.calculate_position_size = lambda price, stop_loss, available_margin: 0
+    monkeypatch.setattr(te, "kite_client", fake_client)
+    monkeypatch.setattr(te, "risk_manager", fake_risk)
+
+    engine = TradingEngine()
+
+    assert engine.execute_signal(_sample_signal()) is False
+    assert fake_client.place_calls == []
+
+
 def test_execute_signal_does_not_track_unfilled_order(monkeypatch):
     import backend.trading_engine as te
 

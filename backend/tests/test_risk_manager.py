@@ -44,3 +44,12 @@ def test_calculate_position_size_returns_zero_when_margin_cannot_fund_one_share(
     monkeypatch.setitem(config_manager.config, "risk", risk_cfg)
 
     assert risk_manager.calculate_position_size(100, 95, available_margin=99) == 0
+
+
+def test_calculate_position_size_returns_zero_for_zero_available_margin(monkeypatch):
+    risk_cfg = config_manager.get_risk_config().copy()
+    risk_cfg["maxCapitalPerTrade"] = 10_000
+    risk_cfg["riskPerTrade"] = 1_000
+    monkeypatch.setitem(config_manager.config, "risk", risk_cfg)
+
+    assert risk_manager.calculate_position_size(100, 95, available_margin=0) == 0
