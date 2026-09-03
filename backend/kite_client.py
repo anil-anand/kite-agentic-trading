@@ -125,13 +125,22 @@ class KiteClient:
     def get_historical_data(
         self, instrument_token, from_date, to_date, interval, continuous=False, oi=False
     ):
-        return (
-            self.kite.historical_data(
-                instrument_token, from_date, to_date, interval, continuous, oi
-            )
-            if self.kite
-            else []
-        )
+        if not self.kite:
+            return []
+
+        import time
+
+        retries = 3
+        for attempt in range(retries):
+            try:
+                return self.kite.historical_data(
+                    instrument_token, from_date, to_date, interval, continuous, oi
+                )
+            except Exception as e:
+                if attempt < retries - 1:
+                    time.sleep(1 + attempt)
+                else:
+                    raise e
 
     def get_instruments(self, exchange=None):
         if not self.instruments_cache:
