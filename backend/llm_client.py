@@ -1,6 +1,19 @@
 import json
 from urllib import error, request
 
+OPENCODE_PLANS = {
+    "zen": {
+        "baseUrl": "https://opencode.ai/zen/v1",
+        "model": "big-pickle",
+        "providerId": "opencode",
+    },
+    "go": {
+        "baseUrl": "https://opencode.ai/zen/go/v1",
+        "model": "kimi-k3",
+        "providerId": "opencode-go",
+    },
+}
+
 PROVIDER_PRESETS = {
     "OpenAI": {
         "baseUrl": "https://api.openai.com/v1",
@@ -31,12 +44,48 @@ PROVIDER_PRESETS = {
     "OpenCode": {
         "baseUrl": "https://opencode.ai/zen/v1",
         "model": "big-pickle",
+        "providerId": "opencode",
         "requiresApiKey": True,
     },
 }
 
 
 class OpenAICompatibleClient:
+    @staticmethod
+    def _is_chat_compatible(model):
+        if not isinstance(model, dict):
+            return False
+
+        chat_protocols = {
+            "chat",
+            "chat-completions",
+            "chat_completions",
+            "openai-chat",
+            "openai-chat-completions",
+            "openai-completions",
+            "openai/completions",
+        }
+
+        def is_chat_protocol(value):
+            return isinstance(value, str) and value.lower() in chat_protocols
+
+        protocol = model.get("protocol") or model.get("api")
+        if isinstance(protocol, str):
+            return is_chat_protocol(protocol)
+        if protocol is not None:
+            return False
+
+        protocols = model.get("protocols") or model.get("supportedProtocols")
+        if isinstance(protocols, list):
+            return any(is_chat_protocol(item) for item in protocols)
+        if protocols is not None:
+            return False
+
+        endpoint = model.get("endpoint")
+        if isinstance(endpoint, dict):
+            return is_chat_protocol(endpoint.get("type"))
+        return False
+
     @staticmethod
     def _resolve_base_url(provider, base_url, api_key):
         if provider == "Ollama" and api_key:
@@ -137,7 +186,9 @@ class OpenAICompatibleClient:
             raise RuntimeError("LLM response was malformed")
         return content
 
-    def discover_models(self, provider, base_url, api_key):
+    def discover_models(self, provider, base_url, api_key, plan="zen"):
+        if provider == "OpenCode":
+            base_url = OPENCODE_PLANS.get(plan, OPENCODE_PLANS["zen"])["baseUrl"]
         base_url = self._resolve_base_url(provider, base_url, api_key).rstrip("/")
         if provider == "Ollama":
             body = self._request(
@@ -158,5 +209,8 @@ class OpenAICompatibleClient:
             body = self._request(
                 f"{base_url}/models", api_key, headers=self._headers(provider, api_key)
             )
-            models = [item.get("id") for item in body.get("data", [])]
+            catalog = body.get("data", [])
+            if provider == "OpenCode":
+                catalog = [item for item in catalog if self._is_chat_compatible(item)]
+            models = [item.get("id") for item in catalog]
         return [model for model in models if model]

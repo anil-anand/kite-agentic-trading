@@ -71,6 +71,7 @@ class ConfigManager:
                 "provider": "Gemini",
                 "baseUrl": "https://generativelanguage.googleapis.com/v1beta",
                 "model": "gemini-2.5-flash",
+                "openCodePlan": "zen",
                 "apiKey": "",
                 "temperature": 0.2,
                 "maxTokens": 1024,
@@ -131,6 +132,8 @@ class ConfigManager:
     def _migrate_legacy_llm_key(self):
         legacy_key = self.config.get("credentials", {}).get("llmApiKey", "")
         llm = self.config.setdefault("llm", deepcopy(self.default_config["llm"]))
+        if llm.get("openCodePlan") not in {"zen", "go"}:
+            llm["openCodePlan"] = "zen"
         if llm.get("baseUrl", "").endswith("/openai"):
             llm["baseUrl"] = llm["baseUrl"][:-6]
             self.save()
@@ -193,6 +196,14 @@ class ConfigManager:
             api_key = incoming_llm.pop("apiKey", "")
             incoming_llm.pop("apiKeyConfigured", None)
             current_llm.update(incoming_llm)
+            if current_llm.get("openCodePlan") not in {"zen", "go"}:
+                current_llm["openCodePlan"] = "zen"
+            if current_llm.get("provider") == "OpenCode":
+                from .llm_client import OPENCODE_PLANS
+
+                current_llm["baseUrl"] = OPENCODE_PLANS[current_llm["openCodePlan"]][
+                    "baseUrl"
+                ]
             if api_key and api_key != "********":
                 current_llm["apiKey"] = self._encrypt(api_key)
         self.save()

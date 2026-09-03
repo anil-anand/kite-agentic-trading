@@ -3,7 +3,11 @@ from urllib.error import HTTPError
 
 import pytest
 
-from backend.llm_client import PROVIDER_PRESETS, OpenAICompatibleClient
+from backend.llm_client import (
+    OPENCODE_PLANS,
+    PROVIDER_PRESETS,
+    OpenAICompatibleClient,
+)
 
 
 class FakeResponse:
@@ -77,6 +81,90 @@ def test_provider_presets_are_explicit_and_exclude_custom_and_bedrock():
         "OpenCode",
     }
     assert PROVIDER_PRESETS["Ollama"]["requiresApiKey"] is False
+
+
+def test_opencode_plans_have_explicit_chat_defaults_and_identities():
+    assert OPENCODE_PLANS == {
+        "zen": {
+            "baseUrl": "https://opencode.ai/zen/v1",
+            "model": "big-pickle",
+            "providerId": "opencode",
+        },
+        "go": {
+            "baseUrl": "https://opencode.ai/zen/go/v1",
+            "model": "kimi-k3",
+            "providerId": "opencode-go",
+        },
+    }
+
+
+def test_go_model_discovery_excludes_non_chat_protocols(monkeypatch):
+    def fake_urlopen(req, timeout):
+        return FakeResponse(
+            {
+                "data": [
+                    {"id": "kimi-k3", "protocol": "chat-completions"},
+                    {"id": "reasoning-model", "protocol": "responses"},
+                    {"id": "claude-model", "protocol": "anthropic"},
+                ]
+            }
+        )
+
+    monkeypatch.setattr("backend.llm_client.request.urlopen", fake_urlopen)
+
+    assert OpenAICompatibleClient().discover_models(
+        "OpenCode", OPENCODE_PLANS["go"]["baseUrl"], "key", plan="go"
+    ) == ["kimi-k3"]
+
+
+def test_opencode_discovery_fails_closed_for_missing_or_unknown_protocols(monkeypatch):
+    def fake_urlopen(req, timeout):
+        return FakeResponse(
+            {
+                "data": [
+                    {"id": "kimi-k3"},
+                    {"id": "deepseek", "api": "openai-completions"},
+                    {
+                        "id": "chat-with-endpoint",
+                        "endpoint": {
+                            "type": "openai/completions",
+                            "url": "https://opencode.ai/zen/go/v1",
+                        },
+                    },
+                    {
+                        "id": "reasoning-model",
+                        "endpoint": {
+                            "type": "openai/responses",
+                            "url": "https://opencode.ai/zen/v1/responses",
+                        },
+                    },
+                    {
+                        "id": "claude-model",
+                        "endpoint": {
+                            "type": "anthropic/messages",
+                            "url": "https://opencode.ai/zen/v1/messages",
+                        },
+                    },
+                    {
+                        "id": "gemini-model",
+                        "endpoint": {
+                            "type": "aisdk",
+                            "package": "@ai-sdk/google",
+                        },
+                    },
+                    {
+                        "id": "unknown-model",
+                        "protocol": "future-protocol",
+                    },
+                ]
+            }
+        )
+
+    monkeypatch.setattr("backend.llm_client.request.urlopen", fake_urlopen)
+
+    assert OpenAICompatibleClient().discover_models(
+        "OpenCode", OPENCODE_PLANS["go"]["baseUrl"], "key", plan="go"
+    ) == ["deepseek", "chat-with-endpoint"]
 
 
 def test_anthropic_request_uses_provider_auth_and_native_messages_api(monkeypatch):
@@ -271,7 +359,7 @@ def test_discover_models_uses_provider_endpoint_and_normalizes_models(monkeypatc
             "OpenCode",
             "https://opencode.ai/zen/v1",
             "opencode-key",
-            {"data": [{"id": "big-pickle"}]},
+            {"data": [{"id": "big-pickle", "protocol": "chat-completions"}]},
             ["big-pickle"],
             "/models",
         ),
