@@ -34,10 +34,18 @@ def _base_price(token: int) -> float:
     return 100.0 + (token % 900)
 
 
+_OPEN_STATUSES = {"OPEN", "TRIGGER PENDING"}
+
+
 class MockKiteClient:
     def __init__(self):
         self.access_token = "dev-token"
         self._order_seq = 0
+        # Simulated trading book: the agent's orders actually fill against a
+        # live-moving synthetic price, so dev mode shows real positions and P&L.
+        self._orders = {}  # order_id -> order dict
+        self._positions = {}  # symbol -> position dict
+        self._live_prices = {}  # symbol -> current (drifting) price
 
     # -- auth (no-ops in dev) ----------------------------------------------
     def init(self, api_key):
@@ -80,10 +88,18 @@ class MockKiteClient:
             :50
         ]
 
-    def _ltp_for(self, symbol):
-        token = _token_for(symbol)
-        candles = self._synthetic_candles(token, n=1)
-        return candles[-1]["close"] if candles else _base_price(token)
+    def _live_price(self, symbol):
+        """Current price that drifts a little on each read, so P&L moves and
+        resting stops can trigger over the agent's monitor loop. Seeded from the
+        deterministic candle close the first time a symbol is touched."""
+        price = self._live_prices.get(symbol)
+        if price is None:
+            token = _token_for(symbol)
+            candles = self._synthetic_candles(token, n=1)
+            price = candles[-1]["close"] if candles else _base_price(token)
+        price = round(price * (1 + random.uniform(-0.003, 0.003)), 2)
+        self._live_prices[symbol] = price
+        return price
 
     def get_ltp(self, instruments):
         out = {}
@@ -91,7 +107,7 @@ class MockKiteClient:
             symbol = key.split(":")[-1]
             out[key] = {
                 "instrument_token": _token_for(symbol),
-                "last_price": self._ltp_for(symbol),
+                "last_price": self._live_price(symbol),
             }
         return out
 
@@ -149,13 +165,6 @@ class MockKiteClient:
             price = close
         return candles
 
-    # -- account (empty book in dev) ---------------------------------------
-    def get_positions(self):
-        return {"net": [], "day": []}
-
-    def get_orders(self):
-        return []
-
     def get_holdings(self):
         return []
 
@@ -169,13 +178,152 @@ class MockKiteClient:
             "commodity": {},
         }
 
-    # -- orders (accepted, but nothing is sent anywhere) -------------------
-    def place_order(self, **kwargs):
+    # -- simulated order book ---------------------------------------------
+    def place_order(
+        self,
+        variety,
+        exchange,
+        tradingsymbol,
+        transaction_type,
+        quantity,
+        product,
+        order_type,
+        price=None,
+        trigger_price=None,
+        **kwargs,
+    ):
         self._order_seq += 1
-        return f"DEV{self._order_seq}"
+        order_id = f"DEV{self._order_seq}"
+        qty = int(quantity)
+        order = {
+            "orderId": order_id,
+            "tradingsymbol": tradingsymbol,
+            "exchange": exchange,
+            "transaction_type": transaction_type,
+            "quantity": qty,
+            "filledQuantity": 0,
+            "product": product,
+            "order_type": order_type,
+            "price": price,
+            "trigger_price": trigger_price,
+            "status": "OPEN",
+        }
+        self._orders[order_id] = order
+
+        if qty <= 0:
+            order["status"] = "REJECTED"
+            return order_id
+
+        if order_type == "SL":
+            # Protective stop rests until the live price crosses the trigger.
+            if trigger_price is None:
+                order["status"] = "REJECTED"
+            else:
+                order["status"] = "TRIGGER PENDING"
+            return order_id
+
+        # MARKET/LIMIT are marketable in the sim — fill immediately.
+        fill = self._live_price(tradingsymbol) if order_type == "MARKET" else price
+        if not fill or fill <= 0:
+            order["status"] = "REJECTED"
+            return order_id
+        self._fill(order, fill)
+        return order_id
 
     def cancel_order(self, variety, order_id, parent_order_id=None):
+        order = self._orders.get(str(order_id))
+        if order and order["status"] in _OPEN_STATUSES:
+            order["status"] = "CANCELLED"
         return {"order_id": order_id}
 
-    def modify_order(self, **kwargs):
-        return {"order_id": kwargs.get("order_id")}
+    def modify_order(self, variety, order_id, trigger_price=None, price=None, **kwargs):
+        order = self._orders.get(str(order_id))
+        if order and order["status"] in _OPEN_STATUSES:
+            if trigger_price is not None:
+                order["trigger_price"] = trigger_price
+            if price is not None:
+                order["price"] = price
+        return {"order_id": order_id}
+
+    def _fill(self, order, price):
+        order["status"] = "COMPLETE"
+        order["filledQuantity"] = order["quantity"]
+        order["averagePrice"] = price
+        self._apply_fill(
+            order["tradingsymbol"],
+            order["exchange"],
+            order["product"],
+            order["transaction_type"],
+            order["quantity"],
+            price,
+        )
+
+    def _apply_fill(self, symbol, exchange, product, txn, qty, price):
+        signed = qty if txn == "BUY" else -qty
+        pos = self._positions.get(symbol)
+        if pos is None:
+            pos = {
+                "tradingsymbol": symbol,
+                "exchange": exchange,
+                "product": product,
+                "quantity": 0,
+                "averagePrice": 0.0,
+                "realised": 0.0,
+            }
+            self._positions[symbol] = pos
+
+        prev_qty = pos["quantity"]
+        prev_avg = pos["averagePrice"]
+        new_qty = prev_qty + signed
+
+        if prev_qty == 0 or (prev_qty > 0) == (signed > 0):
+            # Opening or adding — weighted average.
+            total = prev_avg * abs(prev_qty) + price * qty
+            pos["averagePrice"] = total / abs(new_qty) if new_qty else 0.0
+        else:
+            # Reducing / closing / reversing — book realised on the closed part.
+            closing = min(qty, abs(prev_qty))
+            direction = 1 if prev_qty > 0 else -1
+            pos["realised"] += (price - prev_avg) * closing * direction
+            if abs(signed) > abs(prev_qty):
+                pos["averagePrice"] = price  # reversed
+            elif new_qty == 0:
+                pos["averagePrice"] = 0.0
+        pos["quantity"] = new_qty
+
+    def _check_resting_orders(self):
+        for order in self._orders.values():
+            if order["status"] != "TRIGGER PENDING":
+                continue
+            ltp = self._live_price(order["tradingsymbol"])
+            trig = order["trigger_price"]
+            txn = order["transaction_type"]
+            # SELL stop protects a long (fires on the way down); BUY stop
+            # protects a short (fires on the way up).
+            if (txn == "SELL" and ltp <= trig) or (txn == "BUY" and ltp >= trig):
+                self._fill(order, trig)
+
+    def get_positions(self):
+        self._check_resting_orders()
+        net = []
+        for symbol, pos in self._positions.items():
+            qty = pos["quantity"]
+            ltp = self._live_price(symbol)
+            unrealised = (ltp - pos["averagePrice"]) * qty if qty else 0.0
+            net.append(
+                {
+                    "tradingsymbol": symbol,
+                    "exchange": pos["exchange"],
+                    "product": pos["product"],
+                    "quantity": qty,
+                    "averagePrice": round(pos["averagePrice"], 2),
+                    "lastPrice": ltp,
+                    "realised": round(pos["realised"], 2),
+                    "unrealised": round(unrealised, 2),
+                    "pnl": round(pos["realised"] + unrealised, 2),
+                }
+            )
+        return {"net": net, "day": list(net)}
+
+    def get_orders(self):
+        return [dict(o) for o in self._orders.values()]
