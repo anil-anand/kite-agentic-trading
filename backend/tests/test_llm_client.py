@@ -3,7 +3,7 @@ from urllib.error import HTTPError
 
 import pytest
 
-from backend.llm_client import OpenAICompatibleClient
+from backend.llm_client import PROVIDER_PRESETS, OpenAICompatibleClient
 
 
 class FakeResponse:
@@ -65,3 +65,75 @@ def test_generate_rejects_malformed_response(monkeypatch):
 
     with pytest.raises(RuntimeError, match="malformed"):
         OpenAICompatibleClient().generate("https://example.test", "key", "model", "p")
+
+
+def test_provider_presets_are_explicit_and_exclude_custom_and_bedrock():
+    assert set(PROVIDER_PRESETS) == {
+        "OpenAI",
+        "Anthropic",
+        "Gemini",
+        "OpenRouter",
+        "Ollama",
+        "OpenCode",
+    }
+    assert PROVIDER_PRESETS["Ollama"]["requiresApiKey"] is False
+
+
+def test_anthropic_request_uses_provider_auth_and_native_messages_api(monkeypatch):
+    captured = {}
+
+    def fake_urlopen(req, timeout):
+        captured["request"] = req
+        return FakeResponse({"content": [{"type": "text", "text": "analysis"}]})
+
+    monkeypatch.setattr("backend.llm_client.request.urlopen", fake_urlopen)
+
+    result = OpenAICompatibleClient().generate(
+        "https://api.anthropic.com/v1",
+        "secret-key",
+        "claude-sonnet",
+        "prompt",
+        provider="Anthropic",
+    )
+
+    assert result == "analysis"
+    assert captured["request"].full_url == "https://api.anthropic.com/v1/messages"
+    assert captured["request"].headers["X-api-key"] == "secret-key"
+    assert json.loads(captured["request"].data)["messages"] == [
+        {"role": "user", "content": "prompt"}
+    ]
+
+
+def test_ollama_request_has_no_authorization_header(monkeypatch):
+    captured = {}
+
+    def fake_urlopen(req, timeout):
+        captured["request"] = req
+        return FakeResponse({"message": {"content": "analysis"}})
+
+    monkeypatch.setattr("backend.llm_client.request.urlopen", fake_urlopen)
+
+    assert (
+        OpenAICompatibleClient().generate(
+            "http://localhost:11434", "", "llama3.2", "prompt", provider="Ollama"
+        )
+        == "analysis"
+    )
+    assert "Authorization" not in captured["request"].headers
+    assert captured["request"].full_url == "http://localhost:11434/api/chat"
+
+
+def test_discover_models_uses_provider_endpoint_and_normalizes_models(monkeypatch):
+    captured = {}
+
+    def fake_urlopen(req, timeout):
+        captured["request"] = req
+        return FakeResponse({"data": [{"id": "gpt-4o"}, {"id": "gpt-4o-mini"}]})
+
+    monkeypatch.setattr("backend.llm_client.request.urlopen", fake_urlopen)
+
+    assert OpenAICompatibleClient().discover_models(
+        "OpenAI", "https://api.openai.com/v1", "secret-key"
+    ) == ["gpt-4o", "gpt-4o-mini"]
+    assert captured["request"].full_url == "https://api.openai.com/v1/models"
+    assert captured["request"].headers["Authorization"] == "Bearer secret-key"

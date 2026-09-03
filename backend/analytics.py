@@ -405,7 +405,8 @@ class TradeAnalytics:
         creds = config_manager.get_credentials()
         llm = config_manager.get_llm_settings()
         api_key = creds.get("llmApiKey")
-        if not api_key:
+        provider = llm.get("provider", "Gemini")
+        if not api_key and provider != "Ollama":
             return {"error": "LLM API Key not configured in settings."}
 
         conn = self._get_conn()
@@ -461,6 +462,7 @@ Trade Timeline Events:
                 api_key=api_key,
                 model=llm.get("model", ""),
                 prompt=prompt,
+                provider=provider,
             )
             return {"analysis": analysis}
         except Exception as e:

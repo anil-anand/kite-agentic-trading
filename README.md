@@ -72,7 +72,7 @@ npm run dev
 
 On your first launch, navigate to the **Settings** tab to enter your Kite API Key and API Secret. The app will encrypt and save them locally.
 
-To enable Journal post-mortems, open **Settings > BYOK LLM Post-Mortems** and enter a provider, OpenAI-compatible base URL, model, and API key. The default Gemini profile uses `https://generativelanguage.googleapis.com/v1beta/openai` with `gemini-2.5-flash`. For OpenAI, use `https://api.openai.com/v1` and a compatible model such as `gpt-4o-mini`. Any provider exposing `/chat/completions` can be configured with its custom base URL. API keys are encrypted locally and are never returned to the renderer in plaintext.
+To enable Journal post-mortems, open **Settings > BYOK LLM Post-Mortems**, choose a provider, refresh its available models, and enter its API key. Supported presets are OpenAI (`gpt-4o-mini`), Anthropic (`claude-3-5-haiku-latest`), Gemini (`gemini-2.5-flash`), OpenRouter (`openai/gpt-4o-mini`), Ollama (`llama3.2`), and OpenCode (`big-pickle`). Ollama uses the local server at `http://localhost:11434` and does not require a key. Provider endpoints and request authentication are selected by the preset; arbitrary endpoints are intentionally not accepted. API keys are encrypted locally and are never returned to the renderer in plaintext. Bedrock is deferred.
 
 ## 🧰 Installing the Application
 

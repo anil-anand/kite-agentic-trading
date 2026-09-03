@@ -3,11 +3,23 @@ import { useTradingStore } from '../stores/trading-store';
 import { SETTINGS_SAVE } from '@shared/ipc-channels';
 import { LLMSettings } from '@shared/types';
 
+const LLM_PROVIDERS = ['OpenAI', 'Anthropic', 'Gemini', 'OpenRouter', 'Ollama', 'OpenCode'] as const;
+const LLM_PRESETS: Record<string, Partial<LLMSettings>> = {
+  OpenAI: { baseUrl: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
+  Anthropic: { baseUrl: 'https://api.anthropic.com/v1', model: 'claude-3-5-haiku-latest' },
+  Gemini: { baseUrl: 'https://generativelanguage.googleapis.com/v1beta', model: 'gemini-2.5-flash' },
+  OpenRouter: { baseUrl: 'https://openrouter.ai/api/v1', model: 'openai/gpt-4o-mini' },
+  Ollama: { baseUrl: 'http://localhost:11434', model: 'llama3.2' },
+  OpenCode: { baseUrl: 'https://opencode.ai/zen/v1', model: 'big-pickle' },
+};
+
 const Settings: React.FC = () => {
   const { settings, setSettings } = useTradingStore();
   const [localSettings, setLocalSettings] = useState<any>(settings);
   const [saveStatus, setSaveStatus] = useState<string>('');
   const [llmKey, setLlmKey] = useState<string>('');
+  const [models, setModels] = useState<string[]>([]);
+  const [discovering, setDiscovering] = useState(false);
 
   // Sync local state when global settings load
   useEffect(() => {
@@ -42,17 +54,21 @@ const Settings: React.FC = () => {
   };
 
   const handleProviderChange = (provider: string) => {
-    const presets: Record<string, Partial<LLMSettings>> = {
-      Gemini: {
-        baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
-        model: 'gemini-2.5-flash',
-      },
-      OpenAI: {
-        baseUrl: 'https://api.openai.com/v1',
-        model: 'gpt-4o-mini',
-      },
-    };
-    updateLlm({ provider, ...(presets[provider] || {}) });
+    updateLlm({ provider: provider as LLMSettings['provider'], ...(LLM_PRESETS[provider] || {}) });
+    setModels([]);
+  };
+
+  const discoverModels = async () => {
+    try {
+      setDiscovering(true);
+      const result = await window.electronAPI?.settings.discoverModels({
+        provider: localSettings.llm.provider,
+        baseUrl: localSettings.llm.baseUrl,
+      });
+      if (Array.isArray(result)) setModels(result);
+    } finally {
+      setDiscovering(false);
+    }
   };
 
   const saveChanges = async () => {
@@ -125,39 +141,40 @@ const Settings: React.FC = () => {
                   onChange={(e) => handleProviderChange(e.target.value)}
                   className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white"
                 >
-                  <option>Gemini</option>
-                  <option>OpenAI</option>
-                  <option>Custom</option>
+                   {LLM_PROVIDERS.map((provider) => <option key={provider}>{provider}</option>)}
                 </select>
               </div>
               <div>
                 <label className="block text-surface-400 text-sm mb-1">Base URL</label>
-                <input
-                  type="url"
-                  value={localSettings.llm?.baseUrl || ''}
-                  onChange={(e) => updateLlm({ baseUrl: e.target.value })}
-                  className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white focus:border-accent-light outline-none"
-                />
+                <input type="url" value={localSettings.llm?.baseUrl || ''} readOnly
+                  className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-surface-400 outline-none" />
               </div>
               <div>
                 <label className="block text-surface-400 text-sm mb-1">Model</label>
-                <input
-                  value={localSettings.llm?.model || ''}
-                  onChange={(e) => updateLlm({ model: e.target.value })}
-                  className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white focus:border-accent-light outline-none"
-                />
+                <div className="flex gap-2">
+                  <select value={localSettings.llm?.model || ''} onChange={(e) => updateLlm({ model: e.target.value })}
+                    className="flex-1 bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white focus:border-accent-light outline-none">
+                    <option value={localSettings.llm?.model || ''}>{localSettings.llm?.model || 'Select a model'}</option>
+                    {models.filter((model) => model !== localSettings.llm?.model).map((model) => <option key={model}>{model}</option>)}
+                  </select>
+                  <button type="button" onClick={discoverModels} disabled={discovering}
+                    className="px-3 py-2 bg-surface-700 hover:bg-surface-600 rounded-lg text-white disabled:opacity-50">
+                    {discovering ? 'Loading...' : 'Refresh'}
+                  </button>
+                </div>
               </div>
               <div>
                 <label className="block text-surface-400 text-sm mb-1">API Key</label>
                 <input 
-                  type="password" 
-                  value={llmKey} 
-                  onChange={(e) => setLlmKey(e.target.value)}
-                  placeholder={localSettings.llm?.apiKeyConfigured ? 'Key saved (enter to replace)' : 'Enter provider API key'}
+                   type="password"
+                   value={llmKey}
+                   onChange={(e) => setLlmKey(e.target.value)}
+                   disabled={localSettings.llm?.provider === 'Ollama'}
+                   placeholder={localSettings.llm?.apiKeyConfigured ? 'Key saved (enter to replace)' : 'Enter provider API key'}
                   className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white focus:border-accent-light outline-none" 
                 />
               </div>
-              <p className="text-xs text-surface-500">Used for trade post-mortems in the Journal. Compatible with Gemini, OpenAI, and custom OpenAI-compatible endpoints. Stored encrypted.</p>
+               <p className="text-xs text-surface-500">Used for trade post-mortems in the Journal. Keys are encrypted locally. Ollama runs without a key.</p>
             </div>
           </section>
 

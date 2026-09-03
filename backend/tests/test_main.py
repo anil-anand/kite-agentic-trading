@@ -17,3 +17,21 @@ def test_save_settings_uses_config_manager_profile_path():
     save_settings.assert_called_once_with(
         {"llm": {"provider": "OpenAI", "model": "gpt-4o-mini"}}
     )
+
+
+def test_discover_models_uses_llm_discovery_service():
+    with (
+        patch("backend.main.config_manager.get_llm_settings") as get_settings,
+        patch("backend.main.config_manager.get_credentials") as get_credentials,
+        patch("backend.main.OpenAICompatibleClient.discover_models") as discover,
+    ):
+        get_settings.return_value = {
+            "provider": "Ollama",
+            "baseUrl": "http://localhost:11434",
+        }
+        get_credentials.return_value = {"llmApiKey": ""}
+        discover.return_value = ["llama3.2"]
+
+        result = handle_request({"id": 2, "method": "discover_models", "params": {}})
+
+    assert result["result"] == ["llama3.2"]

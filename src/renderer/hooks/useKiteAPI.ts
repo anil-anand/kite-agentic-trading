@@ -32,6 +32,7 @@ export interface ElectronAPI {
     get(): Promise<any>;
     save(settings: any): Promise<any>;
     saveLlmKey(key: string): Promise<any>;
+    discoverModels(params: any): Promise<any>;
     reset(): Promise<any>;
   };
   analytics: {

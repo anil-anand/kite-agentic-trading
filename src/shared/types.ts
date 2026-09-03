@@ -9,11 +9,13 @@ export interface KiteCredentials {
 }
 
 export interface LLMSettings {
-  provider: string;
+  provider: 'OpenAI' | 'Anthropic' | 'Gemini' | 'OpenRouter' | 'Ollama' | 'OpenCode';
   baseUrl: string;
   model: string;
   apiKey: string;
   apiKeyConfigured?: boolean;
+  temperature?: number;
+  maxTokens?: number;
 }
 
 export interface AuthState {

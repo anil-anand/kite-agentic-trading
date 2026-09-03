@@ -69,9 +69,11 @@ class ConfigManager:
             "credentials": {"apiKey": "", "apiSecret": ""},
             "llm": {
                 "provider": "Gemini",
-                "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai",
+                "baseUrl": "https://generativelanguage.googleapis.com/v1beta",
                 "model": "gemini-2.5-flash",
                 "apiKey": "",
+                "temperature": 0.2,
+                "maxTokens": 1024,
             },
             "mode": "auto",
         }
@@ -129,6 +131,9 @@ class ConfigManager:
     def _migrate_legacy_llm_key(self):
         legacy_key = self.config.get("credentials", {}).get("llmApiKey", "")
         llm = self.config.setdefault("llm", deepcopy(self.default_config["llm"]))
+        if llm.get("baseUrl", "").endswith("/openai"):
+            llm["baseUrl"] = llm["baseUrl"][:-6]
+            self.save()
         if legacy_key and not llm.get("apiKey"):
             decrypted_key = self._decrypt(legacy_key)
             if decrypted_key:

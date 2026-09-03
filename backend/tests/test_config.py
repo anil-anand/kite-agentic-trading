@@ -13,9 +13,11 @@ def test_default_llm_profile_is_gemini_compatible(tmp_path, monkeypatch):
 
     assert manager.config["llm"] == {
         "provider": "Gemini",
-        "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "baseUrl": "https://generativelanguage.googleapis.com/v1beta",
         "model": "gemini-2.5-flash",
         "apiKey": "",
+        "temperature": 0.2,
+        "maxTokens": 1024,
     }
 
 
