@@ -121,6 +121,8 @@ def handle_request(req):
 
         elif method == "start_agent":
             mode = params.get("mode", "auto")
+            if mode not in ("auto", "confirm", "paper"):
+                return error(-32602, f"Invalid agent mode: {mode}")
             trading_engine.start(mode)
             return success({"status": "started", "mode": mode})
 

@@ -8,6 +8,7 @@ import uuid
 from .config import config_manager
 from .journal import journal
 from .kite_client import kite_client
+from .paper_broker import PaperBroker
 from .risk_manager import risk_manager
 from .scanner import scanner
 from .utils import DateTimeEncoder
@@ -21,8 +22,14 @@ class TradingEngine:
     def __init__(self):
         self.running = False
         self.thread = None
-        self.mode = "auto"  # auto or confirm
+        self.mode = "auto"  # auto | confirm | paper
         self.interval = 60  # seconds
+        # Broker seam: every order / position call goes through self.broker.
+        # With no override it resolves to the live Kite client; paper mode sets
+        # an override to a simulator that fills against real market data with no
+        # real orders. Resolving live lazily keeps one source of truth and lets
+        # tests monkeypatch the module client after construction.
+        self._broker_override = None
         self.active_trades = {}  # tradingsymbol -> { sl, target, direction, entry_price, entry_time, original_strategy, stop_order_id, exit_pending, exit_order_id }
         self._instrument_map = {}  # cached symbol -> instrument_token map
         self._entry_fill_timeout_seconds = 15
@@ -44,7 +51,7 @@ class TradingEngine:
         if symbol in self._tick_size_map:
             return self._tick_size_map[symbol]
         try:
-            instruments = kite_client.get_instruments(exchange)
+            instruments = self.broker.get_instruments(exchange)
             for i in instruments:
                 self._tick_size_map[i["tradingsymbol"]] = float(
                     i.get("tick_size", 0.05)
@@ -59,11 +66,37 @@ class TradingEngine:
     def _round_to_tick(self, price: float, tick_size: float) -> float:
         return round(round(price / tick_size) * tick_size, 2)
 
+    @property
+    def broker(self):
+        return (
+            self._broker_override if self._broker_override is not None else kite_client
+        )
+
+    def _auto_execute_enabled(self) -> bool:
+        """Whether the agent executes trades automatically. Paper mode behaves
+        like auto (fully autonomous), just against the simulated broker."""
+        return self.mode in ("auto", "paper")
+
     def start(self, mode: str = "auto"):
         if self.running:
             return
 
         self.mode = mode
+        if mode == "paper":
+            # Fresh virtual account each paper session; no real orders, and no
+            # interaction with any live position tracking.
+            self._broker_override = PaperBroker(kite_client)
+            with self._trade_lock:
+                self.active_trades = {}
+                self._pending_entries = set()
+            self._push_log(
+                "Paper trading: simulating fills on live prices — no real orders "
+                "will be placed.",
+                level="warning",
+            )
+        else:
+            self._broker_override = None
+
         self.running = True
         self.thread = threading.Thread(target=self._run_loop)
         self.thread.daemon = True
@@ -146,7 +179,7 @@ class TradingEngine:
     def _ensure_instrument_map(self):
         """Cache the NSE instrument map for reuse across scan and re-evaluation."""
         if not self._instrument_map:
-            instruments = kite_client.get_instruments("NSE")
+            instruments = self.broker.get_instruments("NSE")
             self._instrument_map = {
                 i["tradingsymbol"]: i["instrument_token"] for i in instruments
             }
@@ -187,7 +220,11 @@ class TradingEngine:
             # threads, so active_trades access must be guarded by the lock.
             if signal["confidence"] >= 70:
                 self._push_signal(signal)
-                if self.mode == "auto" and signal["confidence"] >= 80 and can_trade:
+                if (
+                    self._auto_execute_enabled()
+                    and signal["confidence"] >= 80
+                    and can_trade
+                ):
                     symbol = signal["tradingsymbol"]
                     with self._trade_lock:
                         already_active = (
@@ -247,7 +284,7 @@ class TradingEngine:
         entry_price = self._round_to_tick(signal["entryPrice"], tick_size)
 
         try:
-            order_id = kite_client.place_order(
+            order_id = self.broker.place_order(
                 variety="regular",
                 exchange=exchange,
                 tradingsymbol=symbol,
@@ -269,7 +306,7 @@ class TradingEngine:
                     level="warning",
                 )
                 try:
-                    kite_client.cancel_order("regular", order_id)
+                    self.broker.cancel_order("regular", order_id)
                 except Exception:
                     pass
                 return False
@@ -361,7 +398,7 @@ class TradingEngine:
 
     def monitor_positions(self):
         try:
-            positions = kite_client.get_positions().get("net", [])
+            positions = self.broker.get_positions().get("net", [])
             total_pnl = sum(
                 p.get("realised", 0.0) + p.get("unrealised", 0.0) for p in positions
             )
@@ -403,7 +440,7 @@ class TradingEngine:
                 if (
                     symbol not in tracked
                     and symbol not in pending
-                    and self.mode == "auto"
+                    and self._auto_execute_enabled()
                 ):
                     self._adopt_position(p)
                     continue
@@ -459,7 +496,7 @@ class TradingEngine:
     def _find_live_position_by_symbol(self, symbol: str) -> dict:
         """Fetch the current open position for a symbol, or {} if flat/closed."""
         try:
-            positions = kite_client.get_positions().get("net", [])
+            positions = self.broker.get_positions().get("net", [])
         except Exception:
             return {}
         for p in positions:
@@ -544,7 +581,7 @@ class TradingEngine:
         if lost_race:
             if stop_order_id:
                 try:
-                    kite_client.cancel_order("regular", stop_order_id)
+                    self.broker.cancel_order("regular", stop_order_id)
                 except Exception:
                     pass
             return
@@ -568,7 +605,7 @@ class TradingEngine:
 
         # Get current positions for P&L and LTP data
         try:
-            positions = kite_client.get_positions().get("net", [])
+            positions = self.broker.get_positions().get("net", [])
             position_map = {
                 p["tradingsymbol"]: p for p in positions if p["quantity"] != 0
             }
@@ -626,7 +663,7 @@ class TradingEngine:
             if opposing >= 2 and supporting == 0:
                 reason = f"Thesis invalidated for {symbol}: {opposing} opposing signals, 0 supporting. Exiting."
                 self._push_log(reason, level="warning")
-                if self.mode == "auto":
+                if self._auto_execute_enabled():
                     self._exit_position(pos, symbol, reason)
                 continue
 
@@ -634,7 +671,7 @@ class TradingEngine:
             if supporting == 0 and in_loss and mins_held >= weak_exit_mins:
                 reason = f"Weak conviction for {symbol}: 0 supporting signals, in loss, held {mins_held:.0f} mins. Exiting."
                 self._push_log(reason, level="warning")
-                if self.mode == "auto":
+                if self._auto_execute_enabled():
                     self._exit_position(pos, symbol, reason)
                 continue
 
@@ -700,7 +737,7 @@ class TradingEngine:
             limit_price = self._round_to_tick(limit_price, tick_size)
 
             try:
-                kite_client.modify_order(
+                self.broker.modify_order(
                     variety="regular",
                     order_id=stop_order_id,
                     trigger_price=trigger_price,
@@ -743,7 +780,7 @@ class TradingEngine:
     def square_off_all(self):
         self._push_log("Squaring off all open positions")
         try:
-            positions = kite_client.get_positions().get("net", [])
+            positions = self.broker.get_positions().get("net", [])
             for p in positions:
                 if p["quantity"] != 0:
                     self._place_exit_order(p, p["tradingsymbol"], "Square off")
@@ -766,7 +803,7 @@ class TradingEngine:
         return {}
 
     def _find_live_position(self, symbol: str, direction: str) -> dict:
-        positions = kite_client.get_positions().get("net", [])
+        positions = self.broker.get_positions().get("net", [])
         for p in positions:
             qty = p.get("quantity", 0)
             if p.get("tradingsymbol") != symbol or qty == 0:
@@ -778,7 +815,7 @@ class TradingEngine:
         return {}
 
     def _is_order_closed_without_fill(self, order_id: str) -> bool:
-        orders = kite_client.get_orders()
+        orders = self.broker.get_orders()
         for order in orders:
             if str(order.get("orderId")) != str(order_id):
                 continue
@@ -808,7 +845,7 @@ class TradingEngine:
                 limit_price = trigger_price * (1 + buffer_pct)
             limit_price = self._round_to_tick(limit_price, tick_size)
 
-            order_id = kite_client.place_order(
+            order_id = self.broker.place_order(
                 variety="regular",
                 exchange=exchange,
                 tradingsymbol=symbol,
@@ -857,7 +894,7 @@ class TradingEngine:
                 return
             trade["stop_order_id"] = None
         try:
-            kite_client.cancel_order("regular", stop_order_id)
+            self.broker.cancel_order("regular", stop_order_id)
         except Exception:
             pass
 
@@ -899,7 +936,7 @@ class TradingEngine:
             order_kwargs["price"] = price
 
         try:
-            order_id = kite_client.place_order(**order_kwargs)
+            order_id = self.broker.place_order(**order_kwargs)
         except Exception as e:
             if order_type == "LIMIT":
                 self._push_log(
@@ -910,7 +947,7 @@ class TradingEngine:
                 if "price" in order_kwargs:
                     del order_kwargs["price"]
                 try:
-                    order_id = kite_client.place_order(**order_kwargs)
+                    order_id = self.broker.place_order(**order_kwargs)
                 except Exception as e2:
                     with self._trade_lock:
                         if symbol in self.active_trades:
@@ -938,7 +975,7 @@ class TradingEngine:
             if not order_id:
                 trade["exit_pending"] = False
                 return
-        orders = kite_client.get_orders()
+        orders = self.broker.get_orders()
         for order in orders:
             if str(order.get("orderId")) != str(order_id):
                 continue
