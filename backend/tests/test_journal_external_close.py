@@ -149,3 +149,42 @@ class TestJournalExternalClose:
 
         assert ("T1", 95.0, "stop_loss") in j.closed
         assert "RELIANCE" not in eng.active_trades  # tracking dropped
+
+    def test_stale_position_snapshot_journals_close_before_cleanup(self, monkeypatch):
+        # The first snapshot can still contain the position while a protective
+        # stop fills before the live re-check in the hit-stop path.
+        j = FakeJournal()
+
+        class FlatAfterSnapshotKite(FakeKite):
+            def __init__(self):
+                super().__init__(
+                    ltp=95.0,
+                    orders=[{"orderId": "STOP1", "status": "COMPLETE"}],
+                    positions_net=[
+                        {
+                            "tradingsymbol": "RELIANCE",
+                            "quantity": 10,
+                            "lastPrice": 95.0,
+                        }
+                    ],
+                )
+                self.position_reads = 0
+
+            def get_positions(self):
+                self.position_reads += 1
+                if self.position_reads > 1:
+                    return {"net": []}
+                return {"net": self._net}
+
+        kite = FlatAfterSnapshotKite()
+        monkeypatch.setattr(te, "kite_client", kite)
+        monkeypatch.setattr(te, "journal", j)
+        monkeypatch.setattr(te, "risk_manager", FakeRisk())
+
+        eng = TradingEngine()
+        eng.active_trades["RELIANCE"] = _trade()
+
+        eng.monitor_positions()
+
+        assert ("T1", 95.0, "stop_loss") in j.closed
+        assert "RELIANCE" not in eng.active_trades
