@@ -190,7 +190,6 @@ class TestSimulatedBook:
         assert orders[oid]["filledQuantity"] == 10
 
     def test_price_moves_between_reads(self):
-        p1 = self.mock._live_price("RELIANCE")
         seen = {self.mock._live_price("RELIANCE") for _ in range(20)}
         assert len(seen) > 1  # drifts, so P&L and stops are dynamic
 
