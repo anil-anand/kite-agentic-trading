@@ -98,7 +98,13 @@ class OpenAICompatibleClient:
             return {"Authorization": f"Bearer {api_key}"}
         return {}
 
-    def generate(self, base_url, api_key, model, prompt, provider="OpenAI"):
+    def generate(self, base_url, api_key, model, prompt, provider="OpenAI", plan="zen"):
+        if provider == "OpenCode":
+            opencode_plan = OPENCODE_PLANS.get(plan, OPENCODE_PLANS["zen"])
+            if model not in opencode_plan["chatModels"]:
+                raise RuntimeError(
+                    f"Model '{model}' is not available for OpenCode plan '{plan}'"
+                )
         base_url = self._resolve_base_url(provider, base_url, api_key).rstrip("/")
         headers = self._headers(provider, api_key)
         if provider == "Anthropic":
