@@ -11,19 +11,23 @@ anywhere, and positions/orders start empty (use paper mode for a simulated book)
 
 import datetime
 import random
+import zlib
 
-# A small, fixed dev universe. tradingsymbol -> instrument_token.
-_UNIVERSE = {
-    "RELIANCE": 738561,
-    "TCS": 2953217,
-    "INFY": 408065,
-    "HDFCBANK": 341249,
-    "ICICIBANK": 1270529,
-    "SBIN": 779521,
-    "ITC": 424961,
-    "AXISBANK": 1510401,
-}
-_TOKEN_TO_SYMBOL = {t: s for s, t in _UNIVERSE.items()}
+from .nifty_universe import NIFTY_100
+
+
+def _token_for(symbol: str) -> int:
+    """Deterministic, stable instrument token for any symbol.
+
+    Uses a hash so the mock covers the entire scan universe (NIFTY 100 plus any
+    custom watchlist symbol) without a hand-written table — every symbol resolves
+    to a token, so instruments, quotes, LTP, and candles all work.
+    """
+    return 100000 + (zlib.crc32(symbol.encode()) % 900000)
+
+
+# Full dev universe: the same NIFTY 100 the app actually scans.
+_UNIVERSE = {symbol: _token_for(symbol) for symbol in NIFTY_100}
 
 
 def _base_price(token: int) -> float:
@@ -77,7 +81,7 @@ class MockKiteClient:
         ]
 
     def _ltp_for(self, symbol):
-        token = _UNIVERSE.get(symbol, 0)
+        token = _token_for(symbol)
         candles = self._synthetic_candles(token, n=1)
         return candles[-1]["close"] if candles else _base_price(token)
 
@@ -86,7 +90,7 @@ class MockKiteClient:
         for key in instruments:
             symbol = key.split(":")[-1]
             out[key] = {
-                "instrument_token": _UNIVERSE.get(symbol, 0),
+                "instrument_token": _token_for(symbol),
                 "last_price": self._ltp_for(symbol),
             }
         return out
@@ -95,7 +99,7 @@ class MockKiteClient:
         out = {}
         for key in instruments:
             symbol = key.split(":")[-1]
-            token = _UNIVERSE.get(symbol, 0)
+            token = _token_for(symbol)
             candles = self._synthetic_candles(token, n=2)
             last = candles[-1]
             prev = candles[0]

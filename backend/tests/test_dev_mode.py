@@ -121,3 +121,55 @@ class TestSessionBypass:
         monkeypatch.setattr(m.config_manager, "get_credentials", lambda: {})
         res = m.handle_request({"method": "check_session", "id": 1})
         assert res["result"] == {"is_valid": False}
+
+
+class TestCoversScanUniverse:
+    """Regression: the mock must cover the full NIFTY 100 scan universe, or the
+    screener/scanner produce nothing and every data screen is empty."""
+
+    def setup_method(self):
+        self.mock = MockKiteClient()
+
+    def test_instruments_cover_full_nifty100(self):
+        from backend.nifty_universe import NIFTY_100
+
+        symbols = {i["tradingsymbol"] for i in self.mock.get_instruments("NSE")}
+        assert set(NIFTY_100) <= symbols
+
+    def test_quote_works_for_arbitrary_universe_symbol(self):
+        # A symbol beyond the old 8-symbol table used to crash (token 0 ->
+        # empty candles -> IndexError). Now every symbol resolves.
+        q = self.mock.get_quote(["NSE:ADANIENT", "NSE:WIPRO"])
+        assert q["NSE:ADANIENT"]["last_price"] > 0
+        assert {"open", "high", "low", "close"} <= q["NSE:ADANIENT"]["ohlc"].keys()
+
+    def test_candles_non_empty_for_any_universe_token(self):
+        from backend.mock_kite_client import _token_for
+
+        for sym in ("ADANIENT", "WIPRO", "HINDALCO"):
+            candles = self.mock.get_historical_data(
+                _token_for(sym), None, None, "5minute"
+            )
+            assert len(candles) >= 35
+
+    def test_screener_and_scan_produce_signals_end_to_end(self, monkeypatch):
+        # The exact user-visible failure: scan_now returned [] because the
+        # screener fell back to real NIFTY 100 names the mock didn't know.
+        import backend.kite_client as kc
+        import backend.scanner as sc
+        import backend.screener as scr
+
+        monkeypatch.setattr(kc, "kite_client", self.mock)
+        monkeypatch.setattr(sc, "kite_client", self.mock)
+        monkeypatch.setattr(scr, "kite_client", self.mock)
+
+        from backend.nifty_universe import NIFTY_100
+
+        watchlist = scr.screener_engine.generate_daily_watchlist(
+            universe=NIFTY_100, limit=12
+        )
+        assert len(watchlist) == 12
+        assert set(watchlist) <= set(NIFTY_100)
+
+        signals = sc.scanner.scan_watchlist(watchlist)
+        assert len(signals) > 0  # real signals off synthetic candles
