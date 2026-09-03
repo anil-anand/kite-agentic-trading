@@ -106,7 +106,7 @@ def test_provider_presets_are_explicit_and_exclude_custom_and_bedrock():
                     "owned_by": "google",
                 },
             ],
-            ["big-pickle", "gpt-5"],
+            ["big-pickle"],
         ),
         (
             "go",
@@ -155,6 +155,11 @@ def test_opencode_discovery_filters_minimal_catalog_by_plan_allowlist(
         )
         == expected
     )
+
+
+def test_opencode_zen_allowlist_excludes_responses_only_gpt5():
+    assert "big-pickle" in OPENCODE_PLANS["zen"]["chatModels"]
+    assert "gpt-5" not in OPENCODE_PLANS["zen"]["chatModels"]
 
 
 def test_anthropic_request_uses_provider_auth_and_native_messages_api(monkeypatch):

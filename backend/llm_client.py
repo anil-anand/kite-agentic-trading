@@ -6,7 +6,7 @@ OPENCODE_PLANS = {
         "baseUrl": "https://opencode.ai/zen/v1",
         "model": "big-pickle",
         "providerId": "opencode",
-        "chatModels": frozenset({"big-pickle", "gpt-5"}),
+        "chatModels": frozenset({"big-pickle"}),
     },
     "go": {
         "baseUrl": "https://opencode.ai/zen/go/v1",
