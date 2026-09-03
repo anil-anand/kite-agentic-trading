@@ -39,6 +39,7 @@ class TradingEngine:
         # that execute_signal is still setting up.
         self._pending_entries: set = set()
         self._tick_size_map = {}
+        self._reserved_entry_margin = 0.0
 
     def _get_tick_size(self, symbol: str, exchange: str = "NSE") -> float:
         if symbol in self._tick_size_map:
@@ -237,33 +238,60 @@ class TradingEngine:
             self._push_log(f"Cannot execute signal {signal['id']}: {reason}")
             return False
 
-        qty = risk_manager.calculate_position_size(
-            signal["entryPrice"], signal["stopLoss"]
-        )
-
         transaction_type = "BUY" if signal["direction"] == "BUY" else "SELL"
         exchange = signal.get("exchange", "NSE")
         tick_size = self._get_tick_size(symbol, exchange)
         entry_price = self._round_to_tick(signal["entryPrice"], tick_size)
 
         try:
-            order_id = kite_client.place_order(
-                variety="regular",
-                exchange=exchange,
-                tradingsymbol=symbol,
-                transaction_type=transaction_type,
-                quantity=qty,
-                product="MIS",
-                order_type="LIMIT",
-                price=entry_price,
-            )
+            baseline_position = self._find_live_position(symbol, signal["direction"])
+            baseline_quantity = abs(baseline_position.get("quantity", 0))
+            # Serialize the margin snapshot, sizing, and submission so concurrent
+            # scanner callbacks cannot reserve the same available margin.
+            with self._trade_lock:
+                margins = kite_client.get_margins()
+                equity_margin = margins.get("equity", {})
+                available = equity_margin.get("available", {})
+                if "live_balance" in available:
+                    available_margin = available["live_balance"]
+                else:
+                    available_margin = equity_margin.get("net", 0)
+                available_margin = max(
+                    0, available_margin - self._reserved_entry_margin
+                )
+
+                qty = risk_manager.calculate_position_size(
+                    entry_price, signal["stopLoss"], available_margin
+                )
+                if qty <= 0:
+                    self._push_log(
+                        f"Cannot execute signal {signal['id']}: insufficient available margin",
+                        level="warning",
+                    )
+                    return False
+
+                reserved_margin = qty * entry_price
+                self._reserved_entry_margin += reserved_margin
+                order_id = kite_client.place_order(
+                    variety="regular",
+                    exchange=exchange,
+                    tradingsymbol=symbol,
+                    transaction_type=transaction_type,
+                    quantity=qty,
+                    product="MIS",
+                    order_type="LIMIT",
+                    price=entry_price,
+                )
             self._push_log(
                 f"Executed {transaction_type} for {symbol}, qty {qty}, order_id {order_id}"
             )
 
             # Wait for fill — NO LOCK held; this blocks up to 15 seconds.
-            position = self._wait_for_entry_fill(signal, order_id)
+            position = self._wait_for_entry_fill(signal, order_id, baseline_quantity)
             if not position:
+                with self._trade_lock:
+                    self._reserved_entry_margin -= reserved_margin
+                    reserved_margin = 0
                 self._push_log(
                     f"Entry order {order_id} for {symbol} not filled. Not tracking as active trade.",
                     level="warning",
@@ -273,6 +301,10 @@ class TradingEngine:
                 except Exception:
                     pass
                 return False
+
+            with self._trade_lock:
+                self._reserved_entry_margin -= reserved_margin
+                reserved_margin = 0
 
             stop_order_id = self._place_protective_stop(
                 signal,
@@ -344,6 +376,10 @@ class TradingEngine:
                 }
             return True
         except Exception as e:
+            with self._trade_lock:
+                self._reserved_entry_margin = max(
+                    0, self._reserved_entry_margin - locals().get("reserved_margin", 0)
+                )
             self._push_log(f"Failed to execute signal: {e}")
             return False
 
@@ -755,19 +791,48 @@ class TradingEngine:
         except Exception as e:
             self._push_log(f"Error in square off: {e}")
 
-    def _wait_for_entry_fill(self, signal: dict, order_id: str) -> dict:
+    def _wait_for_entry_fill(
+        self, signal: dict, order_id: str, baseline_quantity: int = 0
+    ) -> dict:
         deadline = time.time() + self._entry_fill_timeout_seconds
         symbol = signal["tradingsymbol"]
         direction = signal["direction"]
         while time.time() <= deadline:
             position = self._find_live_position(symbol, direction)
-            if position:
+            filled_quantity = abs(position.get("quantity", 0)) if position else 0
+            order = self._find_order(order_id)
+            if position and (
+                not order
+                or filled_quantity > baseline_quantity
+                and str(order.get("status", "")).upper()
+                in {
+                    "COMPLETE",
+                    "CANCELLED",
+                }
+            ):
                 return position
 
-            if self._is_order_closed_without_fill(order_id):
+            if order and str(order.get("status", "")).upper() in {
+                "REJECTED",
+                "CANCELLED",
+            }:
                 return {}
 
             time.sleep(self._entry_fill_poll_seconds)
+
+        try:
+            kite_client.cancel_order("regular", order_id)
+        except Exception:
+            pass
+        position = self._find_live_position(symbol, direction)
+        if abs(position.get("quantity", 0)) > baseline_quantity:
+            return position
+        return {}
+
+    def _find_order(self, order_id: str) -> dict:
+        for order in kite_client.get_orders():
+            if str(order.get("orderId")) == str(order_id):
+                return order
         return {}
 
     def _find_live_position(self, symbol: str, direction: str) -> dict:
