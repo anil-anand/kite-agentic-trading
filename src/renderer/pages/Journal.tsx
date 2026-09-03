@@ -342,6 +342,13 @@ const Journal: React.FC = () => {
 
   const renderAnalytics = () => (
     <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
+      {expectancy.length === 0 && confluence.length === 0 && calibration.length === 0 && exitReasons.length === 0 && (
+        <div className="bg-surface-800 rounded-xl p-6 border border-surface-700 text-center">
+          <p className="text-surface-200 font-medium">No completed trades to analyze yet.</p>
+          <p className="text-surface-400 text-sm mt-2">Analytics will appear after trades are closed.</p>
+        </div>
+      )}
+
       {/* Expectancy */}
       <div className="bg-surface-800 rounded-xl p-6 border border-surface-700 shadow-lg">
         <h3 className="text-lg font-semibold text-white mb-6 flex items-center">
