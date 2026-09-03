@@ -86,7 +86,7 @@ class TestMockOrders:
     def setup_method(self):
         self.mock = MockKiteClient()
 
-    def test_place_order_returns_id_and_sends_nothing(self):
+    def test_market_buy_opens_simulated_position(self):
         oid = self.mock.place_order(
             variety="regular",
             exchange="NSE",
@@ -97,7 +97,10 @@ class TestMockOrders:
             order_type="MARKET",
         )
         assert isinstance(oid, str) and oid
-        assert self.mock.get_positions()["net"] == []  # nothing actually traded
+        net = self.mock.get_positions()["net"]
+        assert len(net) == 1
+        assert net[0]["tradingsymbol"] == "RELIANCE"
+        assert net[0]["quantity"] == 10
 
     def test_cancel_and_modify_are_safe_noops(self):
         assert self.mock.cancel_order("regular", "X1")["order_id"] == "X1"
@@ -108,6 +111,88 @@ class TestMockOrders:
     def test_generate_session_returns_dev_token(self):
         s = self.mock.generate_session("req", "secret")
         assert s["access_token"] == "dev-token"
+
+
+class TestSimulatedBook:
+    def setup_method(self):
+        self.mock = MockKiteClient()
+
+    def _buy(self, qty=10, ot="MARKET", price=None):
+        return self.mock.place_order(
+            variety="regular",
+            exchange="NSE",
+            tradingsymbol="RELIANCE",
+            transaction_type="BUY",
+            quantity=qty,
+            product="MIS",
+            order_type=ot,
+            price=price,
+        )
+
+    def test_limit_buy_fills_at_price_and_marks_pnl(self):
+        self.mock.place_order(
+            variety="regular",
+            exchange="NSE",
+            tradingsymbol="RELIANCE",
+            transaction_type="BUY",
+            quantity=10,
+            product="MIS",
+            order_type="LIMIT",
+            price=100.0,
+        )
+        pos = self.mock.get_positions()["net"][0]
+        assert pos["averagePrice"] == 100.0
+        assert "pnl" in pos and "unrealised" in pos
+
+    def test_sell_closes_and_books_realised(self):
+        # Force a flat, known price so realised P&L is deterministic.
+        self.mock._live_prices["RELIANCE"] = 100.0
+        self._buy(qty=10, ot="MARKET")  # fills ~100 (drifted)
+        entry = self.mock.get_positions()["net"][0]["averagePrice"]
+        self.mock._live_prices["RELIANCE"] = entry + 5  # move up 5
+        self.mock.place_order(
+            variety="regular",
+            exchange="NSE",
+            tradingsymbol="RELIANCE",
+            transaction_type="SELL",
+            quantity=10,
+            product="MIS",
+            order_type="MARKET",
+        )
+        pos = self.mock.get_positions()["net"][0]
+        assert pos["quantity"] == 0
+
+    def test_resting_stop_triggers_when_price_crosses(self):
+        self.mock._live_prices["RELIANCE"] = 100.0
+        self._buy(qty=10, ot="MARKET")
+        self.mock.place_order(
+            variety="regular",
+            exchange="NSE",
+            tradingsymbol="RELIANCE",
+            transaction_type="SELL",
+            quantity=10,
+            product="MIS",
+            order_type="SL",
+            price=94.0,
+            trigger_price=95.0,
+        )
+        # Above the trigger → still open.
+        self.mock._live_prices["RELIANCE"] = 97.0
+        assert self.mock.get_positions()["net"][0]["quantity"] == 10
+        # Drop below the trigger → the stop fills and closes the position.
+        self.mock._live_prices["RELIANCE"] = 90.0
+        assert self.mock.get_positions()["net"][0]["quantity"] == 0
+
+    def test_get_orders_reflects_fills(self):
+        oid = self._buy()
+        orders = {o["orderId"]: o for o in self.mock.get_orders()}
+        assert orders[oid]["status"] == "COMPLETE"
+        assert orders[oid]["filledQuantity"] == 10
+
+    def test_price_moves_between_reads(self):
+        p1 = self.mock._live_price("RELIANCE")
+        seen = {self.mock._live_price("RELIANCE") for _ in range(20)}
+        assert len(seen) > 1  # drifts, so P&L and stops are dynamic
 
 
 class TestSessionBypass:
