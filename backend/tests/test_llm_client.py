@@ -123,6 +123,52 @@ def test_ollama_request_has_no_authorization_header(monkeypatch):
     assert captured["request"].full_url == "http://localhost:11434/api/chat"
 
 
+def test_ollama_cloud_request_uses_api_key_and_cloud_endpoint(monkeypatch):
+    captured = {}
+
+    def fake_urlopen(req, timeout):
+        captured["request"] = req
+        return FakeResponse({"message": {"content": "cloud analysis"}})
+
+    monkeypatch.setattr("backend.llm_client.request.urlopen", fake_urlopen)
+
+    result = OpenAICompatibleClient().generate(
+        "http://localhost:11434", "cloud-key", "llama3.2", "prompt", provider="Ollama"
+    )
+
+    assert result == "cloud analysis"
+    assert captured["request"].full_url == "https://ollama.com/api/chat"
+    assert captured["request"].headers["Authorization"] == "Bearer cloud-key"
+
+
+def test_ollama_cloud_model_discovery_validates_api_key(monkeypatch):
+    captured = {}
+
+    def fake_urlopen(req, timeout):
+        captured["request"] = req
+        return FakeResponse({"models": [{"name": "cloud-model"}]})
+
+    monkeypatch.setattr("backend.llm_client.request.urlopen", fake_urlopen)
+
+    assert OpenAICompatibleClient().discover_models(
+        "Ollama", "http://localhost:11434", "cloud-key"
+    ) == ["cloud-model"]
+    assert captured["request"].full_url == "https://ollama.com/api/tags"
+    assert captured["request"].headers["Authorization"] == "Bearer cloud-key"
+
+
+def test_ollama_cloud_rejects_invalid_api_key(monkeypatch):
+    def fake_urlopen(req, timeout):
+        raise HTTPError(req.full_url, 401, "Unauthorized", {}, None)
+
+    monkeypatch.setattr("backend.llm_client.request.urlopen", fake_urlopen)
+
+    with pytest.raises(RuntimeError, match="HTTP 401"):
+        OpenAICompatibleClient().discover_models(
+            "Ollama", "http://localhost:11434", "invalid-key"
+        )
+
+
 def test_discover_models_uses_provider_endpoint_and_normalizes_models(monkeypatch):
     captured = {}
 

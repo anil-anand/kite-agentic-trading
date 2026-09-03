@@ -24,6 +24,7 @@ PROVIDER_PRESETS = {
     },
     "Ollama": {
         "baseUrl": "http://localhost:11434",
+        "cloudBaseUrl": "https://ollama.com",
         "model": "llama3.2",
         "requiresApiKey": False,
     },
@@ -36,6 +37,12 @@ PROVIDER_PRESETS = {
 
 
 class OpenAICompatibleClient:
+    @staticmethod
+    def _resolve_base_url(provider, base_url, api_key):
+        if provider == "Ollama" and api_key:
+            return PROVIDER_PRESETS["Ollama"]["cloudBaseUrl"]
+        return base_url
+
     @staticmethod
     def _content(body, path):
         try:
@@ -77,7 +84,7 @@ class OpenAICompatibleClient:
         return {}
 
     def generate(self, base_url, api_key, model, prompt, provider="OpenAI"):
-        base_url = base_url.rstrip("/")
+        base_url = self._resolve_base_url(provider, base_url, api_key).rstrip("/")
         headers = self._headers(provider, api_key)
         if provider == "Anthropic":
             body = self._request(
@@ -131,9 +138,13 @@ class OpenAICompatibleClient:
         return content
 
     def discover_models(self, provider, base_url, api_key):
-        base_url = base_url.rstrip("/")
+        base_url = self._resolve_base_url(provider, base_url, api_key).rstrip("/")
         if provider == "Ollama":
-            body = self._request(f"{base_url}/api/tags", api_key, headers={})
+            body = self._request(
+                f"{base_url}/api/tags",
+                api_key,
+                headers=self._headers(provider, api_key),
+            )
             models = [item.get("name") for item in body.get("models", [])]
         elif provider == "Gemini":
             body = self._request(
