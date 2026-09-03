@@ -184,7 +184,7 @@ export interface Margins {
 
 export type StrategyName = 'ema_crossover' | 'rsi_reversal' | 'vwap_bounce' | 'supertrend';
 export type SignalDirection = 'BUY' | 'SELL';
-export type AgentMode = 'auto' | 'confirm';
+export type AgentMode = 'auto' | 'confirm' | 'paper';
 
 export interface Signal {
   id: string;
