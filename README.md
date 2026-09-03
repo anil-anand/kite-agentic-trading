@@ -23,7 +23,7 @@ The app features a modern Electron/React frontend communicating with a high-perf
 
 * **Frontend**: Electron, React 18, TypeScript, Tailwind CSS, Zustand (with local persistence), Vite.
 * **Backend**: Python 3, `kiteconnect`, `pandas`, `ta` (Technical Analysis), custom JSON-RPC bridge.
-* **Security**: API keys are locally encrypted using `cryptography.fernet` and stored in `~/.kite-agentic-trading/config.json`.
+* **Security**: Kite and BYOK LLM API keys are locally encrypted using `cryptography.fernet` and stored in `~/.kite-agentic-trading/config.json`.
 
 ## 📦 Prerequisites
 
@@ -71,6 +71,8 @@ npm run dev
 ```
 
 On your first launch, navigate to the **Settings** tab to enter your Kite API Key and API Secret. The app will encrypt and save them locally.
+
+To enable Journal post-mortems, open **Settings > BYOK LLM Post-Mortems** and enter a provider, OpenAI-compatible base URL, model, and API key. The default Gemini profile uses `https://generativelanguage.googleapis.com/v1beta/openai` with `gemini-2.5-flash`. For OpenAI, use `https://api.openai.com/v1` and a compatible model such as `gpt-4o-mini`. Any provider exposing `/chat/completions` can be configured with its custom base URL. API keys are encrypted locally and are never returned to the renderer in plaintext.
 
 ## 🧰 Installing the Application
 

@@ -6,7 +6,14 @@ export interface KiteCredentials {
   accessToken?: string;
   userId?: string;
   userName?: string;
-  llmApiKey?: string;
+}
+
+export interface LLMSettings {
+  provider: string;
+  baseUrl: string;
+  model: string;
+  apiKey: string;
+  apiKeyConfigured?: boolean;
 }
 
 export interface AuthState {
@@ -293,6 +300,7 @@ export interface WatchlistItem {
 
 export interface AppSettings {
   credentials: KiteCredentials;
+  llm: LLMSettings;
   risk: RiskConfig;
   strategies: StrategyConfig;
   watchlist: string[]; // ["NSE:RELIANCE", "NSE:INFY", ...]

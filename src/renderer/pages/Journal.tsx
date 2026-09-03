@@ -290,7 +290,7 @@ const Journal: React.FC = () => {
                               ) : (
                                 <div className="bg-surface-800 p-6 rounded-lg border border-surface-700 shadow-md">
                                   <h4 className="flex items-center text-sm font-semibold text-accent-light mb-4 uppercase tracking-widest">
-                                    <Cpu size={16} className="mr-2" /> Gemini AI Analysis
+                                    <Cpu size={16} className="mr-2" /> AI Analysis
                                   </h4>
                                   <div className="prose prose-invert prose-sm max-w-none prose-p:leading-relaxed prose-headings:text-white prose-a:text-accent-light">
                                     {/* Using a simple replace for markdown since we don't have react-markdown */}

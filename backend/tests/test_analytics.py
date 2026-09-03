@@ -1,6 +1,6 @@
 import sqlite3
 from datetime import datetime, timedelta
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -171,15 +171,18 @@ def test_what_if_analysis(mock_replay, temp_db):
 
 
 @patch("backend.config.config_manager.get_credentials")
-@patch("google.genai.Client")
-def test_llm_post_mortem(mock_genai_client, mock_get_credentials, temp_db):
+@patch("backend.config.config_manager.get_llm_settings")
+@patch("backend.analytics.OpenAICompatibleClient.generate")
+def test_llm_post_mortem(
+    mock_generate, mock_get_llm_settings, mock_get_credentials, temp_db
+):
     mock_get_credentials.return_value = {"llmApiKey": "fake_key"}
-
-    mock_client = MagicMock()
-    mock_response = MagicMock()
-    mock_response.text = "This is a post-mortem analysis."
-    mock_client.models.generate_content.return_value = mock_response
-    mock_genai_client.return_value = mock_client
+    mock_get_llm_settings.return_value = {
+        "provider": "Gemini",
+        "baseUrl": "https://example.test/v1",
+        "model": "gemini-2.5-flash",
+    }
+    mock_generate.return_value = "This is a post-mortem analysis."
 
     analytics = TradeAnalytics(db_path=temp_db)
     # create table trade_events in temp_db for this test to not crash
@@ -198,3 +201,4 @@ def test_llm_post_mortem(mock_genai_client, mock_get_credentials, temp_db):
     res = analytics.generate_llm_post_mortem("1")
     assert "error" not in res
     assert res["analysis"] == "This is a post-mortem analysis."
+    mock_generate.assert_called_once()

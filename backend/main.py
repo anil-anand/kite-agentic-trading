@@ -132,11 +132,10 @@ def handle_request(req):
             return success(trading_engine.status())
 
         elif method == "get_settings":
-            return success(config_manager.config)
+            return success(config_manager.get_settings())
 
         elif method == "save_settings":
-            config_manager.config.update(params)
-            config_manager.save()
+            config_manager.save_settings(params)
             return success({"status": "saved"})
 
         elif method == "save_llm_api_key":

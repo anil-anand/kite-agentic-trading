@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useTradingStore } from '../stores/trading-store';
 import { SETTINGS_SAVE } from '@shared/ipc-channels';
+import { LLMSettings } from '@shared/types';
 
 const Settings: React.FC = () => {
   const { settings, setSettings } = useTradingStore();
@@ -12,9 +13,7 @@ const Settings: React.FC = () => {
   useEffect(() => {
     if (settings) {
       setLocalSettings(settings);
-      if (settings.credentials?.llmApiKey) {
-        setLlmKey(settings.credentials.llmApiKey);
-      }
+      setLlmKey('');
     }
   }, [settings]);
 
@@ -38,21 +37,33 @@ const Settings: React.FC = () => {
     });
   };
 
+  const updateLlm = (changes: Partial<LLMSettings>) => {
+    setLocalSettings((prev: any) => prev ? ({ ...prev, llm: { ...prev.llm, ...changes } }) : prev);
+  };
+
+  const handleProviderChange = (provider: string) => {
+    const presets: Record<string, Partial<LLMSettings>> = {
+      Gemini: {
+        baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
+        model: 'gemini-2.5-flash',
+      },
+      OpenAI: {
+        baseUrl: 'https://api.openai.com/v1',
+        model: 'gpt-4o-mini',
+      },
+    };
+    updateLlm({ provider, ...(presets[provider] || {}) });
+  };
+
   const saveChanges = async () => {
     try {
       setSaveStatus('Saving...');
-      await window.electronAPI?.invoke(SETTINGS_SAVE, localSettings);
+      await window.electronAPI?.invoke(SETTINGS_SAVE, {
+        ...localSettings,
+        llm: { ...localSettings.llm, apiKey: llmKey },
+      });
       
-      // Save LLM key via specific endpoint if it changed
-      if (llmKey !== (settings?.credentials?.llmApiKey || '')) {
-        await window.electronAPI?.settings.saveLlmKey(llmKey);
-        // Optimistically update the store copy
-        if (localSettings.credentials) {
-          localSettings.credentials.llmApiKey = llmKey;
-        }
-      }
-      
-      setSettings(localSettings);
+      setSettings({ ...localSettings, llm: { ...localSettings.llm, apiKey: '' } });
       setSaveStatus('Saved successfully!');
       setTimeout(() => setSaveStatus(''), 3000);
     } catch (error) {
@@ -105,19 +116,48 @@ const Settings: React.FC = () => {
           </section>
 
           <section className="bg-surface-800 p-6 rounded-xl border border-surface-700">
-            <h2 className="text-lg font-semibold text-white mb-4">Google Gemini API (LLM Post-Mortems)</h2>
+            <h2 className="text-lg font-semibold text-white mb-4">BYOK LLM Post-Mortems</h2>
             <div className="space-y-4">
               <div>
-                <label className="block text-surface-400 text-sm mb-1">Gemini API Key</label>
+                <label className="block text-surface-400 text-sm mb-1">Provider</label>
+                <select
+                  value={localSettings.llm?.provider || 'Gemini'}
+                  onChange={(e) => handleProviderChange(e.target.value)}
+                  className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white"
+                >
+                  <option>Gemini</option>
+                  <option>OpenAI</option>
+                  <option>Custom</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-surface-400 text-sm mb-1">Base URL</label>
+                <input
+                  type="url"
+                  value={localSettings.llm?.baseUrl || ''}
+                  onChange={(e) => updateLlm({ baseUrl: e.target.value })}
+                  className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white focus:border-accent-light outline-none"
+                />
+              </div>
+              <div>
+                <label className="block text-surface-400 text-sm mb-1">Model</label>
+                <input
+                  value={localSettings.llm?.model || ''}
+                  onChange={(e) => updateLlm({ model: e.target.value })}
+                  className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white focus:border-accent-light outline-none"
+                />
+              </div>
+              <div>
+                <label className="block text-surface-400 text-sm mb-1">API Key</label>
                 <input 
                   type="password" 
                   value={llmKey} 
                   onChange={(e) => setLlmKey(e.target.value)}
-                  placeholder="AIzaSy..."
+                  placeholder={localSettings.llm?.apiKeyConfigured ? 'Key saved (enter to replace)' : 'Enter provider API key'}
                   className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white focus:border-accent-light outline-none" 
                 />
               </div>
-              <p className="text-xs text-surface-500">Used for generating AI-powered trade post-mortems in the Journal. Stored securely and encrypted.</p>
+              <p className="text-xs text-surface-500">Used for trade post-mortems in the Journal. Compatible with Gemini, OpenAI, and custom OpenAI-compatible endpoints. Stored encrypted.</p>
             </div>
           </section>
 

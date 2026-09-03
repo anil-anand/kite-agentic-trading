@@ -1,4 +1,5 @@
 import json
+from copy import deepcopy
 from pathlib import Path
 
 from cryptography.fernet import Fernet
@@ -65,7 +66,13 @@ class ConfigManager:
                 "ULTRACEMCO",
                 "NESTLEIND",
             ],
-            "credentials": {"apiKey": "", "apiSecret": "", "llmApiKey": ""},
+            "credentials": {"apiKey": "", "apiSecret": ""},
+            "llm": {
+                "provider": "Gemini",
+                "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai",
+                "model": "gemini-2.5-flash",
+                "apiKey": "",
+            },
             "mode": "auto",
         }
 
@@ -105,17 +112,28 @@ class ConfigManager:
                     loaded = json.load(f)
 
                 # Merge with defaults to ensure new keys/strategies are present
-                self.config = self.default_config.copy()
+                self.config = deepcopy(self.default_config)
                 for k, v in loaded.items():
                     if isinstance(v, dict) and k in self.config:
                         self.config[k].update(v)
                     else:
                         self.config[k] = v
             except json.JSONDecodeError:
-                self.config = self.default_config.copy()
+                self.config = deepcopy(self.default_config)
         else:
-            self.config = self.default_config.copy()
+            self.config = deepcopy(self.default_config)
             self.save()
+
+        self._migrate_legacy_llm_key()
+
+    def _migrate_legacy_llm_key(self):
+        legacy_key = self.config.get("credentials", {}).get("llmApiKey", "")
+        llm = self.config.setdefault("llm", deepcopy(self.default_config["llm"]))
+        if legacy_key and not llm.get("apiKey"):
+            decrypted_key = self._decrypt(legacy_key)
+            if decrypted_key:
+                llm["apiKey"] = self._encrypt(decrypted_key)
+                self.save()
 
     def save(self):
         with open(self.config_file, "w") as f:
@@ -123,12 +141,56 @@ class ConfigManager:
 
     def get_credentials(self):
         creds = self.config.get("credentials", {})
+        llm = self.config.get("llm", {})
+        encrypted_llm_key = llm.get("apiKey") or creds.get("llmApiKey", "")
         return {
             "apiKey": self._decrypt(creds.get("apiKey", "")),
             "apiSecret": self._decrypt(creds.get("apiSecret", "")),
             "accessToken": self._decrypt(creds.get("accessToken", "")),
-            "llmApiKey": self._decrypt(creds.get("llmApiKey", "")),
+            "llmApiKey": self._decrypt(encrypted_llm_key),
         }
+
+    def get_llm_settings(self):
+        return deepcopy(self.config.get("llm", self.default_config["llm"]))
+
+    def get_settings(self):
+        settings = deepcopy(self.config)
+        settings.setdefault("llm", deepcopy(self.default_config["llm"]))
+        settings["llm"]["apiKey"] = ""
+        settings["llm"]["apiKeyConfigured"] = bool(
+            self.config["llm"].get("apiKey")
+            or self.config.get("credentials", {}).get("llmApiKey")
+        )
+        settings["credentials"] = {key: "" for key in settings.get("credentials", {})}
+        return settings
+
+    def save_settings(self, settings: dict):
+        incoming = deepcopy(settings)
+        incoming_llm = incoming.pop("llm", None)
+        incoming_credentials = incoming.pop("credentials", None)
+        for key, value in incoming.items():
+            if isinstance(value, dict) and isinstance(self.config.get(key), dict):
+                self.config[key].update(value)
+            else:
+                self.config[key] = value
+
+        if incoming_credentials is not None:
+            credentials = self.config.setdefault("credentials", {})
+            for key in ("apiKey", "apiSecret", "accessToken"):
+                value = incoming_credentials.get(key, "")
+                if value and value != "********":
+                    credentials[key] = self._encrypt(value)
+
+        if incoming_llm is not None:
+            current_llm = self.config.setdefault(
+                "llm", deepcopy(self.default_config["llm"])
+            )
+            api_key = incoming_llm.pop("apiKey", "")
+            incoming_llm.pop("apiKeyConfigured", None)
+            current_llm.update(incoming_llm)
+            if api_key and api_key != "********":
+                current_llm["apiKey"] = self._encrypt(api_key)
+        self.save()
 
     def save_credentials(self, api_key: str, api_secret: str, access_token: str = ""):
         if "credentials" not in self.config:
@@ -141,10 +203,8 @@ class ConfigManager:
         self.save()
 
     def save_llm_api_key(self, llm_api_key: str):
-        if "credentials" not in self.config:
-            self.config["credentials"] = {}
-
-        self.config["credentials"]["llmApiKey"] = self._encrypt(llm_api_key)
+        self.config.setdefault("llm", deepcopy(self.default_config["llm"]))
+        self.config["llm"]["apiKey"] = self._encrypt(llm_api_key)
         self.save()
 
     def get_risk_config(self):
