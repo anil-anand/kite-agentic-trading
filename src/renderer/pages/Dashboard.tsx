@@ -33,8 +33,8 @@ const Dashboard: React.FC = () => {
         if (posResponse && posResponse.net) {
            setPositions(posResponse.net);
         }
-      } catch (err) {
-        console.error("Failed to fetch dashboard data:", err);
+      } catch (err: any) {
+        console.error("Failed to fetch dashboard data:", err.message || JSON.stringify(err));
       }
     };
     fetchData();

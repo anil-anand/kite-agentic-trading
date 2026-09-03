@@ -133,7 +133,8 @@ class PythonBridge {
       
       if (pendingReq) {
         if (response.error) {
-          pendingReq.reject(response.error);
+          const errMsg = response.error.message || JSON.stringify(response.error);
+          pendingReq.reject(new Error(errMsg));
         } else {
           pendingReq.resolve(response.result);
         }

@@ -50,6 +50,12 @@ def handle_request(req):
             kite_client.init(api_key)
             kite_client.set_access_token(access_token)
 
+            # Verify the token is actually still valid with the Kite API
+            try:
+                kite_client.get_margins()
+            except Exception:
+                return success({"is_valid": False})
+
             # Start ticker on resume
             ticker_manager.start(api_key, access_token)
 
