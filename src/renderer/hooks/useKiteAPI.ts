@@ -97,11 +97,51 @@ export const useKiteAPI = () => {
              store.setAgentState({ mode: 'auto' });
            }
            store.setSettings(settings);
+
+           // Populate the watchlist from the configured symbols and subscribe
+           // to their live ticks so prices update.
+           if (Array.isArray(settings.watchlist) && settings.watchlist.length > 0) {
+             await loadWatchlist(settings.watchlist);
+           }
         }
       } catch (e) {
         console.error("Init Error", e);
       }
     };
+
+    const loadWatchlist = async (symbols: string[]) => {
+      try {
+        const instruments = await window.electronAPI?.invoke(IPC.MARKET_INSTRUMENTS, 'NSE') || [];
+        const tokenBySymbol: Record<string, number> = {};
+        for (const i of instruments) {
+          tokenBySymbol[i.tradingsymbol] = i.instrument_token;
+        }
+        const keys = symbols.map(s => `NSE:${s}`);
+        const ltpMap = await window.electronAPI?.invoke(IPC.MARKET_LTP, keys) || {};
+
+        const items = symbols
+          .filter(s => tokenBySymbol[s])
+          .map(s => ({
+            tradingsymbol: s,
+            exchange: 'NSE',
+            instrumentToken: tokenBySymbol[s],
+            lastPrice: ltpMap[`NSE:${s}`]?.last_price || 0,
+            change: 0,
+            changePercent: 0,
+            open: 0, high: 0, low: 0, close: 0, volume: 0,
+            activeSignals: [],
+          }));
+
+        store.setWatchlist(items as any);
+        const tokens = items.map(i => i.instrumentToken);
+        if (tokens.length > 0) {
+          await window.electronAPI?.invoke(IPC.TICKER_SUBSCRIBE, tokens);
+        }
+      } catch (e) {
+        console.error("Failed to load watchlist", e);
+      }
+    };
+
     init();
 
     return () => {
