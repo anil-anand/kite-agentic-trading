@@ -384,11 +384,16 @@ class TradingEngine:
                 tracked = set(self.active_trades.keys())
                 pending = set(self._pending_entries)
 
-            # Manual closures: cancel the broker stop (network), then drop tracking.
+            # Manual closures: the position is flat but we still track it — it was
+            # closed outside the app-side exit path, most often by the broker-side
+            # protective stop filling (also: a manual close in the Kite app). Book
+            # the close in the journal so the trade doesn't stay OPEN forever and
+            # is included in analytics, then cancel any leftover stop and drop it.
             for symbol in symbols_to_remove:
                 self._push_log(
-                    f"Detected manual closure for {symbol}. Removing from tracking."
+                    f"Detected external closure for {symbol}. Removing from tracking."
                 )
+                self._journal_external_close(symbol)
                 self._cancel_protective_stop(symbol)
                 with self._trade_lock:
                     self.active_trades.pop(symbol, None)
@@ -974,6 +979,48 @@ class TradingEngine:
                     )
                     del self.active_trades[symbol]
             break
+
+    def _journal_external_close(self, symbol: str):
+        """Book a journal close for a position closed outside the app-side exit
+        path (broker-stop fill or a manual close in Kite). Uses the current LTP
+        as the exit price and infers the reason from the protective stop's
+        status."""
+        with self._trade_lock:
+            trade = self.active_trades.get(symbol)
+            if not trade:
+                return
+            trade_id = trade.get("trade_id")
+            stop_order_id = trade.get("stop_order_id")
+            exchange = trade.get("exchange", "NSE")
+        if not trade_id:
+            return
+
+        # Exit price: best available post-hoc estimate is the current LTP.
+        exit_price = 0.0
+        try:
+            data = kite_client.get_ltp([f"{exchange}:{symbol}"])
+            exit_price = (data.get(f"{exchange}:{symbol}") or {}).get("last_price", 0.0)
+        except Exception:
+            pass
+
+        # If the protective stop shows COMPLETE, the stop closed it.
+        reason = "closed_externally"
+        if stop_order_id:
+            try:
+                for o in kite_client.get_orders():
+                    if str(o.get("orderId")) == str(stop_order_id):
+                        if str(o.get("status", "")).upper() == "COMPLETE":
+                            reason = "stop_loss"
+                        break
+            except Exception:
+                pass
+
+        try:
+            journal.close_trade(trade_id, exit_price, reason)
+        except Exception as e:
+            self._push_log(
+                f"Error closing trade in journal for {symbol}: {e}", level="error"
+            )
 
 
 trading_engine = TradingEngine()
