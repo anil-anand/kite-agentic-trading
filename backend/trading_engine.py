@@ -244,6 +244,8 @@ class TradingEngine:
         entry_price = self._round_to_tick(signal["entryPrice"], tick_size)
 
         try:
+            baseline_position = self._find_live_position(symbol, signal["direction"])
+            baseline_quantity = abs(baseline_position.get("quantity", 0))
             # Serialize the margin snapshot, sizing, and submission so concurrent
             # scanner callbacks cannot reserve the same available margin.
             with self._trade_lock:
@@ -285,7 +287,7 @@ class TradingEngine:
             )
 
             # Wait for fill — NO LOCK held; this blocks up to 15 seconds.
-            position = self._wait_for_entry_fill(signal, order_id)
+            position = self._wait_for_entry_fill(signal, order_id, baseline_quantity)
             if not position:
                 with self._trade_lock:
                     self._reserved_entry_margin -= reserved_margin
@@ -784,19 +786,48 @@ class TradingEngine:
         except Exception as e:
             self._push_log(f"Error in square off: {e}")
 
-    def _wait_for_entry_fill(self, signal: dict, order_id: str) -> dict:
+    def _wait_for_entry_fill(
+        self, signal: dict, order_id: str, baseline_quantity: int = 0
+    ) -> dict:
         deadline = time.time() + self._entry_fill_timeout_seconds
         symbol = signal["tradingsymbol"]
         direction = signal["direction"]
         while time.time() <= deadline:
             position = self._find_live_position(symbol, direction)
-            if position:
+            filled_quantity = abs(position.get("quantity", 0)) if position else 0
+            order = self._find_order(order_id)
+            if position and (
+                not order
+                or filled_quantity > baseline_quantity
+                and str(order.get("status", "")).upper()
+                in {
+                    "COMPLETE",
+                    "CANCELLED",
+                }
+            ):
                 return position
 
-            if self._is_order_closed_without_fill(order_id):
+            if order and str(order.get("status", "")).upper() in {
+                "REJECTED",
+                "CANCELLED",
+            }:
                 return {}
 
             time.sleep(self._entry_fill_poll_seconds)
+
+        try:
+            kite_client.cancel_order("regular", order_id)
+        except Exception:
+            pass
+        position = self._find_live_position(symbol, direction)
+        if abs(position.get("quantity", 0)) > baseline_quantity:
+            return position
+        return {}
+
+    def _find_order(self, order_id: str) -> dict:
+        for order in kite_client.get_orders():
+            if str(order.get("orderId")) == str(order_id):
+                return order
         return {}
 
     def _find_live_position(self, symbol: str, direction: str) -> dict:
