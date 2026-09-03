@@ -237,9 +237,21 @@ class TradingEngine:
             self._push_log(f"Cannot execute signal {signal['id']}: {reason}")
             return False
 
+        margins = kite_client.get_margins()
+        equity_margin = margins.get("equity", {})
+        available_margin = equity_margin.get("available", {}).get("live_balance", 0)
+        if not available_margin:
+            available_margin = equity_margin.get("net", 0)
+
         qty = risk_manager.calculate_position_size(
-            signal["entryPrice"], signal["stopLoss"]
+            signal["entryPrice"], signal["stopLoss"], available_margin
         )
+        if qty <= 0:
+            self._push_log(
+                f"Cannot execute signal {signal['id']}: insufficient available margin",
+                level="warning",
+            )
+            return False
 
         transaction_type = "BUY" if signal["direction"] == "BUY" else "SELL"
         exchange = signal.get("exchange", "NSE")

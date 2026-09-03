@@ -11,6 +11,7 @@ class FakeKiteClient:
         self.cancel_calls = []
         self.modify_calls = []
         self._next_id = 1
+        self.margins = {"equity": {"available": {"live_balance": 10_000}}}
 
     def place_order(self, **kwargs):
         self.place_calls.append(kwargs)
@@ -32,6 +33,9 @@ class FakeKiteClient:
 
     def get_positions(self):
         return self.positions
+
+    def get_margins(self):
+        return self.margins
 
     def get_orders(self):
         return self.orders
@@ -72,7 +76,7 @@ class FakeRiskManager:
     def can_trade(self):
         return True, "OK"
 
-    def calculate_position_size(self, price, stop_loss):
+    def calculate_position_size(self, price, stop_loss, available_margin=None):
         return 10
 
     def set_open_positions(self, count):
@@ -127,6 +131,22 @@ def test_execute_signal_places_protective_stop_and_tracks_trade(monkeypatch):
     assert fake_client.place_calls[1]["price"] == 94.05
     assert "RELIANCE" in engine.active_trades
     assert engine.active_trades["RELIANCE"]["stop_order_id"] == "OID2"
+
+
+def test_execute_signal_does_not_submit_when_margin_cannot_fund_entry(monkeypatch):
+    import backend.trading_engine as te
+
+    fake_client = FakeKiteClient()
+    fake_client.margins = {"equity": {"available": {"live_balance": 99}}}
+    fake_risk = FakeRiskManager()
+    fake_risk.calculate_position_size = lambda price, stop_loss, available_margin: 0
+    monkeypatch.setattr(te, "kite_client", fake_client)
+    monkeypatch.setattr(te, "risk_manager", fake_risk)
+
+    engine = TradingEngine()
+
+    assert engine.execute_signal(_sample_signal()) is False
+    assert fake_client.place_calls == []
 
 
 def test_execute_signal_does_not_track_unfilled_order(monkeypatch):
