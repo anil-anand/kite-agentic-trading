@@ -189,6 +189,16 @@ class TestSimulatedBook:
         assert orders[oid]["status"] == "COMPLETE"
         assert orders[oid]["filledQuantity"] == 10
 
+    def test_orders_carry_a_valid_timestamp(self):
+        # The Orders UI does new Date(orderTimestamp); a missing/invalid value
+        # renders "Invalid Date".
+        import datetime as _dt
+
+        self._buy()
+        o = self.mock.get_orders()[0]
+        assert "orderTimestamp" in o
+        _dt.datetime.fromisoformat(o["orderTimestamp"])  # parses -> valid date
+
     def test_price_moves_between_reads(self):
         seen = {self.mock._live_price("RELIANCE") for _ in range(20)}
         assert len(seen) > 1  # drifts, so P&L and stops are dynamic
