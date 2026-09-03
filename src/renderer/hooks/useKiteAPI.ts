@@ -58,18 +58,18 @@ export const useKiteAPI = () => {
   useEffect(() => {
     if (!window.electronAPI) return;
 
-    const unsubTick = window.electronAPI.on(IPC.TICKER_TICK, (event: any, data: any) => {
+    window.electronAPI.on(IPC.TICKER_TICK, (event: any, data: any) => {
        if (data && data.tradingsymbol) {
          store.updateTick(data.tradingsymbol, data);
        }
     });
-    const unsubSignal = window.electronAPI.on(IPC.AGENT_SIGNAL, (event: any, data: any) => {
+    window.electronAPI.on(IPC.AGENT_SIGNAL, (event: any, data: any) => {
        store.addSignal(data);
     });
-    const unsubLog = window.electronAPI.on(IPC.LOG_ENTRY, (event: any, data: any) => {
+    window.electronAPI.on(IPC.LOG_ENTRY, (event: any, data: any) => {
        store.addLogEntry(data);
     });
-    const unsubAgentState = window.electronAPI.on(IPC.AGENT_STATE_UPDATE, (event: any, data: any) => {
+    window.electronAPI.on(IPC.AGENT_STATE_UPDATE, (event: any, data: any) => {
        store.setAgentState(data);
     });
 
