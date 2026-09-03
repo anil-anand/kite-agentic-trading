@@ -43,9 +43,11 @@ def handle_request(req):
             return success({"login_url": kite_client.login_url()})
 
         elif method == "check_session":
-            # Development bypass: no Zerodha login required, and no real ticker
-            # websocket to start — the mock client serves everything.
+            # Development bypass: no Zerodha login required. Start the ticker so
+            # the synthetic dev emitter can feed the Watchlist (it uses the mock
+            # client, not a real websocket).
             if is_dev_mode():
+                ticker_manager.start("dev", "dev")
                 return success({"is_valid": True})
 
             creds = config_manager.get_credentials()
@@ -131,6 +133,19 @@ def handle_request(req):
 
         elif method == "search_instruments":
             return success(kite_client.search_instruments(params.get("query", "")))
+
+        elif method == "ticker_subscribe":
+            ticker_manager.subscribe(params.get("tokens", []))
+            return success(
+                {"status": "subscribed", "count": len(ticker_manager.tokens)}
+            )
+
+        elif method == "ticker_unsubscribe":
+            ticker_manager.unsubscribe(params.get("tokens", []))
+            return success({"status": "unsubscribed"})
+
+        elif method == "ticker_status":
+            return success(ticker_manager.status())
 
         elif method == "start_agent":
             mode = params.get("mode", "auto")
