@@ -39,6 +39,7 @@ class TradingEngine:
         # that execute_signal is still setting up.
         self._pending_entries: set = set()
         self._tick_size_map = {}
+        self._reserved_entry_margin = 0.0
 
     def _get_tick_size(self, symbol: str, exchange: str = "NSE") -> float:
         if symbol in self._tick_size_map:
@@ -253,6 +254,9 @@ class TradingEngine:
                     available_margin = available["live_balance"]
                 else:
                     available_margin = equity_margin.get("net", 0)
+                available_margin = max(
+                    0, available_margin - self._reserved_entry_margin
+                )
 
                 qty = risk_manager.calculate_position_size(
                     entry_price, signal["stopLoss"], available_margin
@@ -264,6 +268,8 @@ class TradingEngine:
                     )
                     return False
 
+                reserved_margin = qty * entry_price
+                self._reserved_entry_margin += reserved_margin
                 order_id = kite_client.place_order(
                     variety="regular",
                     exchange=exchange,
@@ -281,6 +287,9 @@ class TradingEngine:
             # Wait for fill — NO LOCK held; this blocks up to 15 seconds.
             position = self._wait_for_entry_fill(signal, order_id)
             if not position:
+                with self._trade_lock:
+                    self._reserved_entry_margin -= reserved_margin
+                    reserved_margin = 0
                 self._push_log(
                     f"Entry order {order_id} for {symbol} not filled. Not tracking as active trade.",
                     level="warning",
@@ -290,6 +299,10 @@ class TradingEngine:
                 except Exception:
                     pass
                 return False
+
+            with self._trade_lock:
+                self._reserved_entry_margin -= reserved_margin
+                reserved_margin = 0
 
             stop_order_id = self._place_protective_stop(
                 signal,
@@ -361,6 +374,10 @@ class TradingEngine:
                 }
             return True
         except Exception as e:
+            with self._trade_lock:
+                self._reserved_entry_margin = max(
+                    0, self._reserved_entry_margin - locals().get("reserved_margin", 0)
+                )
             self._push_log(f"Failed to execute signal: {e}")
             return False
 
