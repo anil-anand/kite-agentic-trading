@@ -10,6 +10,7 @@ from .journal import journal
 from .kite_client import kite_client
 from .risk_manager import risk_manager
 from .scanner import scanner
+from .strategy_selector import assemble_context, select_strategies
 from .utils import DateTimeEncoder
 
 # Module-level lock for stdout to prevent interleaved JSON output between
@@ -41,6 +42,21 @@ class TradingEngine:
         self._tick_size_map = {}
         self._reserved_entry_margin = 0.0
 
+        # Session state machine for AI/regime strategy selection (issue #62).
+        #   warmup    -> engine just started, nothing evaluated yet
+        #   observing -> inside the first-15-min observation window; signals may
+        #                be generated but NO trades are placed
+        #   active    -> observation done and the strategy decision applied;
+        #                normal auto-execution allowed
+        #   halted    -> square-off / stopped for the day
+        self.session_state = "warmup"
+        self.selection_record = None
+
+    # First-15-minute observation window, anchored to the official market open
+    # (naive local time, consistent with risk_manager's configured times).
+    MARKET_OPEN = datetime.time(9, 15)
+    OBSERVATION_MINUTES = 15
+
     def _get_tick_size(self, symbol: str, exchange: str = "NSE") -> float:
         if symbol in self._tick_size_map:
             return self._tick_size_map[symbol]
@@ -66,6 +82,7 @@ class TradingEngine:
 
         self.mode = mode
         self.running = True
+        self.session_state = "warmup"
         self.thread = threading.Thread(target=self._run_loop)
         self.thread.daemon = True
         self.thread.start()
@@ -78,7 +95,151 @@ class TradingEngine:
         self._push_log("Trading engine stopped")
 
     def status(self) -> dict:
-        return {"running": self.running, "mode": self.mode}
+        return {
+            "running": self.running,
+            "mode": self.mode,
+            "session_state": self.session_state,
+        }
+
+    # --- Session state machine + strategy selection (issue #62) --------------
+    def _now(self) -> datetime.datetime:
+        # Seam for tests.
+        return datetime.datetime.now()
+
+    def _observation_deadline(self, now: datetime.datetime) -> datetime.datetime:
+        open_dt = datetime.datetime.combine(now.date(), self.MARKET_OPEN)
+        return open_dt + datetime.timedelta(minutes=self.OBSERVATION_MINUTES)
+
+    def _selection_done_today(self, now: datetime.datetime) -> bool:
+        """True if a strategy decision has already been recorded for today —
+        used so a mid-session restart re-hydrates rather than re-deciding."""
+        record = config_manager.get_strategy_selection()
+        return bool(record) and record.get("session_date") == now.date().isoformat()
+
+    def _auto_execute_allowed(self) -> bool:
+        """Trades may only be placed once the session is ACTIVE. During the
+        observation window (or warmup/halted) no order is placed."""
+        return self.session_state == "active"
+
+    def update_session_state(self, now: datetime.datetime = None):
+        """Advance the session state machine. Before the observation deadline we
+        stay in OBSERVING (signals only, no trades). At/after the deadline we
+        run the one-shot strategy selection (unless already done today) and move
+        to ACTIVE. A late start finds the deadline already passed and transitions
+        straight through, using whatever session data is available now."""
+        if self.session_state == "halted":
+            return
+        now = now or self._now()
+
+        if now < self._observation_deadline(now):
+            if self.session_state != "observing":
+                self.session_state = "observing"
+                self._push_log(
+                    "Session in observation window — collecting market context; "
+                    "no trades will be placed until it closes.",
+                    level="info",
+                )
+                self._push_state_update()
+            return
+
+        # Deadline passed.
+        if self._selection_done_today(now):
+            # Restart mid-session: reuse the existing decision, don't re-decide.
+            if self.selection_record is None:
+                self.selection_record = config_manager.get_strategy_selection()
+            if self.session_state != "active":
+                self.session_state = "active"
+                self._push_state_update()
+            return
+
+        self.run_strategy_selection(now=now)
+        self.session_state = "active"
+        self._push_state_update()
+
+    def _selection_universe(self) -> list:
+        from .nifty_universe import get_nifty100_universe
+
+        custom = config_manager.get_watchlist()
+        return list(set(get_nifty100_universe() + custom))
+
+    def run_strategy_selection(self, now: datetime.datetime = None):
+        """Assemble the session context, classify the regime, and persist the
+        decision as a per-session overlay. Conservative fallback: on UNKNOWN (or
+        any failure) nothing is applied and the user's baseline set is left
+        untouched."""
+        now = now or self._now()
+        baseline = config_manager.get_strategy_config()
+        available_ids = [
+            sid for sid, cfg in baseline.items() if cfg.get("enabled", False)
+        ]
+        try:
+            context = assemble_context(
+                kite_client.get_quote, self._selection_universe()
+            )
+            decision = select_strategies(context, available_ids)
+        except Exception as e:
+            self._push_log(
+                f"Strategy selection failed ({e}); leaving baseline strategies "
+                "unchanged.",
+                level="warning",
+            )
+            decision = {
+                "regime": "UNKNOWN",
+                "applied": False,
+                "enabled": [],
+                "disabled": [],
+                "rationale": f"Selection error: {e}. Baseline left unchanged.",
+                "inputs_used": {},
+                "inputs_missing": ["market_quotes"],
+                "decided_at": now.isoformat(),
+            }
+
+        decision["session_date"] = now.date().isoformat()
+        decision["source"] = "deterministic"
+        config_manager.save_strategy_selection(decision)
+        self.selection_record = decision
+        self._push_log(decision["rationale"], level="info")
+        self._push_strategy_selection(decision)
+        return decision
+
+    def reevaluate_strategies(self):
+        """Force a fresh strategy decision on demand (manual re-evaluate)."""
+        record = self.run_strategy_selection()
+        if self.session_state == "observing":
+            self.session_state = "active"
+            self._push_state_update()
+        return record
+
+    def set_strategy_override(self, enabled_ids: list):
+        """Apply a manual per-session override of the enabled strategy set. Kept
+        as an overlay over the user's baseline — it never mutates the baseline
+        config. Only ids the user already permits take effect."""
+        baseline = config_manager.get_strategy_config()
+        permitted = {sid for sid, cfg in baseline.items() if cfg.get("enabled", False)}
+        enabled = [sid for sid in enabled_ids if sid in permitted]
+        now = self._now()
+        record = {
+            "regime": (self.selection_record or {}).get("regime", "MANUAL"),
+            "applied": True,
+            "enabled": enabled,
+            "disabled": [sid for sid in permitted if sid not in set(enabled)],
+            "rationale": "Manual override of the session strategy set by the user.",
+            "inputs_used": {},
+            "inputs_missing": [],
+            "decided_at": now.isoformat(),
+            "session_date": now.date().isoformat(),
+            "source": "manual",
+        }
+        config_manager.save_strategy_selection(record)
+        self.selection_record = record
+        self._push_strategy_selection(record)
+        return record
+
+    def _push_strategy_selection(self, record: dict):
+        event = {"event": "agent:strategy-selection", "data": record}
+        with _stdout_lock:
+            print(json.dumps(event, cls=DateTimeEncoder))
+            sys.stdout.flush()
 
     def _push_state_update(self):
         event = {
@@ -87,6 +248,7 @@ class TradingEngine:
                 "running": self.running,
                 "mode": self.mode,
                 "status": "scanning" if self.running else "idle",
+                "session_state": self.session_state,
             },
         }
         with _stdout_lock:
@@ -120,6 +282,11 @@ class TradingEngine:
 
         while self.running:
             try:
+                # 0. Advance the session state machine (observation -> active +
+                #    one-shot strategy selection). Failure here must not stop the
+                #    loop, so it's inside the same try.
+                self.update_session_state()
+
                 # 1. Fast polling: Monitor live positions for Stop-Loss / Target
                 self.monitor_positions()
 
@@ -188,7 +355,12 @@ class TradingEngine:
             # threads, so active_trades access must be guarded by the lock.
             if signal["confidence"] >= 70:
                 self._push_signal(signal)
-                if self.mode == "auto" and signal["confidence"] >= 80 and can_trade:
+                if (
+                    self.mode == "auto"
+                    and signal["confidence"] >= 80
+                    and can_trade
+                    and self._auto_execute_allowed()
+                ):
                     symbol = signal["tradingsymbol"]
                     with self._trade_lock:
                         already_active = (
@@ -784,6 +956,7 @@ class TradingEngine:
 
     def square_off_all(self):
         self._push_log("Squaring off all open positions")
+        self.session_state = "halted"
         try:
             positions = kite_client.get_positions().get("net", [])
             for p in positions:
