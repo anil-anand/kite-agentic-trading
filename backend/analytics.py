@@ -463,6 +463,7 @@ Trade Timeline Events:
                 model=llm.get("model", ""),
                 prompt=prompt,
                 provider=provider,
+                plan=llm.get("openCodePlan", "zen"),
             )
             return {"analysis": analysis}
         except Exception as e:

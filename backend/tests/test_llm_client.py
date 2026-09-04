@@ -3,7 +3,7 @@ from urllib.error import HTTPError
 
 import pytest
 
-from backend.llm_client import PROVIDER_PRESETS, OpenAICompatibleClient
+from backend.llm_client import OPENCODE_PLANS, PROVIDER_PRESETS, OpenAICompatibleClient
 
 
 class FakeResponse:
@@ -77,6 +77,112 @@ def test_provider_presets_are_explicit_and_exclude_custom_and_bedrock():
         "OpenCode",
     }
     assert PROVIDER_PRESETS["Ollama"]["requiresApiKey"] is False
+
+
+@pytest.mark.parametrize(
+    ("plan", "catalog", "expected"),
+    [
+        (
+            "zen",
+            [
+                {
+                    "id": "big-pickle",
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "opencode",
+                },
+                {"id": "gpt-5", "object": "model", "created": 0, "owned_by": "openai"},
+                {"id": "o3", "object": "model", "created": 0, "owned_by": "openai"},
+                {
+                    "id": "claude-sonnet-4-5",
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "anthropic",
+                },
+                {
+                    "id": "gemini-2.5-pro",
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "google",
+                },
+            ],
+            ["big-pickle"],
+        ),
+        (
+            "go",
+            [
+                {
+                    "id": "kimi-k3",
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "moonshot",
+                },
+                {
+                    "id": "kimi-k2.5",
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "moonshot",
+                },
+                {"id": "o3", "object": "model", "created": 0, "owned_by": "openai"},
+                {
+                    "id": "claude-sonnet-4-5",
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "anthropic",
+                },
+                {
+                    "id": "gemini-2.5-pro",
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "google",
+                },
+            ],
+            ["kimi-k3", "kimi-k2.5"],
+        ),
+    ],
+)
+def test_opencode_discovery_filters_minimal_catalog_by_plan_allowlist(
+    monkeypatch, plan, catalog, expected
+):
+    monkeypatch.setattr(
+        "backend.llm_client.request.urlopen",
+        lambda request, timeout: FakeResponse({"data": catalog}),
+    )
+
+    assert (
+        OpenAICompatibleClient().discover_models(
+            "OpenCode", OPENCODE_PLANS[plan]["baseUrl"], "key", plan=plan
+        )
+        == expected
+    )
+
+
+def test_opencode_zen_allowlist_excludes_responses_only_gpt5():
+    assert "big-pickle" in OPENCODE_PLANS["zen"]["chatModels"]
+    assert "gpt-5" not in OPENCODE_PLANS["zen"]["chatModels"]
+
+
+@pytest.mark.parametrize(
+    ("plan", "model"),
+    [("zen", "gpt-5"), ("go", "big-pickle")],
+)
+def test_generate_rejects_opencode_models_outside_selected_plan_allowlist(
+    monkeypatch, plan, model
+):
+    def fail_if_requested(*args, **kwargs):
+        raise AssertionError("invalid OpenCode model reached HTTP request")
+
+    monkeypatch.setattr("backend.llm_client.request.urlopen", fail_if_requested)
+
+    with pytest.raises(RuntimeError, match="not available for OpenCode plan"):
+        OpenAICompatibleClient().generate(
+            OPENCODE_PLANS[plan]["baseUrl"],
+            "opencode-key",
+            model,
+            "prompt",
+            provider="OpenCode",
+            plan=plan,
+        )
 
 
 def test_anthropic_request_uses_provider_auth_and_native_messages_api(monkeypatch):
@@ -295,7 +401,22 @@ def test_discover_models_supports_all_provider_protocols(
     assert captured["request"].full_url == f"{base_url}{path}"
     if provider == "Anthropic":
         assert captured["request"].headers["X-api-key"] == api_key
-    elif provider == "Gemini":
+    elif provider == "Gemini" or provider == "OpenCode":
         assert "Authorization" not in captured["request"].headers
     else:
         assert captured["request"].headers["Authorization"] == f"Bearer {api_key}"
+
+
+def test_opencode_model_discovery_does_not_send_api_key(monkeypatch):
+    captured = {}
+
+    def fake_urlopen(req, timeout):
+        captured["request"] = req
+        return FakeResponse({"data": [{"id": "big-pickle"}]})
+
+    monkeypatch.setattr("backend.llm_client.request.urlopen", fake_urlopen)
+
+    assert OpenAICompatibleClient().discover_models(
+        "OpenCode", OPENCODE_PLANS["zen"]["baseUrl"], "expired-key"
+    ) == ["big-pickle"]
+    assert "Authorization" not in captured["request"].headers

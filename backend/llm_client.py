@@ -1,6 +1,21 @@
 import json
 from urllib import error, request
 
+OPENCODE_PLANS = {
+    "zen": {
+        "baseUrl": "https://opencode.ai/zen/v1",
+        "model": "big-pickle",
+        "providerId": "opencode",
+        "chatModels": frozenset({"big-pickle"}),
+    },
+    "go": {
+        "baseUrl": "https://opencode.ai/zen/go/v1",
+        "model": "kimi-k3",
+        "providerId": "opencode-go",
+        "chatModels": frozenset({"kimi-k3", "kimi-k2.5"}),
+    },
+}
+
 PROVIDER_PRESETS = {
     "OpenAI": {
         "baseUrl": "https://api.openai.com/v1",
@@ -83,7 +98,13 @@ class OpenAICompatibleClient:
             return {"Authorization": f"Bearer {api_key}"}
         return {}
 
-    def generate(self, base_url, api_key, model, prompt, provider="OpenAI"):
+    def generate(self, base_url, api_key, model, prompt, provider="OpenAI", plan="zen"):
+        if provider == "OpenCode":
+            opencode_plan = OPENCODE_PLANS.get(plan, OPENCODE_PLANS["zen"])
+            if model not in opencode_plan["chatModels"]:
+                raise RuntimeError(
+                    f"Model '{model}' is not available for OpenCode plan '{plan}'"
+                )
         base_url = self._resolve_base_url(provider, base_url, api_key).rstrip("/")
         headers = self._headers(provider, api_key)
         if provider == "Anthropic":
@@ -137,8 +158,11 @@ class OpenAICompatibleClient:
             raise RuntimeError("LLM response was malformed")
         return content
 
-    def discover_models(self, provider, base_url, api_key):
+    def discover_models(self, provider, base_url, api_key, plan="zen"):
+        opencode_plan = OPENCODE_PLANS.get(plan, OPENCODE_PLANS["zen"])
         base_url = self._resolve_base_url(provider, base_url, api_key).rstrip("/")
+        if provider == "OpenCode":
+            base_url = opencode_plan["baseUrl"]
         if provider == "Ollama":
             body = self._request(
                 f"{base_url}/api/tags",
@@ -156,7 +180,19 @@ class OpenAICompatibleClient:
             ]
         else:
             body = self._request(
-                f"{base_url}/models", api_key, headers=self._headers(provider, api_key)
+                f"{base_url}/models",
+                api_key,
+                headers={}
+                if provider == "OpenCode"
+                else self._headers(provider, api_key),
             )
-            models = [item.get("id") for item in body.get("data", [])]
+            catalog = body.get("data", [])
+            if provider == "OpenCode":
+                catalog = [
+                    item
+                    for item in catalog
+                    if isinstance(item, dict)
+                    and item.get("id") in opencode_plan["chatModels"]
+                ]
+            models = [item.get("id") for item in catalog]
         return [model for model in models if model]

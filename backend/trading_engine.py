@@ -489,6 +489,7 @@ class TradingEngine:
                             f"{symbol} already flat before exit (broker stop likely filled). Cleaning up.",
                             level="warning",
                         )
+                        self._journal_external_close(symbol)
                         self._cancel_protective_stop(symbol)
                         with self._trade_lock:
                             self.active_trades.pop(symbol, None)

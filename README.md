@@ -23,7 +23,7 @@ The app features a modern Electron/React frontend communicating with a high-perf
 
 * **Frontend**: Electron, React 18, TypeScript, Tailwind CSS, Zustand (with local persistence), Vite.
 * **Backend**: Python 3, `kiteconnect`, `pandas`, `ta` (Technical Analysis), custom JSON-RPC bridge.
-* **Security**: Kite and BYOK LLM API keys are locally encrypted using `cryptography.fernet` and stored in `~/.kite-agentic-trading/config.json`.
+* **Security**: Kite and BYOK LLM API keys are encrypted by the backend using `cryptography.fernet` and stored locally in `~/.kite-agentic-trading/config.json`.
 
 ## 📦 Prerequisites
 
@@ -72,7 +72,11 @@ npm run dev
 
 On your first launch, navigate to the **Settings** tab to enter your Kite API Key and API Secret. The app will encrypt and save them locally.
 
-To enable Journal post-mortems, open **Settings > BYOK LLM Post-Mortems**, choose a provider, refresh its available models, and enter its API key. Supported presets are OpenAI (`gpt-4o-mini`), Anthropic (`claude-3-5-haiku-latest`), Gemini (`gemini-2.5-flash`), OpenRouter (`openai/gpt-4o-mini`), Ollama (`llama3.2`), and OpenCode (`big-pickle`). Ollama defaults to the local server at `http://localhost:11434` without a key; entering an Ollama API key switches model discovery and generation to Ollama Cloud. Provider endpoints and request authentication are selected by the preset; arbitrary endpoints are intentionally not accepted. API keys are encrypted locally and are never returned to the renderer in plaintext. Bedrock is deferred.
+To enable Journal post-mortems, open **Settings > BYOK LLM Post-Mortems**, choose a supported provider, refresh its available models, and enter your API key. Model discovery always uses the provider selected in Settings. Supported presets are OpenAI (`gpt-4o-mini`), Anthropic (`claude-3-5-haiku-latest`), Gemini (`gemini-2.5-flash`), OpenRouter (`openai/gpt-4o-mini`), Ollama (`llama3.2`), and OpenCode (`big-pickle`). Ollama defaults to the local server at `http://localhost:11434` without a key; entering an Ollama API key switches model discovery and generation to Ollama Cloud. Provider endpoints and request authentication are selected by the preset; arbitrary endpoints are intentionally not accepted. API keys configured in Settings are encrypted and stored by the backend, masked in the app, and never returned to the renderer in plaintext. Bedrock is deferred.
+
+### OpenCode plan selection
+
+The OpenCode preset supports two plans: **Zen** and **Go**. Zen uses the `opencode` provider identity at the `https://opencode.ai/zen/v1` endpoint; Go uses the `opencode-go` provider identity at `https://opencode.ai/zen/go/v1`. Use **Refresh** in Settings to discover the models exposed by the selected plan. This integration currently exposes only models compatible with the OpenAI Chat Completions API.
 
 ## 🧰 Installing the Application
 
