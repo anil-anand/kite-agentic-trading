@@ -16,6 +16,12 @@ class RiskManager:
 
         # Check time
         now = datetime.datetime.now().time()
+
+        # Market opens at 09:15 IST — do not place orders before that.
+        market_open = datetime.time(9, 15)
+        if now < market_open:
+            return False, "Market has not opened yet (opens at 09:15)"
+
         no_new_trades_after = datetime.datetime.strptime(
             config["noNewTradesAfter"], "%H:%M"
         ).time()
