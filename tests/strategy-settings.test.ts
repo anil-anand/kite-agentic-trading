@@ -1,0 +1,33 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { STRATEGY_IDS, buildStrategySettings } from '../src/renderer/utils/strategy-settings.ts';
+
+test('builds settings for every configured strategy', () => {
+  const enabledStrategies = ['ema_crossover', 'stoc_rsi'];
+
+  const settings = buildStrategySettings(enabledStrategies);
+
+  assert.deepEqual(STRATEGY_IDS, [
+    'ema_crossover',
+    'rsi_reversal',
+    'vwap_bounce',
+    'supertrend',
+    'macd_cross',
+    'bollinger_breakout',
+    'stochastic_reversal',
+    'adx_momentum',
+    'psar_trend',
+    'donchian_breakout',
+    'cci_reversal',
+    'williams_r',
+    'mfi_exhaustion',
+    'keltner_breakout',
+    'awesome_oscillator',
+    'tsi_cross',
+    'stoc_rsi',
+  ]);
+  assert.deepEqual(Object.keys(settings), STRATEGY_IDS);
+  for (const strategyId of STRATEGY_IDS) {
+    assert.equal(settings[strategyId].enabled, enabledStrategies.includes(strategyId));
+  }
+});
