@@ -46,6 +46,10 @@ export const AGENT_SIGNAL = 'agent:signal'; // Main → Renderer event
 export const AGENT_EXECUTE_SIGNAL = 'agent:execute-signal';
 export const AGENT_DISMISS_SIGNAL = 'agent:dismiss-signal';
 export const AGENT_SCAN_NOW = 'agent:scan-now';
+export const AGENT_STRATEGY_SELECTION_GET = 'agent:strategy-selection-get';
+export const AGENT_STRATEGY_REEVALUATE = 'agent:strategy-reevaluate';
+export const AGENT_STRATEGY_OVERRIDE = 'agent:strategy-override';
+export const AGENT_STRATEGY_SELECTION = 'agent:strategy-selection'; // Main → Renderer event
 
 // ─── Activity Log ─────────────────────────────────────────────────
 export const LOG_ENTRY = 'log:entry'; // Main → Renderer event
