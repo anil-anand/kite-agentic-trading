@@ -182,7 +182,7 @@ def test_execute_signal_rejects_low_expected_profit_after_costs(monkeypatch):
             "transactionCostFilterEnabled": True,
             "brokeragePercentPerOrder": 0.03,
             "brokerageCapPerOrder": 20,
-            "statutoryChargesPercentRoundTrip": 0.015,
+            "statutoryChargesPercentRoundTrip": 0.025,
         },
     )
 

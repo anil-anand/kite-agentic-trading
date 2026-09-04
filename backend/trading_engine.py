@@ -71,7 +71,7 @@ class TradingEngine:
         )
         brokerage_cap = max(0.0, risk_config.get("brokerageCapPerOrder", 20))
         statutory_pct = (
-            max(0.0, risk_config.get("statutoryChargesPercentRoundTrip", 0.015)) / 100
+            max(0.0, risk_config.get("statutoryChargesPercentRoundTrip", 0.025)) / 100
         )
 
         entry_turnover = entry_price * quantity

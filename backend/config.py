@@ -28,7 +28,7 @@ class ConfigManager:
                 "transactionCostFilterEnabled": True,
                 "brokeragePercentPerOrder": 0.03,
                 "brokerageCapPerOrder": 20,
-                "statutoryChargesPercentRoundTrip": 0.015,
+                "statutoryChargesPercentRoundTrip": 0.025,
             },
             "strategies": {
                 "ema_crossover": {"enabled": True},
