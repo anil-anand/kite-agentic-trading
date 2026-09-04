@@ -50,6 +50,10 @@ class TestEmitShape:
         assert d["lastPrice"] == 501.25  # camelCase for the Tick type
         assert d["changePercent"] == 0.25
         assert d["instrumentToken"] == 111
+        # Tick type expects a parsable string timestamp, not None.
+        import datetime as _dt
+
+        _dt.datetime.fromisoformat(d["timestamp"])
 
     def test_emit_skips_unknown_token(self, capsys, monkeypatch):
         monkeypatch.setattr(tk, "kite_client", FakeMD())
@@ -89,6 +93,15 @@ class TestSubscription:
         mgr.subscribe([111, 222, 111])
         assert mgr.tokens == {111, 222}
         mgr.unsubscribe([111])
+        assert mgr.tokens == {222}
+
+    def test_unsubscribe_normalizes_stringified_tokens(self):
+        # A stringified token from the renderer must still match the int tokens
+        # we subscribed with, or the subscription would leak.
+        mgr = TickerManager()
+        mgr._dev = True
+        mgr.subscribe([111, 222])
+        mgr.unsubscribe(["111"])
         assert mgr.tokens == {222}
 
     def test_status_shape(self):

@@ -1,3 +1,4 @@
+import datetime
 import json
 import random
 import sys
@@ -76,10 +77,14 @@ class TickerManager:
             self.ticker.set_mode(self.ticker.MODE_FULL, list(self.tokens))
 
     def unsubscribe(self, tokens: list):
-        for token in tokens:
-            self.tokens.discard(int(token))
+        # Normalize to int so the broker unsubscribe matches the int tokens we
+        # subscribed with — a stringified token from the renderer would
+        # otherwise leave a stale subscription active.
+        normalized = [int(token) for token in tokens]
+        for token in normalized:
+            self.tokens.discard(token)
         if not self._dev and self.ticker and self.running:
-            self.ticker.unsubscribe(tokens)
+            self.ticker.unsubscribe(normalized)
 
     # -- token -> symbol -------------------------------------------------
     def _symbol_for(self, token: int) -> str:
@@ -105,7 +110,7 @@ class TickerManager:
                 "lastPrice": round(last_price, 2),
                 "changePercent": round(change_percent, 2),
                 "volume": volume,
-                "timestamp": None,
+                "timestamp": datetime.datetime.now().isoformat(),
             },
         }
         print(json.dumps(event, cls=DateTimeEncoder))

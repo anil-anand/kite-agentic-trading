@@ -199,6 +199,43 @@ class TestSimulatedBook:
         assert "orderTimestamp" in o
         _dt.datetime.fromisoformat(o["orderTimestamp"])  # parses -> valid date
 
+    def test_orders_use_camelcase_fields(self):
+        # The renderer reads camelCase (o.transactionType, o.orderType,
+        # o.triggerPrice), matching the real KiteClient.convert_keys() output.
+        # snake_case keys would render as undefined in the Orders UI.
+        self.mock.place_order(
+            variety="regular",
+            exchange="NSE",
+            tradingsymbol="RELIANCE",
+            transaction_type="SELL",
+            quantity=5,
+            product="MIS",
+            order_type="SL",
+            trigger_price=90.0,
+        )
+        o = self.mock.get_orders()[-1]
+        assert o["transactionType"] == "SELL"
+        assert o["orderType"] == "SL"
+        assert o["triggerPrice"] == 90.0
+        # No stale snake_case keys.
+        assert "transaction_type" not in o
+        assert "trigger_price" not in o
+
+    def test_modify_order_updates_camelcase_trigger(self):
+        oid = self.mock.place_order(
+            variety="regular",
+            exchange="NSE",
+            tradingsymbol="RELIANCE",
+            transaction_type="SELL",
+            quantity=5,
+            product="MIS",
+            order_type="SL",
+            trigger_price=90.0,
+        )
+        self.mock.modify_order("regular", oid, trigger_price=88.0)
+        o = {x["orderId"]: x for x in self.mock.get_orders()}[oid]
+        assert o["triggerPrice"] == 88.0
+
     def test_price_moves_between_reads(self):
         seen = {self.mock._live_price("RELIANCE") for _ in range(20)}
         assert len(seen) > 1  # drifts, so P&L and stops are dynamic

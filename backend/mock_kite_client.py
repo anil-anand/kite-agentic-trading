@@ -5,8 +5,12 @@ synthetic-but-plausible market data so the entire UI and engine can run with no
 Zerodha account, no login, and no network. Historical candles are a deterministic
 seeded random walk per instrument, so strategies actually produce signals.
 
-Not for any real trading — orders are accepted and given ids but nothing is sent
-anywhere, and positions/orders start empty (use paper mode for a simulated book).
+Not for any real trading. Orders are not sent anywhere, but the mock keeps a
+full in-memory simulated book: orders fill (market at the live price, limit at
+the limit, stop-losses rest and trigger when the drifting price crosses them),
+positions mark to a moving price with realised/unrealised P&L, and the
+Orders/Positions views populate — all in the same camelCase shape the real
+KiteClient returns via convert_keys().
 """
 
 import datetime
@@ -196,18 +200,21 @@ class MockKiteClient:
         order_id = f"DEV{self._order_seq}"
         qty = int(quantity)
         now = datetime.datetime.now().isoformat()
+        # camelCase keys match the real KiteClient.convert_keys() output the
+        # renderer reads (e.g. the Orders page uses o.transactionType).
         order = {
             "orderId": order_id,
             "tradingsymbol": tradingsymbol,
             "exchange": exchange,
-            "transaction_type": transaction_type,
+            "transactionType": transaction_type,
             "quantity": qty,
             "filledQuantity": 0,
             "product": product,
-            "order_type": order_type,
+            "orderType": order_type,
             "price": price,
-            "trigger_price": trigger_price,
+            "triggerPrice": trigger_price,
             "status": "OPEN",
+            "isAppOrder": True,
             # The Orders UI renders new Date(orderTimestamp); without it dev-mode
             # orders show "Invalid Date".
             "orderTimestamp": now,
@@ -245,7 +252,7 @@ class MockKiteClient:
         order = self._orders.get(str(order_id))
         if order and order["status"] in _OPEN_STATUSES:
             if trigger_price is not None:
-                order["trigger_price"] = trigger_price
+                order["triggerPrice"] = trigger_price
             if price is not None:
                 order["price"] = price
         return {"order_id": order_id}
@@ -258,7 +265,7 @@ class MockKiteClient:
             order["tradingsymbol"],
             order["exchange"],
             order["product"],
-            order["transaction_type"],
+            order["transactionType"],
             order["quantity"],
             price,
         )
@@ -301,8 +308,8 @@ class MockKiteClient:
             if order["status"] != "TRIGGER PENDING":
                 continue
             ltp = self._live_price(order["tradingsymbol"])
-            trig = order["trigger_price"]
-            txn = order["transaction_type"]
+            trig = order["triggerPrice"]
+            txn = order["transactionType"]
             # SELL stop protects a long (fires on the way down); BUY stop
             # protects a short (fires on the way up).
             if (txn == "SELL" and ltp <= trig) or (txn == "BUY" and ltp >= trig):

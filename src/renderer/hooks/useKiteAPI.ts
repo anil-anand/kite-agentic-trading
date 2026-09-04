@@ -121,19 +121,20 @@ export const useKiteAPI = () => {
         const ltpMap = await window.electronAPI?.invoke(IPC.MARKET_LTP, keys) || {};
 
         const items = symbols
-          .filter(s => tokenBySymbol[s])
-          .map(s => ({
-            tradingsymbol: s,
+          .map(s => ({ symbol: s, token: tokenBySymbol[s] }))
+          .filter((x): x is { symbol: string; token: number } => typeof x.token === 'number')
+          .map(({ symbol, token }) => ({
+            tradingsymbol: symbol,
             exchange: 'NSE',
-            instrumentToken: tokenBySymbol[s],
-            lastPrice: ltpMap[`NSE:${s}`]?.last_price || 0,
+            instrumentToken: token,
+            lastPrice: ltpMap[`NSE:${symbol}`]?.last_price ?? 0,
             change: 0,
             changePercent: 0,
             open: 0, high: 0, low: 0, close: 0, volume: 0,
             activeSignals: [],
           }));
 
-        store.setWatchlist(items as any);
+        store.setWatchlist(items);
         const tokens = items.map(i => i.instrumentToken);
         if (tokens.length > 0) {
           await window.electronAPI?.invoke(IPC.TICKER_SUBSCRIBE, tokens);
