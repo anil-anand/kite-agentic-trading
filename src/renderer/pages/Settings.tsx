@@ -148,7 +148,11 @@ const Settings: React.FC = () => {
         autoSquareOff: true,
         squareOffTime: "15:15",
         defaultStopLossPercent: 1.5,
-        defaultTargetPercent: 3
+        defaultTargetPercent: 3,
+        transactionCostFilterEnabled: true,
+        brokeragePercentPerOrder: 0.03,
+        brokerageCapPerOrder: 20,
+        statutoryChargesPercentRoundTrip: 0.015,
       }
     }));
   };
@@ -337,6 +341,50 @@ const Settings: React.FC = () => {
                   value={localSettings.risk?.defaultTargetPercent || ''} 
                   onChange={(e) => handleRiskChange('defaultTargetPercent', e.target.value)}
                   className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white focus:border-accent-light outline-none" 
+                />
+              </div>
+              <div>
+                <label className="block text-surface-400 text-sm mb-1">Profitability Filter (after costs)</label>
+                <div className="flex items-center h-10">
+                  <label className="relative inline-flex items-center cursor-pointer">
+                    <input
+                      type="checkbox"
+                      className="sr-only peer"
+                      checked={localSettings.risk?.transactionCostFilterEnabled ?? true}
+                      onChange={(e) => handleRiskChange('transactionCostFilterEnabled', e.target.checked)}
+                    />
+                    <div className="w-11 h-6 bg-surface-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-accent-dark"></div>
+                  </label>
+                </div>
+              </div>
+              <div>
+                <label className="block text-surface-400 text-sm mb-1">Brokerage per order (%)</label>
+                <input
+                  type="number"
+                  step="0.001"
+                  value={localSettings.risk?.brokeragePercentPerOrder || ''}
+                  onChange={(e) => handleRiskChange('brokeragePercentPerOrder', e.target.value)}
+                  className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white focus:border-accent-light outline-none"
+                />
+              </div>
+              <div>
+                <label className="block text-surface-400 text-sm mb-1">Brokerage cap per order (₹)</label>
+                <input
+                  type="number"
+                  step="0.1"
+                  value={localSettings.risk?.brokerageCapPerOrder || ''}
+                  onChange={(e) => handleRiskChange('brokerageCapPerOrder', e.target.value)}
+                  className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white focus:border-accent-light outline-none"
+                />
+              </div>
+              <div>
+                <label className="block text-surface-400 text-sm mb-1">Estimated round-trip statutory charges (%)</label>
+                <input
+                  type="number"
+                  step="0.001"
+                  value={localSettings.risk?.statutoryChargesPercentRoundTrip || ''}
+                  onChange={(e) => handleRiskChange('statutoryChargesPercentRoundTrip', e.target.value)}
+                  className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white focus:border-accent-light outline-none"
                 />
               </div>
             </div>

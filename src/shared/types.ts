@@ -232,15 +232,19 @@ export interface AgentState {
 export interface RiskConfig {
   maxCapitalPerTrade: number;
   maxDailyLoss: number;
-  maxOpenPositions: number;
+  maxSimultaneousPositions: number;
   noNewTradesAfter: string; // "14:30" format
   startTradeAfter: string; // "09:45" format
   autoSquareOff: boolean;
   squareOffTime: string; // "15:10" format
   defaultStopLossPercent: number;
   defaultTargetPercent: number;
-  trailingStopEnabled: boolean;
-  trailingStopPercent: number;
+  positionRevalWeakExitMins: number;
+  positionRevalBreakevenMins: number;
+  transactionCostFilterEnabled: boolean;
+  brokeragePercentPerOrder: number;
+  brokerageCapPerOrder: number;
+  statutoryChargesPercentRoundTrip: number;
 }
 
 // ─── Strategy Configuration ───────────────────────────────────────

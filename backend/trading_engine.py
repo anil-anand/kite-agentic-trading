@@ -60,6 +60,26 @@ class TradingEngine:
     def _round_to_tick(self, price: float, tick_size: float) -> float:
         return round(round(price / tick_size) * tick_size, 2)
 
+    def _estimate_round_trip_transaction_cost(
+        self, entry_price: float, exit_price: float, quantity: int, risk_config: dict
+    ) -> float:
+        if quantity <= 0 or entry_price <= 0 or exit_price <= 0:
+            return 0.0
+
+        brokerage_pct = max(0.0, risk_config.get("brokeragePercentPerOrder", 0.03)) / 100
+        brokerage_cap = max(0.0, risk_config.get("brokerageCapPerOrder", 20))
+        statutory_pct = (
+            max(0.0, risk_config.get("statutoryChargesPercentRoundTrip", 0.015)) / 100
+        )
+
+        entry_turnover = entry_price * quantity
+        exit_turnover = exit_price * quantity
+        entry_brokerage = min(entry_turnover * brokerage_pct, brokerage_cap)
+        exit_brokerage = min(exit_turnover * brokerage_pct, brokerage_cap)
+        statutory_charges = (entry_turnover + exit_turnover) * statutory_pct
+
+        return entry_brokerage + exit_brokerage + statutory_charges
+
     def start(self, mode: str = "auto"):
         if self.running:
             return
@@ -269,6 +289,24 @@ class TradingEngine:
                         level="warning",
                     )
                     return False
+
+                risk_config = config_manager.get_risk_config()
+                if risk_config.get("transactionCostFilterEnabled", True):
+                    target_price = self._round_to_tick(
+                        signal.get("target", entry_price), tick_size
+                    )
+                    expected_gross_profit = max(
+                        0.0, abs(target_price - entry_price) * qty
+                    )
+                    estimated_cost = self._estimate_round_trip_transaction_cost(
+                        entry_price, target_price, qty, risk_config
+                    )
+                    if expected_gross_profit <= estimated_cost:
+                        self._push_log(
+                            f"Rejected signal {signal['id']} for {symbol}: expected gross profit ₹{expected_gross_profit:.2f} is not above estimated transaction cost ₹{estimated_cost:.2f}.",
+                            level="warning",
+                        )
+                        return False
 
                 reserved_margin = qty * entry_price
                 self._reserved_entry_margin += reserved_margin

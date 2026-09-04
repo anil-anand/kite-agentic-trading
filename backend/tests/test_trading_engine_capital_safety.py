@@ -168,6 +168,64 @@ def test_execute_signal_treats_explicit_zero_live_balance_as_unavailable_margin(
     assert fake_client.place_calls == []
 
 
+def test_execute_signal_rejects_low_expected_profit_after_costs(monkeypatch):
+    import backend.trading_engine as te
+
+    fake_client = FakeKiteClient()
+    fake_risk = FakeRiskManager()
+    monkeypatch.setattr(te, "kite_client", fake_client)
+    monkeypatch.setattr(te, "risk_manager", fake_risk)
+    monkeypatch.setattr(
+        te.config_manager,
+        "get_risk_config",
+        lambda: {
+            "transactionCostFilterEnabled": True,
+            "brokeragePercentPerOrder": 0.03,
+            "brokerageCapPerOrder": 20,
+            "statutoryChargesPercentRoundTrip": 0.015,
+        },
+    )
+
+    engine = TradingEngine()
+    signal = {**_sample_signal(), "target": 100.01}
+
+    assert engine.execute_signal(signal) is False
+    assert fake_client.place_calls == []
+
+
+def test_execute_signal_allows_low_expected_profit_when_cost_filter_disabled(monkeypatch):
+    import backend.trading_engine as te
+
+    fake_client = FakeKiteClient()
+    fake_client.positions = {
+        "net": [
+            {
+                "tradingsymbol": "RELIANCE",
+                "quantity": 10,
+                "exchange": "NSE",
+                "product": "MIS",
+                "lastPrice": 100.0,
+            }
+        ]
+    }
+    fake_risk = FakeRiskManager()
+    monkeypatch.setattr(te, "kite_client", fake_client)
+    monkeypatch.setattr(te, "risk_manager", fake_risk)
+    monkeypatch.setattr(
+        te.config_manager,
+        "get_risk_config",
+        lambda: {"transactionCostFilterEnabled": False},
+    )
+
+    engine = TradingEngine()
+    engine._entry_fill_timeout_seconds = 1
+    engine._entry_fill_poll_seconds = 0
+    signal = {**_sample_signal(), "target": 100.01}
+
+    assert engine.execute_signal(signal) is True
+    assert len(fake_client.place_calls) == 2
+
+
 def test_concurrent_entries_do_not_reuse_reserved_margin(monkeypatch):
     import backend.trading_engine as te
 

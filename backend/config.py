@@ -25,6 +25,10 @@ class ConfigManager:
                 "defaultTargetPercent": 3,
                 "positionRevalWeakExitMins": 15,
                 "positionRevalBreakevenMins": 45,
+                "transactionCostFilterEnabled": True,
+                "brokeragePercentPerOrder": 0.03,
+                "brokerageCapPerOrder": 20,
+                "statutoryChargesPercentRoundTrip": 0.015,
             },
             "strategies": {
                 "ema_crossover": {"enabled": True},
