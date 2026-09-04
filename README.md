@@ -86,7 +86,7 @@ Kite access tokens expire daily, so live development normally means re-doing the
 KITE_DEV_MODE=1 npm run dev
 ```
 
-In dev mode the backend swaps the real Kite client for a **mock** that serves synthetic-but-plausible market data (instruments, quotes, LTP, and deterministic historical candles), the login screen is skipped entirely, and the scanner/strategies produce real signals off the synthetic candles. The account book starts empty and orders are accepted but sent nowhere — for a simulated trading book, use **Paper** mode. Dev mode is off by default and has no effect in production.
+In dev mode the backend swaps the real Kite client for a **mock** that serves synthetic-but-plausible market data (instruments, quotes, LTP, and deterministic historical candles), the login screen is skipped entirely, and the scanner/strategies produce real signals off the synthetic candles. The mock also keeps a **simulated trading book**: orders are filled (market at the live price, limit at the limit, stop-losses rest and trigger when the drifting price crosses them), positions mark to a moving price with live P&L, and the Orders/Positions views populate — so the agent visibly trades end-to-end without touching a real account. A `DEV MODE` badge is shown in the status bar. Dev mode is off by default and has no effect in production.
 
 ## 🧰 Installing the Application
 
