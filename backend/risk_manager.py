@@ -17,10 +17,18 @@ class RiskManager:
         # Check time
         now = datetime.datetime.now().time()
 
-        # Market opens at 09:15 IST — do not place orders before that.
-        market_open = datetime.time(9, 15)
+        # Market opens at 09:15 IST, but we respect startTradeAfter setting.
+        start_trade_after_str = config.get("startTradeAfter", "09:45")
+        try:
+            start_trade_after = datetime.datetime.strptime(
+                start_trade_after_str, "%H:%M"
+            ).time()
+        except ValueError:
+            start_trade_after = datetime.time(9, 15)
+
+        market_open = max(datetime.time(9, 15), start_trade_after)
         if now < market_open:
-            return False, "Market has not opened yet (opens at 09:15)"
+            return False, f"Trading starts at {market_open.strftime('%H:%M')}"
 
         no_new_trades_after = datetime.datetime.strptime(
             config["noNewTradesAfter"], "%H:%M"

@@ -17,6 +17,7 @@ class ConfigManager:
                 "maxCapitalPerTrade": 10000,
                 "maxDailyLoss": 2000,
                 "maxSimultaneousPositions": 5,
+                "startTradeAfter": "09:45",
                 "noNewTradesAfter": "15:00",
                 "autoSquareOff": True,
                 "squareOffTime": "15:15",
