@@ -3,6 +3,7 @@ import { useTradingStore } from '../stores/trading-store';
 import SignalCard from '../components/SignalCard';
 import { useKiteAPI } from '../hooks/useKiteAPI';
 import { Check, X } from 'lucide-react';
+import { buildStrategySettings } from '../utils/strategy-settings';
 
 const AgentControl: React.FC = () => {
   const { agentState, signals, setAgentState } = useTradingStore();
@@ -36,13 +37,9 @@ const AgentControl: React.FC = () => {
       
     setAgentState({ enabledStrategies: newStrategies });
     
-    // Convert to dictionary for backend { "ema_crossover": { "enabled": true }, ... }
-    const strategySettings: any = {};
-    ['ema_crossover', 'rsi_reversal', 'vwap_bounce', 'supertrend', 'macd_cross', 'bollinger_breakout', 'stochastic_reversal'].forEach(s => {
-      strategySettings[s] = { enabled: newStrategies.includes(s) };
+    window.electronAPI?.invoke('settings:save', {
+      strategies: buildStrategySettings(newStrategies),
     });
-    
-    window.electronAPI?.invoke('settings:save', { strategies: strategySettings });
   };
 
   // Group signals by tradingsymbol + direction to calculate confluence
