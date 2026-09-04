@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useTradingStore } from '../stores/trading-store';
 import { SETTINGS_SAVE, AUTH_LOGOUT } from '@shared/ipc-channels';
-import { LLMSettings, OpenCodePlan } from '@shared/types';
+import { LLMSettings, OpenCodePlan, RiskConfig } from '@shared/types';
 
 const LLM_PROVIDERS = ['OpenAI', 'Anthropic', 'Gemini', 'OpenRouter', 'Ollama', 'OpenCode'] as const;
 const LLM_PRESETS: Record<string, Partial<LLMSettings>> = {
@@ -15,6 +15,23 @@ const LLM_PRESETS: Record<string, Partial<LLMSettings>> = {
 const OPENCODE_PLAN_PRESETS: Record<OpenCodePlan, Partial<LLMSettings>> = {
   zen: { baseUrl: 'https://opencode.ai/zen/v1', model: 'big-pickle', openCodePlan: 'zen' },
   go: { baseUrl: 'https://opencode.ai/zen/go/v1', model: 'kimi-k3', openCodePlan: 'go' },
+};
+const DEFAULT_RISK_CONFIG: RiskConfig = {
+  maxCapitalPerTrade: 10000,
+  maxDailyLoss: 2000,
+  maxSimultaneousPositions: 5,
+  startTradeAfter: '09:45',
+  noNewTradesAfter: '15:00',
+  autoSquareOff: true,
+  squareOffTime: '15:15',
+  defaultStopLossPercent: 1.5,
+  defaultTargetPercent: 3,
+  positionRevalWeakExitMins: 15,
+  positionRevalBreakevenMins: 45,
+  transactionCostFilterEnabled: true,
+  brokeragePercentPerOrder: 0.03,
+  brokerageCapPerOrder: 20,
+  statutoryChargesPercentRoundTrip: 0.025,
 };
 
 const Settings: React.FC = () => {
@@ -139,17 +156,7 @@ const Settings: React.FC = () => {
   const resetToDefaults = () => {
     setLocalSettings((prev: any) => ({
       ...prev,
-      risk: {
-        ...prev.risk,
-        maxCapitalPerTrade: 10000,
-        maxDailyLoss: 2000,
-        maxSimultaneousPositions: 5,
-        startTradeAfter: "09:45",
-        autoSquareOff: true,
-        squareOffTime: "15:15",
-        defaultStopLossPercent: 1.5,
-        defaultTargetPercent: 3
-      }
+      risk: { ...DEFAULT_RISK_CONFIG },
     }));
   };
 
@@ -263,7 +270,7 @@ const Settings: React.FC = () => {
                 <label className="block text-surface-400 text-sm mb-1">Max Capital Per Trade (₹)</label>
                 <input 
                   type="number" 
-                  value={localSettings.risk?.maxCapitalPerTrade || ''} 
+                  value={localSettings.risk?.maxCapitalPerTrade ?? ''} 
                   onChange={(e) => handleRiskChange('maxCapitalPerTrade', e.target.value)}
                   className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white focus:border-accent-light outline-none" 
                 />
@@ -272,7 +279,7 @@ const Settings: React.FC = () => {
                 <label className="block text-surface-400 text-sm mb-1">Max Daily Loss (₹)</label>
                 <input 
                   type="number" 
-                  value={localSettings.risk?.maxDailyLoss || ''} 
+                  value={localSettings.risk?.maxDailyLoss ?? ''} 
                   onChange={(e) => handleRiskChange('maxDailyLoss', e.target.value)}
                   className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white focus:border-accent-light outline-none" 
                 />
@@ -281,7 +288,7 @@ const Settings: React.FC = () => {
                 <label className="block text-surface-400 text-sm mb-1">Start Trade After</label>
                 <input 
                   type="time" 
-                  value={localSettings.risk?.startTradeAfter || '09:45'} 
+                  value={localSettings.risk?.startTradeAfter ?? '09:45'} 
                   onChange={(e) => handleRiskChange('startTradeAfter', e.target.value)}
                   className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white focus:border-accent-light outline-none" 
                 />
@@ -304,7 +311,7 @@ const Settings: React.FC = () => {
                 <label className="block text-surface-400 text-sm mb-1">Square Off Time</label>
                 <input 
                   type="time" 
-                  value={localSettings.risk?.squareOffTime || '15:15'} 
+                  value={localSettings.risk?.squareOffTime ?? '15:15'} 
                   onChange={(e) => handleRiskChange('squareOffTime', e.target.value)}
                   disabled={!(localSettings.risk?.autoSquareOff ?? true)}
                   className={`w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white focus:border-accent-light outline-none ${!(localSettings.risk?.autoSquareOff ?? true) ? 'opacity-50 cursor-not-allowed' : ''}`} 
@@ -314,7 +321,7 @@ const Settings: React.FC = () => {
                 <label className="block text-surface-400 text-sm mb-1">Max Simultaneous Positions</label>
                 <input 
                   type="number" 
-                  value={localSettings.risk?.maxSimultaneousPositions || ''} 
+                  value={localSettings.risk?.maxSimultaneousPositions ?? ''} 
                   onChange={(e) => handleRiskChange('maxSimultaneousPositions', e.target.value)}
                   className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white focus:border-accent-light outline-none" 
                 />
@@ -324,7 +331,7 @@ const Settings: React.FC = () => {
                 <input 
                   type="number" 
                   step="0.1"
-                  value={localSettings.risk?.defaultStopLossPercent || ''} 
+                  value={localSettings.risk?.defaultStopLossPercent ?? ''} 
                   onChange={(e) => handleRiskChange('defaultStopLossPercent', e.target.value)}
                   className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white focus:border-accent-light outline-none" 
                 />
@@ -334,9 +341,53 @@ const Settings: React.FC = () => {
                 <input 
                   type="number" 
                   step="0.1"
-                  value={localSettings.risk?.defaultTargetPercent || ''} 
+                  value={localSettings.risk?.defaultTargetPercent ?? ''} 
                   onChange={(e) => handleRiskChange('defaultTargetPercent', e.target.value)}
                   className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white focus:border-accent-light outline-none" 
+                />
+              </div>
+              <div>
+                <label className="block text-surface-400 text-sm mb-1">Profitability Filter (after costs)</label>
+                <div className="flex items-center h-10">
+                  <label className="relative inline-flex items-center cursor-pointer">
+                    <input
+                      type="checkbox"
+                      className="sr-only peer"
+                      checked={localSettings.risk?.transactionCostFilterEnabled ?? true}
+                      onChange={(e) => handleRiskChange('transactionCostFilterEnabled', e.target.checked)}
+                    />
+                    <div className="w-11 h-6 bg-surface-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-accent-dark"></div>
+                  </label>
+                </div>
+              </div>
+              <div>
+                <label className="block text-surface-400 text-sm mb-1">Brokerage per order (%)</label>
+                <input
+                  type="number"
+                  step="0.001"
+                  value={localSettings.risk?.brokeragePercentPerOrder ?? ''}
+                  onChange={(e) => handleRiskChange('brokeragePercentPerOrder', e.target.value)}
+                  className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white focus:border-accent-light outline-none"
+                />
+              </div>
+              <div>
+                <label className="block text-surface-400 text-sm mb-1">Brokerage cap per order (₹)</label>
+                <input
+                  type="number"
+                  step="0.1"
+                  value={localSettings.risk?.brokerageCapPerOrder ?? ''}
+                  onChange={(e) => handleRiskChange('brokerageCapPerOrder', e.target.value)}
+                  className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white focus:border-accent-light outline-none"
+                />
+              </div>
+              <div>
+                <label className="block text-surface-400 text-sm mb-1">Estimated round-trip statutory charges (%)</label>
+                <input
+                  type="number"
+                  step="0.001"
+                  value={localSettings.risk?.statutoryChargesPercentRoundTrip ?? ''}
+                  onChange={(e) => handleRiskChange('statutoryChargesPercentRoundTrip', e.target.value)}
+                  className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white focus:border-accent-light outline-none"
                 />
               </div>
             </div>
