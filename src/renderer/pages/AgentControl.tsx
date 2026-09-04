@@ -34,11 +34,15 @@ const SESSION_LABELS: Record<string, string> = {
 const StrategySelectionPanel: React.FC<{ sessionState?: string }> = ({ sessionState }) => {
   const [record, setRecord] = React.useState<any>(null);
   const [busy, setBusy] = React.useState(false);
+  const [advisorOn, setAdvisorOn] = React.useState(false);
 
   React.useEffect(() => {
     let mounted = true;
     window.electronAPI?.invoke(IPC.AGENT_STRATEGY_SELECTION_GET).then((r: any) => {
       if (mounted && r && Object.keys(r).length) setRecord(r);
+    }).catch(() => {});
+    window.electronAPI?.invoke(IPC.SETTINGS_GET).then((s: any) => {
+      if (mounted && s?.aiStrategyAdvisor) setAdvisorOn(!!s.aiStrategyAdvisor.enabled);
     }).catch(() => {});
     const onSelection = (_e: any, data: any) => setRecord(data);
     window.electronAPI?.on(IPC.AGENT_STRATEGY_SELECTION, onSelection);
@@ -47,6 +51,12 @@ const StrategySelectionPanel: React.FC<{ sessionState?: string }> = ({ sessionSt
       window.electronAPI?.removeAllListeners(IPC.AGENT_STRATEGY_SELECTION);
     };
   }, []);
+
+  const toggleAdvisor = () => {
+    const next = !advisorOn;
+    setAdvisorOn(next);
+    window.electronAPI?.invoke(IPC.SETTINGS_SAVE, { aiStrategyAdvisor: { enabled: next } });
+  };
 
   const reevaluate = async () => {
     setBusy(true);
@@ -77,10 +87,26 @@ const StrategySelectionPanel: React.FC<{ sessionState?: string }> = ({ sessionSt
         </button>
       </div>
 
+      <div className="flex items-center justify-between mb-3 p-2 bg-surface-900 rounded-lg border border-surface-700">
+        <div>
+          <div className="text-sm text-white">AI advisor (LLM)</div>
+          <div className="text-[11px] text-surface-400">Lets your configured LLM refine the regime pick. Always falls back to the deterministic decision.</div>
+        </div>
+        <button
+          onClick={toggleAdvisor}
+          className={`w-12 h-6 rounded-full relative transition-colors shrink-0 ${advisorOn ? 'bg-accent-light' : 'bg-surface-600'}`}
+        >
+          <div className={`absolute top-1 w-4 h-4 rounded-full bg-white transition-transform ${advisorOn ? 'left-7' : 'left-1'}`}></div>
+        </button>
+      </div>
+
       <div className="flex items-center gap-2 flex-wrap mb-3">
         <span className={`px-2 py-1 text-xs font-bold rounded ${REGIME_STYLES[regime] || REGIME_STYLES.UNKNOWN}`}>
           {REGIME_LABELS[regime] || regime}
         </span>
+        {record?.source === 'llm_advisory' && (
+          <span className="px-2 py-1 text-xs rounded bg-accent-dark text-white">LLM advised</span>
+        )}
         {sessionState && (
           <span className="px-2 py-1 text-xs rounded bg-surface-700 text-surface-300">
             {SESSION_LABELS[sessionState] || sessionState}

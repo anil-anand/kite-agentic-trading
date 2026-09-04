@@ -80,6 +80,11 @@ class ConfigManager:
                 "temperature": 0.2,
                 "maxTokens": 1024,
             },
+            # Opt-in LLM advisory layer for session strategy selection (issue
+            # #62, Phase 2). Off by default: when disabled the deterministic
+            # regime classifier decides alone. It never overrides the entry
+            # gates and always falls back to the deterministic decision.
+            "aiStrategyAdvisor": {"enabled": False},
             "mode": "auto",
         }
 

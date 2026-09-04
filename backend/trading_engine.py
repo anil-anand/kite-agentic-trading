@@ -194,13 +194,80 @@ class TradingEngine:
                 "decided_at": now.isoformat(),
             }
 
+        decision.setdefault("source", "deterministic")
+        # Optional LLM advisory pass (Phase 2). Off unless opted in; always
+        # falls back to the deterministic decision on any problem.
+        decision = self._maybe_llm_advise(decision, available_ids)
+
         decision["session_date"] = now.date().isoformat()
-        decision["source"] = "deterministic"
         config_manager.save_strategy_selection(decision)
         self.selection_record = decision
         self._push_log(decision["rationale"], level="info")
         self._push_strategy_selection(decision)
         return decision
+
+    def _maybe_llm_advise(self, decision: dict, available_ids: list) -> dict:
+        """Run the opt-in LLM advisory layer over a deterministic decision. Any
+        failure (disabled, no key, API/parse error) returns the input decision
+        unchanged — the advisory layer can never make the selection worse."""
+        advisor_cfg = config_manager.config.get("aiStrategyAdvisor", {})
+        if not advisor_cfg.get("enabled", False):
+            return decision
+        if not decision.get("applied"):
+            return decision
+
+        try:
+            from .analytics import analytics
+            from .llm_client import OpenAICompatibleClient
+            from .strategy_advisor import advise as llm_advise
+
+            creds = config_manager.get_credentials()
+            llm = config_manager.get_llm_settings()
+            api_key = creds.get("llmApiKey")
+            provider = llm.get("provider", "Gemini")
+            if not api_key and provider != "Ollama":
+                self._push_log(
+                    "AI strategy advisor is on but no LLM API key is configured; "
+                    "using the deterministic decision.",
+                    level="warning",
+                )
+                return decision
+
+            try:
+                expectancy = analytics.get_strategy_expectancy()
+            except Exception:
+                expectancy = []
+
+            def generate_fn(prompt: str) -> str:
+                return OpenAICompatibleClient().generate(
+                    base_url=llm.get("baseUrl", ""),
+                    api_key=api_key,
+                    model=llm.get("model", ""),
+                    prompt=prompt,
+                    provider=provider,
+                    plan=llm.get("openCodePlan", "zen"),
+                )
+
+            result = llm_advise(
+                context=decision.get("inputs_used", {}),
+                deterministic=decision,
+                available_ids=available_ids,
+                generate_fn=generate_fn,
+                expectancy=expectancy,
+            )
+            if result.get("llm_error"):
+                self._push_log(
+                    f"AI strategy advisor failed ({result['llm_error']}); using "
+                    "the deterministic decision.",
+                    level="warning",
+                )
+            return result
+        except Exception as e:
+            self._push_log(
+                f"AI strategy advisor error ({e}); using the deterministic decision.",
+                level="warning",
+            )
+            return decision
 
     def reevaluate_strategies(self):
         """Force a fresh strategy decision on demand (manual re-evaluate)."""
