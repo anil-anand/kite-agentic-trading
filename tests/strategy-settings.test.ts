@@ -8,7 +8,7 @@ test('builds settings for every configured strategy', () => {
   const settings = buildStrategySettings(enabledStrategies);
 
   assert.deepEqual(Object.keys(settings), STRATEGY_IDS);
-  assert.equal(settings.ema_crossover.enabled, true);
-  assert.equal(settings.stoc_rsi.enabled, true);
-  assert.equal(settings.adx_momentum.enabled, false);
+  for (const strategyId of STRATEGY_IDS) {
+    assert.equal(settings[strategyId].enabled, enabledStrategies.includes(strategyId));
+  }
 });
