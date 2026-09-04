@@ -49,6 +49,18 @@ class TestBuildPrompt:
         prompt = build_prompt({}, _deterministic(), AVAILABLE)
         assert "no history yet" in prompt
 
+    def test_includes_news_when_provided(self):
+        prompt = build_prompt(
+            {}, _deterministic(), AVAILABLE, None, ["RBI holds rates", "Infy cut"]
+        )
+        assert "Market news headlines" in prompt
+        assert "RBI holds rates" in prompt
+
+    def test_no_news_section_when_absent(self):
+        assert "Market news headlines" not in build_prompt(
+            {}, _deterministic(), AVAILABLE
+        )
+
 
 class TestParseResponse:
     def test_valid_object(self):

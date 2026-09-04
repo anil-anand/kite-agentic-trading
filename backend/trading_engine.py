@@ -238,6 +238,18 @@ class TradingEngine:
             except Exception:
                 expectancy = []
 
+            # Optional, best-effort market news (Phase 3). Off the critical
+            # path: any failure yields an empty list and the advisor proceeds
+            # without it.
+            news = []
+            if advisor_cfg.get("useNews", False):
+                try:
+                    from .news_provider import market_news
+
+                    news = market_news.headlines(limit=10)
+                except Exception:
+                    news = []
+
             def generate_fn(prompt: str) -> str:
                 return OpenAICompatibleClient().generate(
                     base_url=llm.get("baseUrl", ""),
@@ -254,6 +266,7 @@ class TradingEngine:
                 available_ids=available_ids,
                 generate_fn=generate_fn,
                 expectancy=expectancy,
+                news=news,
             )
             if result.get("llm_error"):
                 self._push_log(

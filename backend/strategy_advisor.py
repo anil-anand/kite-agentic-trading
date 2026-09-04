@@ -39,6 +39,7 @@ def build_prompt(
     deterministic: dict,
     available_ids: List[str],
     expectancy: Optional[List[dict]] = None,
+    news: Optional[List[str]] = None,
 ) -> str:
     """Build the advisory prompt. Pure — no I/O."""
     expectancy = expectancy or []
@@ -61,6 +62,15 @@ def build_prompt(
         lines.append(f"- {sid} (family: {_family_of(sid)}) — {hist}")
     strategy_block = "\n".join(lines)
 
+    # Optional, best-effort market news. Absent by design when unavailable.
+    news_block = ""
+    if news:
+        headlines = "\n".join(f"- {h}" for h in news)
+        news_block = (
+            "\n\nMarket news headlines for today (best-effort, may be incomplete "
+            "or noisy — weigh accordingly):\n" + headlines
+        )
+
     return f"""You are a trading-strategy selector for an intraday equities agent.
 A deterministic classifier has already assessed today's market regime. Your job
 is to CONFIRM or make small, well-justified ADJUSTMENTS to which strategies to
@@ -77,7 +87,7 @@ Deterministic recommendation:
 - disable: {deterministic.get("disabled")}
 
 Strategies you may choose from (with historical performance):
-{strategy_block}
+{strategy_block}{news_block}
 
 Rules:
 - You may ONLY enable strategies from the list above. Do not invent ids.
@@ -133,20 +143,22 @@ def advise(
     available_ids: List[str],
     generate_fn: Callable[[str], str],
     expectancy: Optional[List[dict]] = None,
+    news: Optional[List[str]] = None,
 ) -> Dict[str, object]:
     """Ask the LLM to confirm/adjust the deterministic decision.
 
     ``generate_fn`` takes the prompt and returns the raw model text (injected so
-    this is testable and provider-agnostic). Returns a decision record in the
-    same shape as the deterministic one. On any failure the deterministic
-    decision is returned unchanged (with an ``llm_error`` note for the audit).
+    this is testable and provider-agnostic). ``news`` is optional best-effort
+    market-news context. Returns a decision record in the same shape as the
+    deterministic one. On any failure the deterministic decision is returned
+    unchanged (with an ``llm_error`` note for the audit).
     """
     # Nothing to advise on if the deterministic layer made no applicable call.
     if not deterministic.get("applied"):
         return deterministic
 
     try:
-        prompt = build_prompt(context, deterministic, available_ids, expectancy)
+        prompt = build_prompt(context, deterministic, available_ids, expectancy, news)
         raw = generate_fn(prompt)
         parsed = parse_response(raw, available_ids)
     except Exception as e:

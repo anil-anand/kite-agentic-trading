@@ -35,6 +35,7 @@ const StrategySelectionPanel: React.FC<{ sessionState?: string }> = ({ sessionSt
   const [record, setRecord] = React.useState<any>(null);
   const [busy, setBusy] = React.useState(false);
   const [advisorOn, setAdvisorOn] = React.useState(false);
+  const [newsOn, setNewsOn] = React.useState(false);
 
   React.useEffect(() => {
     let mounted = true;
@@ -42,7 +43,10 @@ const StrategySelectionPanel: React.FC<{ sessionState?: string }> = ({ sessionSt
       if (mounted && r && Object.keys(r).length) setRecord(r);
     }).catch(() => {});
     window.electronAPI?.invoke(IPC.SETTINGS_GET).then((s: any) => {
-      if (mounted && s?.aiStrategyAdvisor) setAdvisorOn(!!s.aiStrategyAdvisor.enabled);
+      if (mounted && s?.aiStrategyAdvisor) {
+        setAdvisorOn(!!s.aiStrategyAdvisor.enabled);
+        setNewsOn(!!s.aiStrategyAdvisor.useNews);
+      }
     }).catch(() => {});
     const onSelection = (_e: any, data: any) => setRecord(data);
     window.electronAPI?.on(IPC.AGENT_STRATEGY_SELECTION, onSelection);
@@ -55,7 +59,13 @@ const StrategySelectionPanel: React.FC<{ sessionState?: string }> = ({ sessionSt
   const toggleAdvisor = () => {
     const next = !advisorOn;
     setAdvisorOn(next);
-    window.electronAPI?.invoke(IPC.SETTINGS_SAVE, { aiStrategyAdvisor: { enabled: next } });
+    window.electronAPI?.invoke(IPC.SETTINGS_SAVE, { aiStrategyAdvisor: { enabled: next, useNews: newsOn } });
+  };
+
+  const toggleNews = () => {
+    const next = !newsOn;
+    setNewsOn(next);
+    window.electronAPI?.invoke(IPC.SETTINGS_SAVE, { aiStrategyAdvisor: { enabled: advisorOn, useNews: next } });
   };
 
   const reevaluate = async () => {
@@ -99,6 +109,21 @@ const StrategySelectionPanel: React.FC<{ sessionState?: string }> = ({ sessionSt
           <div className={`absolute top-1 w-4 h-4 rounded-full bg-white transition-transform ${advisorOn ? 'left-7' : 'left-1'}`}></div>
         </button>
       </div>
+
+      {advisorOn && (
+        <div className="flex items-center justify-between mb-3 p-2 pl-4 bg-surface-900 rounded-lg border border-surface-700">
+          <div>
+            <div className="text-sm text-white">Include market news</div>
+            <div className="text-[11px] text-surface-400">Best-effort NSE headlines added to the advisor prompt. Optional — never blocks the decision.</div>
+          </div>
+          <button
+            onClick={toggleNews}
+            className={`w-12 h-6 rounded-full relative transition-colors shrink-0 ${newsOn ? 'bg-accent-light' : 'bg-surface-600'}`}
+          >
+            <div className={`absolute top-1 w-4 h-4 rounded-full bg-white transition-transform ${newsOn ? 'left-7' : 'left-1'}`}></div>
+          </button>
+        </div>
+      )}
 
       <div className="flex items-center gap-2 flex-wrap mb-3">
         <span className={`px-2 py-1 text-xs font-bold rounded ${REGIME_STYLES[regime] || REGIME_STYLES.UNKNOWN}`}>

@@ -11,10 +11,21 @@ import pytest
 
 import backend.analytics as analytics_mod
 import backend.llm_client as llm_mod
+import backend.news_provider as news_mod
 import backend.trading_engine as te
 from backend.config import config_manager
 from backend.scanner import scanner
 from backend.trading_engine import TradingEngine
+
+
+class PromptSpy:
+    """Captures the prompt sent to the LLM and returns a fixed valid response."""
+
+    last_prompt = None
+
+    def generate(self, **kwargs):
+        PromptSpy.last_prompt = kwargs.get("prompt", "")
+        return '{"enabled": ["supertrend"], "rationale": "ok"}'
 
 
 class FakeKite:
@@ -134,3 +145,38 @@ def test_flag_on_llm_error_falls_back(engine, monkeypatch):
     assert rec["llm_error"] == "HTTP 500"
     # Deterministic overlay still applied normally.
     assert rec["applied"] is True
+
+
+def test_news_added_to_prompt_only_when_usenews_on(engine, monkeypatch):
+    config_manager.config["aiStrategyAdvisor"]["enabled"] = True
+    config_manager.config["aiStrategyAdvisor"]["useNews"] = True
+    monkeypatch.setattr(
+        news_mod.market_news, "headlines", lambda limit=10: ["RBI holds rates"]
+    )
+    monkeypatch.setattr(llm_mod, "OpenAICompatibleClient", PromptSpy)
+    PromptSpy.last_prompt = None
+
+    engine.run_strategy_selection(now=NOW)
+
+    assert "Market news headlines" in PromptSpy.last_prompt
+    assert "RBI holds rates" in PromptSpy.last_prompt
+
+
+def test_news_not_fetched_when_usenews_off(engine, monkeypatch):
+    config_manager.config["aiStrategyAdvisor"]["enabled"] = True
+    config_manager.config["aiStrategyAdvisor"]["useNews"] = False
+
+    called = {"n": 0}
+
+    def _headlines(limit=10):
+        called["n"] += 1
+        return ["should not appear"]
+
+    monkeypatch.setattr(news_mod.market_news, "headlines", _headlines)
+    monkeypatch.setattr(llm_mod, "OpenAICompatibleClient", PromptSpy)
+    PromptSpy.last_prompt = None
+
+    engine.run_strategy_selection(now=NOW)
+
+    assert called["n"] == 0
+    assert "Market news headlines" not in PromptSpy.last_prompt
