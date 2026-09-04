@@ -2,8 +2,132 @@ import React from 'react';
 import { useTradingStore } from '../stores/trading-store';
 import SignalCard from '../components/SignalCard';
 import { useKiteAPI } from '../hooks/useKiteAPI';
-import { Check, X } from 'lucide-react';
+import { Check, X, RefreshCw } from 'lucide-react';
 import { buildStrategySettings, STRATEGY_IDS } from '../utils/strategy-settings';
+import * as IPC from '@shared/ipc-channels';
+
+const REGIME_LABELS: Record<string, string> = {
+  TRENDING: 'Trending',
+  RANGE_BOUND: 'Range-bound',
+  HIGH_VOLATILITY: 'High volatility',
+  UNKNOWN: 'Undetermined',
+  MANUAL: 'Manual',
+};
+
+const REGIME_STYLES: Record<string, string> = {
+  TRENDING: 'bg-profit-fade text-profit-light',
+  RANGE_BOUND: 'bg-accent-dark text-white',
+  HIGH_VOLATILITY: 'bg-loss-fade text-loss-light',
+  UNKNOWN: 'bg-surface-700 text-surface-300',
+  MANUAL: 'bg-surface-700 text-surface-300',
+};
+
+const SESSION_LABELS: Record<string, string> = {
+  warmup: 'Warming up',
+  observing: 'Observing (no trades)',
+  active: 'Active',
+  halted: 'Halted',
+};
+
+// Session strategy-selection audit panel (issue #62). Read-only view of the
+// deterministic regime decision plus a manual re-evaluate control.
+const StrategySelectionPanel: React.FC<{ sessionState?: string }> = ({ sessionState }) => {
+  const [record, setRecord] = React.useState<any>(null);
+  const [busy, setBusy] = React.useState(false);
+
+  React.useEffect(() => {
+    let mounted = true;
+    window.electronAPI?.invoke(IPC.AGENT_STRATEGY_SELECTION_GET).then((r: any) => {
+      if (mounted && r && Object.keys(r).length) setRecord(r);
+    }).catch(() => {});
+    const onSelection = (_e: any, data: any) => setRecord(data);
+    window.electronAPI?.on(IPC.AGENT_STRATEGY_SELECTION, onSelection);
+    return () => {
+      mounted = false;
+      window.electronAPI?.removeAllListeners(IPC.AGENT_STRATEGY_SELECTION);
+    };
+  }, []);
+
+  const reevaluate = async () => {
+    setBusy(true);
+    try {
+      const r = await window.electronAPI?.invoke(IPC.AGENT_STRATEGY_REEVALUATE);
+      if (r) setRecord(r);
+    } catch (e) {
+      console.error('Re-evaluate failed', e);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const regime = record?.regime || 'UNKNOWN';
+  const decidedAt = record?.decided_at ? new Date(record.decided_at).toLocaleTimeString() : null;
+  const missing: string[] = record?.inputs_missing || [];
+
+  return (
+    <div className="bg-surface-800 border border-surface-700 rounded-xl p-6">
+      <div className="flex justify-between items-center mb-3">
+        <h2 className="text-lg font-semibold text-white">Session Strategy Selection</h2>
+        <button
+          onClick={reevaluate}
+          disabled={busy}
+          className="flex items-center gap-2 text-xs bg-surface-700 hover:bg-surface-600 disabled:opacity-50 text-white px-3 py-1.5 rounded transition-colors"
+        >
+          <RefreshCw size={14} className={busy ? 'animate-spin' : ''} /> Re-evaluate
+        </button>
+      </div>
+
+      <div className="flex items-center gap-2 flex-wrap mb-3">
+        <span className={`px-2 py-1 text-xs font-bold rounded ${REGIME_STYLES[regime] || REGIME_STYLES.UNKNOWN}`}>
+          {REGIME_LABELS[regime] || regime}
+        </span>
+        {sessionState && (
+          <span className="px-2 py-1 text-xs rounded bg-surface-700 text-surface-300">
+            {SESSION_LABELS[sessionState] || sessionState}
+          </span>
+        )}
+        {decidedAt && <span className="text-xs text-surface-400">decided {decidedAt}</span>}
+      </div>
+
+      {record ? (
+        <>
+          <p className="text-sm text-surface-300 mb-3">{record.rationale}</p>
+          {record.applied ? (
+            <div className="grid grid-cols-2 gap-4 text-sm">
+              <div>
+                <span className="text-profit-light font-medium">Enabled ({record.enabled?.length || 0})</span>
+                <div className="mt-1 flex flex-wrap gap-1">
+                  {(record.enabled || []).map((s: string) => (
+                    <span key={s} className="text-[10px] bg-surface-900 text-surface-300 px-2 py-0.5 rounded capitalize">
+                      {s.replace(/_/g, ' ')}
+                    </span>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <span className="text-loss-light font-medium">Disabled ({record.disabled?.length || 0})</span>
+                <div className="mt-1 flex flex-wrap gap-1">
+                  {(record.disabled || []).map((s: string) => (
+                    <span key={s} className="text-[10px] bg-surface-900 text-surface-500 px-2 py-0.5 rounded capitalize">
+                      {s.replace(/_/g, ' ')}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            </div>
+          ) : (
+            <p className="text-xs text-surface-400">No overlay applied — the baseline strategy set is used unchanged.</p>
+          )}
+          {missing.length > 0 && (
+            <p className="text-[11px] text-surface-500 mt-3">Inputs unavailable: {missing.join(', ')}</p>
+          )}
+        </>
+      ) : (
+        <p className="text-sm text-surface-400">No decision yet for this session.</p>
+      )}
+    </div>
+  );
+};
 
 const AgentControl: React.FC = () => {
   const { agentState, signals, setAgentState } = useTradingStore();
@@ -124,9 +248,11 @@ const AgentControl: React.FC = () => {
             </div>
           </div>
 
+          <StrategySelectionPanel sessionState={(agentState as any).session_state} />
+
           <div className="bg-surface-800 border border-surface-700 rounded-xl p-6">
             <h2 className="text-lg font-semibold text-white mb-2">Active Strategies</h2>
-            <p className="text-sm text-surface-400 mb-4">All enabled strategies will be evaluated together for every stock in the scan.</p>
+            <p className="text-sm text-surface-400 mb-4">All enabled strategies will be evaluated together for every stock in the scan. When a session strategy selection is applied above, only the strategies it enables are evaluated.</p>
             <div className="grid grid-cols-2 gap-4">
               {STRATEGY_IDS.map((strat) => {
                 const isEnabled = agentState.enabledStrategies.includes(strat as any);

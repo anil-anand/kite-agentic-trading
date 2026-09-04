@@ -134,6 +134,18 @@ export function setupIpcHandlers() {
     return await pythonBridge.call('agent_scan_now');
   });
 
+  ipcMain.handle(channels.AGENT_STRATEGY_SELECTION_GET, async () => {
+    return await pythonBridge.call('get_strategy_selection');
+  });
+
+  ipcMain.handle(channels.AGENT_STRATEGY_REEVALUATE, async () => {
+    return await pythonBridge.call('reevaluate_strategies');
+  });
+
+  ipcMain.handle(channels.AGENT_STRATEGY_OVERRIDE, async (_, enabled: string[]) => {
+    return await pythonBridge.call('set_strategy_override', { enabled });
+  });
+
   // ─── Activity Log ─────────────────────────────────────────────────
   
   ipcMain.handle(channels.LOG_GET_ALL, async () => {

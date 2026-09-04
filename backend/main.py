@@ -138,6 +138,17 @@ def handle_request(req):
         elif method == "agent_status":
             return success(trading_engine.status())
 
+        elif method == "get_strategy_selection":
+            return success(config_manager.get_strategy_selection())
+
+        elif method == "reevaluate_strategies":
+            return success(trading_engine.reevaluate_strategies())
+
+        elif method == "set_strategy_override":
+            return success(
+                trading_engine.set_strategy_override(params.get("enabled", []))
+            )
+
         elif method == "get_settings":
             return success(config_manager.get_settings())
 
