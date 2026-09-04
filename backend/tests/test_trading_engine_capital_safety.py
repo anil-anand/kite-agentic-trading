@@ -193,7 +193,9 @@ def test_execute_signal_rejects_low_expected_profit_after_costs(monkeypatch):
     assert fake_client.place_calls == []
 
 
-def test_execute_signal_allows_low_expected_profit_when_cost_filter_disabled(monkeypatch):
+def test_execute_signal_allows_low_expected_profit_when_cost_filter_disabled(
+    monkeypatch,
+):
     import backend.trading_engine as te
 
     fake_client = FakeKiteClient()

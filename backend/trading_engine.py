@@ -66,7 +66,9 @@ class TradingEngine:
         if quantity <= 0 or entry_price <= 0 or exit_price <= 0:
             return 0.0
 
-        brokerage_pct = max(0.0, risk_config.get("brokeragePercentPerOrder", 0.03)) / 100
+        brokerage_pct = (
+            max(0.0, risk_config.get("brokeragePercentPerOrder", 0.03)) / 100
+        )
         brokerage_cap = max(0.0, risk_config.get("brokerageCapPerOrder", 20))
         statutory_pct = (
             max(0.0, risk_config.get("statutoryChargesPercentRoundTrip", 0.015)) / 100
