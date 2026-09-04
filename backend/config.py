@@ -208,6 +208,11 @@ class ConfigManager:
             self.config["credentials"]["accessToken"] = self._encrypt(access_token)
         self.save()
 
+    def clear_access_token(self):
+        if "credentials" in self.config:
+            self.config["credentials"]["accessToken"] = ""
+            self.save()
+
     def save_llm_api_key(self, llm_api_key: str):
         self.config.setdefault("llm", deepcopy(self.default_config["llm"]))
         self.config["llm"]["apiKey"] = self._encrypt(llm_api_key)

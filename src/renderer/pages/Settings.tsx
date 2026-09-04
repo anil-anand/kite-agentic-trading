@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useTradingStore } from '../stores/trading-store';
-import { SETTINGS_SAVE } from '@shared/ipc-channels';
+import { SETTINGS_SAVE, AUTH_LOGOUT } from '@shared/ipc-channels';
 import { LLMSettings } from '@shared/types';
 
 const LLM_PROVIDERS = ['OpenAI', 'Anthropic', 'Gemini', 'OpenRouter', 'Ollama', 'OpenCode'] as const;
@@ -14,13 +14,14 @@ const LLM_PRESETS: Record<string, Partial<LLMSettings>> = {
 };
 
 const Settings: React.FC = () => {
-  const { settings, setSettings } = useTradingStore();
+  const { settings, setSettings, auth, setAuth } = useTradingStore();
   const [localSettings, setLocalSettings] = useState<any>(settings);
   const [saveStatus, setSaveStatus] = useState<string>('');
   const [llmKey, setLlmKey] = useState<string>('');
   const [models, setModels] = useState<string[]>([]);
   const [discovering, setDiscovering] = useState(false);
   const [discoveryError, setDiscoveryError] = useState('');
+  const [sessionExpiry, setSessionExpiry] = useState<string>('');
 
   // Sync local state when global settings load
   useEffect(() => {
@@ -29,6 +30,38 @@ const Settings: React.FC = () => {
       setLlmKey('');
     }
   }, [settings]);
+
+  useEffect(() => {
+    if (auth.isLoggedIn) {
+      const calculateExpiry = () => {
+        const now = new Date();
+        const expiry = new Date();
+        expiry.setHours(6, 0, 0, 0); // 6 AM
+        if (now.getHours() >= 6) {
+          expiry.setDate(expiry.getDate() + 1);
+        }
+        
+        const diffMs = expiry.getTime() - now.getTime();
+        const diffHrs = Math.floor(diffMs / (1000 * 60 * 60));
+        const diffMins = Math.floor((diffMs % (1000 * 60 * 60)) / (1000 * 60));
+        
+        setSessionExpiry(`Session expires daily at 6:00 AM IST (${diffHrs}h ${diffMins}m remaining)`);
+      };
+      
+      calculateExpiry();
+      const interval = setInterval(calculateExpiry, 60000); // update every min
+      return () => clearInterval(interval);
+    }
+  }, [auth.isLoggedIn]);
+
+  const handleLogout = async () => {
+    try {
+      await window.electronAPI?.invoke(AUTH_LOGOUT);
+      setAuth({ isLoggedIn: false, credentials: null });
+    } catch (e) {
+      console.error('Logout failed', e);
+    }
+  };
 
   if (!localSettings) {
     return <div className="p-6 text-white">Loading settings...</div>;
@@ -123,8 +156,26 @@ const Settings: React.FC = () => {
         
         <div className="space-y-6">
           <section className="bg-surface-800 p-6 rounded-xl border border-surface-700">
-            <h2 className="text-lg font-semibold text-white mb-4">API Credentials</h2>
+            <div className="flex justify-between items-center mb-4">
+              <h2 className="text-lg font-semibold text-white">API Credentials</h2>
+              {auth.isLoggedIn && (
+                <button
+                  onClick={handleLogout}
+                  className="px-4 py-1.5 bg-loss-dark hover:bg-loss rounded-lg text-white text-sm font-medium transition-colors"
+                >
+                  Log Out
+                </button>
+              )}
+            </div>
             <div className="space-y-4">
+              {auth.isLoggedIn && sessionExpiry && (
+                <div className="p-3 bg-surface-700 border border-surface-600 rounded-lg mb-4">
+                  <p className="text-sm text-profit-light flex items-center gap-2">
+                    <span className="w-2 h-2 rounded-full bg-profit"></span>
+                    {sessionExpiry}
+                  </p>
+                </div>
+              )}
               <div>
                 <label className="block text-surface-400 text-sm mb-1">Kite API Key</label>
                 <input type="password" value="••••••••••••••••" readOnly className="w-full bg-surface-900 border border-surface-700 rounded-lg px-4 py-2 text-white" />
