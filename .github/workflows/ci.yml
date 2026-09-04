@@ -50,6 +50,9 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      - name: Strategy settings test
+        run: npm run test:strategy-settings
+
       - name: Build
         # build:main + build:renderer are the TypeScript/renderer compile. The
         # full `build` also runs build:icon, which needs Python + Pillow to

@@ -3,7 +3,7 @@ import { useTradingStore } from '../stores/trading-store';
 import SignalCard from '../components/SignalCard';
 import { useKiteAPI } from '../hooks/useKiteAPI';
 import { Check, X } from 'lucide-react';
-import { buildStrategySettings } from '../utils/strategy-settings';
+import { buildStrategySettings, STRATEGY_IDS } from '../utils/strategy-settings';
 
 const AgentControl: React.FC = () => {
   const { agentState, signals, setAgentState } = useTradingStore();
@@ -128,13 +128,7 @@ const AgentControl: React.FC = () => {
             <h2 className="text-lg font-semibold text-white mb-2">Active Strategies</h2>
             <p className="text-sm text-surface-400 mb-4">All enabled strategies will be evaluated together for every stock in the scan.</p>
             <div className="grid grid-cols-2 gap-4">
-              {[
-                'ema_crossover', 'rsi_reversal', 'vwap_bounce', 'supertrend', 
-                'macd_cross', 'bollinger_breakout', 'stochastic_reversal',
-                'adx_momentum', 'psar_trend', 'donchian_breakout', 'cci_reversal',
-                'williams_r', 'mfi_exhaustion', 'keltner_breakout', 
-                'awesome_oscillator', 'tsi_cross', 'stoc_rsi'
-              ].map((strat) => {
+              {STRATEGY_IDS.map((strat) => {
                 const isEnabled = agentState.enabledStrategies.includes(strat as any);
                 return (
                   <div key={strat} className="flex items-center justify-between p-3 bg-surface-900 rounded-lg border border-surface-700">
