@@ -115,7 +115,7 @@ class TradingEngine:
 
     def _run_loop(self):
         last_scan_time = 0
-        scan_interval = 60  # Check for new signals every 60 seconds
+        scan_interval = 30  # Check for new signals every 30 seconds
         monitor_interval = 5  # Check open positions every 5 seconds for rapid exits
 
         while self.running:
