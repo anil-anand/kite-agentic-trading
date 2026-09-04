@@ -11,6 +11,8 @@ from backend.news_provider import (
     CACHE_TTL_MINUTES,
     STALE_AFTER_MINUTES,
     MarketNewsProvider,
+    _parse_nse_announcements,
+    _parse_rss,
 )
 
 
@@ -135,3 +137,56 @@ def test_headlines_skips_blank():
         now_fn=clock.now,
     )
     assert p.headlines() == ["A"]
+
+
+def test_changing_provider_invalidates_cache():
+    clock = Clock(datetime.datetime(2026, 9, 4, 10, 0))
+    p = MarketNewsProvider(fetch_fn=lambda limit: _items("A"), now_fn=clock.now)
+    p.get_news()
+    assert p._cache  # populated
+    p.set_provider("nse_announcements")
+    assert p.provider == "nse_announcements"
+    assert p._cache == []  # cache dropped so we don't mix sources
+    assert p._fetched_at is None
+
+
+class TestParsers:
+    def test_parse_google_news_rss(self):
+        xml = b"""<?xml version="1.0"?>
+        <rss version="2.0"><channel>
+          <item><title>Nifty ends higher</title><pubDate>Fri, 04 Sep 2026</pubDate></item>
+          <item><title>Sensex slips 200 pts</title><pubDate>Fri, 04 Sep 2026</pubDate></item>
+          <item><title></title></item>
+        </channel></rss>"""
+        out = _parse_rss(xml, limit=10)
+        assert [i["headline"] for i in out] == [
+            "Nifty ends higher",
+            "Sensex slips 200 pts",
+        ]
+        assert out[0]["timestamp"] == "Fri, 04 Sep 2026"
+
+    def test_parse_rss_respects_limit(self):
+        xml = b"""<rss><channel>
+          <item><title>A</title></item>
+          <item><title>B</title></item>
+          <item><title>C</title></item>
+        </channel></rss>"""
+        assert len(_parse_rss(xml, limit=2)) == 2
+
+    def test_parse_nse_announcements(self):
+        payload = {
+            "data": [
+                {"subject": "Board Meeting Intimation", "an_dt": "2026-09-04 10:00"},
+                {"desc": "Buyback update", "dt": "2026-09-04 09:30"},
+                {"subject": ""},  # skipped
+            ]
+        }
+        out = _parse_nse_announcements(payload, limit=10)
+        assert [i["headline"] for i in out] == [
+            "Board Meeting Intimation",
+            "Buyback update",
+        ]
+
+    def test_parse_nse_announcements_handles_garbage(self):
+        assert _parse_nse_announcements({}, 10) == []
+        assert _parse_nse_announcements({"data": "nope"}, 10) == []

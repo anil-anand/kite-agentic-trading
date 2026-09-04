@@ -114,7 +114,7 @@ const StrategySelectionPanel: React.FC<{ sessionState?: string }> = ({ sessionSt
         <div className="flex items-center justify-between mb-3 p-2 pl-4 bg-surface-900 rounded-lg border border-surface-700">
           <div>
             <div className="text-sm text-white">Include market news</div>
-            <div className="text-[11px] text-surface-400">Best-effort NSE headlines added to the advisor prompt. Optional — never blocks the decision.</div>
+            <div className="text-[11px] text-surface-400">Best-effort market-news headlines added to the advisor prompt. Optional — never blocks the decision.</div>
           </div>
           <button
             onClick={toggleNews}

@@ -85,6 +85,11 @@ class ConfigManager:
             # regime classifier decides alone. It never overrides the entry
             # gates and always falls back to the deterministic decision.
             "aiStrategyAdvisor": {"enabled": False, "useNews": False},
+            # Best-effort market-news source for the advisor (issue #62, Phase
+            # 3). Keyless Google News RSS by default; "nse_announcements" is an
+            # alternative (corporate filings). Only consulted when the advisor's
+            # useNews is on; never on the critical path.
+            "marketNews": {"provider": "google_news_rss"},
             "mode": "auto",
         }
 

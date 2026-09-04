@@ -246,6 +246,10 @@ class TradingEngine:
                 try:
                     from .news_provider import market_news
 
+                    provider = config_manager.config.get("marketNews", {}).get(
+                        "provider", "google_news_rss"
+                    )
+                    market_news.set_provider(provider)
                     news = market_news.headlines(limit=10)
                 except Exception:
                     news = []
