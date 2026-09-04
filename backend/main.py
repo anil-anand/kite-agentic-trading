@@ -62,6 +62,12 @@ def handle_request(req):
 
             return success({"is_valid": True})
 
+        elif method == "logout":
+            config_manager.clear_access_token()
+            kite_client.set_access_token(None)
+            ticker_manager.stop()
+            return success({"status": "logged_out"})
+
         elif method == "generate_session":
             request_token = params.get("request_token")
             api_key = params.get("api_key")

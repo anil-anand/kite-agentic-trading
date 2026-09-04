@@ -234,6 +234,7 @@ export interface RiskConfig {
   maxDailyLoss: number;
   maxOpenPositions: number;
   noNewTradesAfter: string; // "14:30" format
+  startTradeAfter: string; // "09:45" format
   autoSquareOff: boolean;
   squareOffTime: string; // "15:10" format
   defaultStopLossPercent: number;

@@ -17,6 +17,7 @@ class ConfigManager:
                 "maxCapitalPerTrade": 10000,
                 "maxDailyLoss": 2000,
                 "maxSimultaneousPositions": 5,
+                "startTradeAfter": "09:45",
                 "noNewTradesAfter": "15:00",
                 "autoSquareOff": True,
                 "squareOffTime": "15:15",
@@ -217,6 +218,11 @@ class ConfigManager:
         if access_token:
             self.config["credentials"]["accessToken"] = self._encrypt(access_token)
         self.save()
+
+    def clear_access_token(self):
+        if "credentials" in self.config:
+            self.config["credentials"]["accessToken"] = ""
+            self.save()
 
     def save_llm_api_key(self, llm_api_key: str):
         self.config.setdefault("llm", deepcopy(self.default_config["llm"]))
