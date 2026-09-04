@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+import datetime
 import json
 from copy import deepcopy
 from pathlib import Path
@@ -77,6 +80,11 @@ class ConfigManager:
                 "temperature": 0.2,
                 "maxTokens": 1024,
             },
+            # Opt-in LLM advisory layer for session strategy selection (issue
+            # #62, Phase 2). Off by default: when disabled the deterministic
+            # regime classifier decides alone. It never overrides the entry
+            # gates and always falls back to the deterministic decision.
+            "aiStrategyAdvisor": {"enabled": False},
             "mode": "auto",
         }
 
@@ -234,6 +242,65 @@ class ConfigManager:
 
     def get_strategy_config(self):
         return self.config.get("strategies", self.default_config["strategies"])
+
+    # --- Per-session AI/regime strategy overlay ------------------------------
+    # The baseline strategy config above is the user's *permitted* set and is
+    # never mutated by the selector. A session decision is stored separately as
+    # an overlay (tagged with the trading date). The effective set the scanner
+    # runs is baseline-enabled INTERSECT overlay-enabled — so the overlay can
+    # only ever narrow the user's permitted set, never enable something they
+    # disabled.
+    def get_strategy_selection(self) -> dict:
+        path = self.config_dir / "strategy_selection.json"
+        if path.exists():
+            try:
+                with open(path, "r") as f:
+                    return json.load(f)
+            except Exception:
+                return {}
+        return {}
+
+    def save_strategy_selection(self, record: dict):
+        path = self.config_dir / "strategy_selection.json"
+        with open(path, "w") as f:
+            json.dump(record, f, indent=4, default=str)
+
+    def clear_strategy_selection(self):
+        path = self.config_dir / "strategy_selection.json"
+        if path.exists():
+            try:
+                path.unlink()
+            except Exception:
+                pass
+
+    def _todays_overlay_enabled(self) -> set | None:
+        """The set of strategy ids the overlay enables for *today*, or None when
+        there is no applicable overlay (so the baseline is used unchanged)."""
+        record = self.get_strategy_selection()
+        if not record or not record.get("applied"):
+            return None
+        today = datetime.date.today().isoformat()
+        if record.get("session_date") != today:
+            return None
+        enabled = record.get("enabled")
+        if not isinstance(enabled, list):
+            return None
+        return set(enabled)
+
+    def get_effective_strategy_config(self) -> dict:
+        """Baseline strategy config with today's overlay applied: a strategy is
+        effectively enabled only if the user permits it AND the overlay enables
+        it. With no applicable overlay this returns the baseline unchanged."""
+        baseline = self.get_strategy_config()
+        overlay = self._todays_overlay_enabled()
+        if overlay is None:
+            return baseline
+        effective = {}
+        for sid, cfg in baseline.items():
+            merged = dict(cfg)
+            merged["enabled"] = bool(cfg.get("enabled", False)) and sid in overlay
+            effective[sid] = merged
+        return effective
 
     def get_watchlist(self):
         return self.config.get("watchlist", self.default_config["watchlist"])

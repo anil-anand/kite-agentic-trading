@@ -91,7 +91,7 @@ class Scanner:
         import concurrent.futures
 
         all_signals = []
-        strategy_config = config_manager.get_strategy_config()
+        strategy_config = config_manager.get_effective_strategy_config()
 
         instruments = kite_client.get_instruments("NSE")
         instrument_map = {
@@ -148,7 +148,7 @@ class Scanner:
         Re-evaluate a single symbol against all enabled strategies.
         Returns a directional summary for thesis invalidation checks.
         """
-        strategy_config = config_manager.get_strategy_config()
+        strategy_config = config_manager.get_effective_strategy_config()
 
         df, _ = self._fetch_candles(instrument_token, tradingsymbol)
         if df.empty:
