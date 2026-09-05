@@ -211,7 +211,7 @@ class TradeJournal:
 
         cursor = conn.execute(
             """
-            SELECT tradingsymbol FROM trades 
+            SELECT tradingsymbol FROM trades
             WHERE entry_time >= ?
         """,
             (today,),
@@ -230,7 +230,7 @@ class TradeJournal:
         conn = self._get_conn()
         cursor = conn.execute(
             """
-            SELECT exit_time FROM trades 
+            SELECT exit_time FROM trades
             WHERE tradingsymbol = ? AND exit_time IS NOT NULL
             ORDER BY exit_time DESC LIMIT 1
         """,
