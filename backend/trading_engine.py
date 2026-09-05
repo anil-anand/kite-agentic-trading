@@ -581,12 +581,31 @@ class TradingEngine:
             # Get symbols of currently open positions to track manual closures
             open_symbols = {p["tradingsymbol"] for p in positions if p["quantity"] != 0}
 
+            # 1. Sync pending exits FIRST. If an exit order was filled, the position
+            # drops from 'open_symbols'. We must process the pending exit before
+            # checking for external closures, otherwise the agent thinks the broker
+            # closed it unexpectedly!
+            pending_exits = []
+            with self._trade_lock:
+                for symbol, trade in self.active_trades.items():
+                    if trade.get("exit_pending"):
+                        pending_exits.append(symbol)
+
+            if pending_exits:
+                try:
+                    all_orders = kite_client.get_orders()
+                    for symbol in pending_exits:
+                        self._sync_exit_pending_status(symbol, all_orders)
+                except Exception as e:
+                    self._push_log(f"Error syncing pending exits: {e}")
+
             # Snapshot in-memory state under a short lock. All Kite calls below
             # run WITHOUT the lock held, so a slow broker API can't freeze the
             # JSON-RPC thread or the scanner callback (both need this lock).
             with self._trade_lock:
                 symbols_to_remove = [
-                    s for s in self.active_trades if s not in open_symbols
+                    s for s in self.active_trades 
+                    if s not in open_symbols and not self.active_trades[s].get("exit_pending")
                 ]
                 tracked = set(self.active_trades.keys())
                 pending = set(self._pending_entries)
@@ -630,7 +649,6 @@ class TradingEngine:
                     target = trade["target"]
 
                 if exit_pending:
-                    self._sync_exit_pending_status(symbol)
                     continue
 
                 ltp = p.get("lastPrice", 0)
@@ -1187,7 +1205,7 @@ class TradingEngine:
         reason_prefix = f"{reason}: " if reason else ""
         self._push_log(f"{reason_prefix}exit order placed for {symbol} ({tx_type})")
 
-    def _sync_exit_pending_status(self, symbol: str):
+    def _sync_exit_pending_status(self, symbol: str, orders: list = None):
         with self._trade_lock:
             trade = self.active_trades.get(symbol)
             if not trade:
@@ -1196,7 +1214,8 @@ class TradingEngine:
             if not order_id:
                 trade["exit_pending"] = False
                 return
-        orders = kite_client.get_orders()
+        if orders is None:
+            orders = kite_client.get_orders()
         for order in orders:
             if str(order.get("orderId")) != str(order_id):
                 continue
