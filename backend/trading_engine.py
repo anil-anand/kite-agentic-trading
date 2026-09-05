@@ -362,6 +362,28 @@ class TradingEngine:
     def execute_signal(self, signal: dict):
         symbol = signal["tradingsymbol"]
 
+        # Overtrading protections
+        risk_config = config_manager.get_risk_config()
+        max_daily_trades = risk_config.get("maxDailyTrades", 10)
+        max_symbol_trades = risk_config.get("maxTradesPerSymbolPerDay", 2)
+        cooldown_mins = risk_config.get("tradeCooldownMins", 15)
+
+        todays_counts = journal.get_todays_trade_counts()
+        if todays_counts["total"] >= max_daily_trades:
+            self._push_log(f"Skipping {symbol}: Max daily trades ({max_daily_trades}) reached.", level="warning")
+            return False
+
+        if todays_counts["by_symbol"].get(symbol, 0) >= max_symbol_trades:
+            self._push_log(f"Skipping {symbol}: Max trades per symbol ({max_symbol_trades}) reached today.", level="warning")
+            return False
+
+        last_exit = journal.get_last_exit_time(symbol)
+        if last_exit:
+            mins_since_exit = (datetime.datetime.now() - last_exit).total_seconds() / 60
+            if mins_since_exit < cooldown_mins:
+                self._push_log(f"Skipping {symbol}: Cooldown period active ({mins_since_exit:.1f}/{cooldown_mins} mins).")
+                return False
+
         # Atomically guard against duplicate entry orders for the same symbol.
         with self._trade_lock:
             if symbol in self.active_trades or symbol in self._pending_entries:
@@ -779,6 +801,14 @@ class TradingEngine:
                 entry_time = trade.get("entry_time", now)
                 entry_price = trade.get("entry_price", 0)
                 current_sl = trade["sl"]
+                last_reeval = trade.get("last_reeval_time", entry_time)
+
+            mins_since_reeval = (now - last_reeval).total_seconds() / 60
+            reeval_interval = risk_config.get("positionRevalIntervalMins", 30)
+
+            # Skip network I/O and evaluation if not enough time has passed
+            if mins_since_reeval < reeval_interval:
+                continue
 
             token = instrument_map.get(symbol)
             if not token:
@@ -849,6 +879,8 @@ class TradingEngine:
 
             with self._trade_lock:
                 trade = self.active_trades.get(symbol)
+                if trade:
+                    trade["last_reeval_time"] = now
                 trade_id = trade.get("trade_id") if trade else None
 
             if trade_id:

@@ -53,12 +53,18 @@ class RiskManager:
         self, price: float, stop_loss: float, available_margin: float = None
     ) -> int:
         config = config_manager.get_risk_config()
-        max_capital = config["maxCapitalPerTrade"]
+        max_capital = config.get("maxCapitalPerTrade", 10000)
+        leverage = config.get("leverageMultiplier", 5)
+        
+        max_buying_power = max_capital * leverage
+        
         if available_margin is not None:
-            max_capital = min(max_capital, max(0, available_margin))
-        risk_per_trade = config.get("riskPerTrade", max_capital * 0.01)
+            usable_margin = min(max_capital, max(0, available_margin))
+            max_buying_power = usable_margin * leverage
+            
+        risk_per_trade = config.get("riskPerTrade", max_buying_power * 0.01)
 
-        quantity_by_capital = int(max_capital / price) if price > 0 else 0
+        quantity_by_capital = int(max_buying_power / price) if price > 0 else 0
         stop_distance = abs(price - stop_loss)
 
         if stop_distance > 0 and risk_per_trade > 0:
