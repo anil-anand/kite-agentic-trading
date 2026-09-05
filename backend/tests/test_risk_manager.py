@@ -5,6 +5,7 @@ from backend.risk_manager import risk_manager
 def test_calculate_position_size_uses_stop_distance(monkeypatch):
     risk_cfg = config_manager.get_risk_config().copy()
     risk_cfg["maxCapitalPerTrade"] = 10_000
+    risk_cfg["leverageMultiplier"] = 1
     risk_cfg["riskPerTrade"] = 100
     monkeypatch.setitem(config_manager.config, "risk", risk_cfg)
 
@@ -18,6 +19,7 @@ def test_calculate_position_size_uses_stop_distance(monkeypatch):
 def test_calculate_position_size_caps_by_capital(monkeypatch):
     risk_cfg = config_manager.get_risk_config().copy()
     risk_cfg["maxCapitalPerTrade"] = 1_000
+    risk_cfg["leverageMultiplier"] = 1
     risk_cfg["riskPerTrade"] = 1_000
     monkeypatch.setitem(config_manager.config, "risk", risk_cfg)
 
@@ -29,6 +31,7 @@ def test_calculate_position_size_caps_by_capital(monkeypatch):
 def test_calculate_position_size_caps_by_available_margin(monkeypatch):
     risk_cfg = config_manager.get_risk_config().copy()
     risk_cfg["maxCapitalPerTrade"] = 10_000
+    risk_cfg["leverageMultiplier"] = 1
     risk_cfg["riskPerTrade"] = 1_000
     monkeypatch.setitem(config_manager.config, "risk", risk_cfg)
 
@@ -40,6 +43,7 @@ def test_calculate_position_size_returns_zero_when_margin_cannot_fund_one_share(
 ):
     risk_cfg = config_manager.get_risk_config().copy()
     risk_cfg["maxCapitalPerTrade"] = 10_000
+    risk_cfg["leverageMultiplier"] = 1
     risk_cfg["riskPerTrade"] = 1_000
     monkeypatch.setitem(config_manager.config, "risk", risk_cfg)
 
@@ -49,7 +53,26 @@ def test_calculate_position_size_returns_zero_when_margin_cannot_fund_one_share(
 def test_calculate_position_size_returns_zero_for_zero_available_margin(monkeypatch):
     risk_cfg = config_manager.get_risk_config().copy()
     risk_cfg["maxCapitalPerTrade"] = 10_000
+    risk_cfg["leverageMultiplier"] = 1
     risk_cfg["riskPerTrade"] = 1_000
     monkeypatch.setitem(config_manager.config, "risk", risk_cfg)
 
     assert risk_manager.calculate_position_size(100, 95, available_margin=0) == 0
+
+
+def test_calculate_position_size_uses_leverage(monkeypatch):
+    risk_cfg = config_manager.get_risk_config().copy()
+    risk_cfg["maxCapitalPerTrade"] = 1_000
+    risk_cfg["leverageMultiplier"] = 5
+    # Let risk per trade fall back to 1% of leveraged margin (5000 * 0.01 = 50)
+    if "riskPerTrade" in risk_cfg:
+        del risk_cfg["riskPerTrade"]
+    monkeypatch.setitem(config_manager.config, "risk", risk_cfg)
+
+    # 5000 buying power, price 100 -> max 50 shares
+    # risk is 50, stop distance is 2 -> max 25 shares (capped by risk)
+    assert risk_manager.calculate_position_size(100, 98) == 25
+
+    # 5000 buying power, price 100 -> max 50 shares
+    # risk is 50, stop distance is 0.5 -> max 100 shares (capped by buying power)
+    assert risk_manager.calculate_position_size(100, 99.5) == 50

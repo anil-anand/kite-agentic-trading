@@ -362,6 +362,36 @@ class TradingEngine:
     def execute_signal(self, signal: dict):
         symbol = signal["tradingsymbol"]
 
+        # Overtrading protections
+        risk_config = config_manager.get_risk_config()
+        max_daily_trades = risk_config.get("maxDailyTrades", 10)
+        max_symbol_trades = risk_config.get("maxTradesPerSymbolPerDay", 2)
+        cooldown_mins = risk_config.get("tradeCooldownMins", 15)
+
+        todays_counts = journal.get_todays_trade_counts()
+        if todays_counts["total"] >= max_daily_trades:
+            self._push_log(
+                f"Skipping {symbol}: Max daily trades ({max_daily_trades}) reached.",
+                level="warning",
+            )
+            return False
+
+        if todays_counts["by_symbol"].get(symbol, 0) >= max_symbol_trades:
+            self._push_log(
+                f"Skipping {symbol}: Max trades per symbol ({max_symbol_trades}) reached today.",
+                level="warning",
+            )
+            return False
+
+        last_exit = journal.get_last_exit_time(symbol)
+        if last_exit:
+            mins_since_exit = (datetime.datetime.now() - last_exit).total_seconds() / 60
+            if mins_since_exit < cooldown_mins:
+                self._push_log(
+                    f"Skipping {symbol}: Cooldown period active ({mins_since_exit:.1f}/{cooldown_mins} mins)."
+                )
+                return False
+
         # Atomically guard against duplicate entry orders for the same symbol.
         with self._trade_lock:
             if symbol in self.active_trades or symbol in self._pending_entries:
@@ -559,12 +589,33 @@ class TradingEngine:
             # Get symbols of currently open positions to track manual closures
             open_symbols = {p["tradingsymbol"] for p in positions if p["quantity"] != 0}
 
+            # 1. Sync pending exits FIRST. If an exit order was filled, the position
+            # drops from 'open_symbols'. We must process the pending exit before
+            # checking for external closures, otherwise the agent thinks the broker
+            # closed it unexpectedly!
+            pending_exits = []
+            with self._trade_lock:
+                for symbol, trade in self.active_trades.items():
+                    if trade.get("exit_pending"):
+                        pending_exits.append(symbol)
+
+            if pending_exits:
+                try:
+                    all_orders = kite_client.get_orders()
+                    for symbol in pending_exits:
+                        self._sync_exit_pending_status(symbol, all_orders)
+                except Exception as e:
+                    self._push_log(f"Error syncing pending exits: {e}")
+
             # Snapshot in-memory state under a short lock. All Kite calls below
             # run WITHOUT the lock held, so a slow broker API can't freeze the
             # JSON-RPC thread or the scanner callback (both need this lock).
             with self._trade_lock:
                 symbols_to_remove = [
-                    s for s in self.active_trades if s not in open_symbols
+                    s
+                    for s in self.active_trades
+                    if s not in open_symbols
+                    and not self.active_trades[s].get("exit_pending")
                 ]
                 tracked = set(self.active_trades.keys())
                 pending = set(self._pending_entries)
@@ -608,7 +659,6 @@ class TradingEngine:
                     target = trade["target"]
 
                 if exit_pending:
-                    self._sync_exit_pending_status(symbol)
                     continue
 
                 ltp = p.get("lastPrice", 0)
@@ -779,6 +829,14 @@ class TradingEngine:
                 entry_time = trade.get("entry_time", now)
                 entry_price = trade.get("entry_price", 0)
                 current_sl = trade["sl"]
+                last_reeval = trade.get("last_reeval_time", entry_time)
+
+            mins_since_reeval = (now - last_reeval).total_seconds() / 60
+            reeval_interval = risk_config.get("positionRevalIntervalMins", 30)
+
+            # Skip network I/O and evaluation if not enough time has passed
+            if mins_since_reeval < reeval_interval:
+                continue
 
             token = instrument_map.get(symbol)
             if not token:
@@ -849,6 +907,8 @@ class TradingEngine:
 
             with self._trade_lock:
                 trade = self.active_trades.get(symbol)
+                if trade:
+                    trade["last_reeval_time"] = now
                 trade_id = trade.get("trade_id") if trade else None
 
             if trade_id:
@@ -1155,7 +1215,7 @@ class TradingEngine:
         reason_prefix = f"{reason}: " if reason else ""
         self._push_log(f"{reason_prefix}exit order placed for {symbol} ({tx_type})")
 
-    def _sync_exit_pending_status(self, symbol: str):
+    def _sync_exit_pending_status(self, symbol: str, orders: list = None):
         with self._trade_lock:
             trade = self.active_trades.get(symbol)
             if not trade:
@@ -1164,7 +1224,8 @@ class TradingEngine:
             if not order_id:
                 trade["exit_pending"] = False
                 return
-        orders = kite_client.get_orders()
+        if orders is None:
+            orders = kite_client.get_orders()
         for order in orders:
             if str(order.get("orderId")) != str(order_id):
                 continue

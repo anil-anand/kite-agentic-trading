@@ -18,7 +18,11 @@ class ConfigManager:
         self.default_config = {
             "risk": {
                 "maxCapitalPerTrade": 10000,
+                "leverageMultiplier": 5,
                 "maxDailyLoss": 2000,
+                "maxDailyTrades": 10,
+                "maxTradesPerSymbolPerDay": 2,
+                "tradeCooldownMins": 15,
                 "maxSimultaneousPositions": 5,
                 "startTradeAfter": "09:45",
                 "noNewTradesAfter": "15:00",
@@ -26,7 +30,8 @@ class ConfigManager:
                 "squareOffTime": "15:15",
                 "defaultStopLossPercent": 1.5,
                 "defaultTargetPercent": 3,
-                "positionRevalWeakExitMins": 15,
+                "positionRevalIntervalMins": 30,
+                "positionRevalWeakExitMins": 60,
                 "positionRevalBreakevenMins": 45,
             },
             "strategies": {
@@ -289,6 +294,9 @@ class ConfigManager:
             entry_time = record.get("entry_time")
             if isinstance(entry_time, (datetime.datetime, datetime.date)):
                 record["entry_time"] = entry_time.isoformat()
+            last_reeval = record.get("last_reeval_time")
+            if isinstance(last_reeval, (datetime.datetime, datetime.date)):
+                record["last_reeval_time"] = last_reeval.isoformat()
             serializable[symbol] = record
         self._atomic_write_json(path, serializable)
 
@@ -338,6 +346,15 @@ class ConfigManager:
                     trade["entry_time"] = datetime.datetime.fromisoformat(entry_time)
                 except ValueError:
                     trade["entry_time"] = datetime.datetime.now()
+
+            last_reeval_time = trade.get("last_reeval_time")
+            if isinstance(last_reeval_time, str):
+                try:
+                    trade["last_reeval_time"] = datetime.datetime.fromisoformat(
+                        last_reeval_time
+                    )
+                except ValueError:
+                    trade["last_reeval_time"] = trade["entry_time"]
         return trades
 
 
