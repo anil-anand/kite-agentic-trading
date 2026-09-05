@@ -123,11 +123,15 @@ def assert_valid_signal(sig, entry_tolerance=1e-6):
         assert sl > entry - entry_tolerance, "SELL stop-loss should be above entry"
         assert target < entry + entry_tolerance, "SELL target should be below entry"
 
+
 @pytest.fixture(autouse=True)
 def mock_journal_overtrading(monkeypatch):
     """Bypass overtrading protections for all tests so they don't fail when
     multiple tests execute signals for the same symbol (e.g. RELIANCE) and hit
     the daily limits across the shared test session database."""
     from backend.journal import journal
-    monkeypatch.setattr(journal, "get_todays_trade_counts", lambda: {"total": 0, "by_symbol": {}})
+
+    monkeypatch.setattr(
+        journal, "get_todays_trade_counts", lambda: {"total": 0, "by_symbol": {}}
+    )
     monkeypatch.setattr(journal, "get_last_exit_time", lambda s: None)

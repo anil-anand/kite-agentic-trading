@@ -370,18 +370,26 @@ class TradingEngine:
 
         todays_counts = journal.get_todays_trade_counts()
         if todays_counts["total"] >= max_daily_trades:
-            self._push_log(f"Skipping {symbol}: Max daily trades ({max_daily_trades}) reached.", level="warning")
+            self._push_log(
+                f"Skipping {symbol}: Max daily trades ({max_daily_trades}) reached.",
+                level="warning",
+            )
             return False
 
         if todays_counts["by_symbol"].get(symbol, 0) >= max_symbol_trades:
-            self._push_log(f"Skipping {symbol}: Max trades per symbol ({max_symbol_trades}) reached today.", level="warning")
+            self._push_log(
+                f"Skipping {symbol}: Max trades per symbol ({max_symbol_trades}) reached today.",
+                level="warning",
+            )
             return False
 
         last_exit = journal.get_last_exit_time(symbol)
         if last_exit:
             mins_since_exit = (datetime.datetime.now() - last_exit).total_seconds() / 60
             if mins_since_exit < cooldown_mins:
-                self._push_log(f"Skipping {symbol}: Cooldown period active ({mins_since_exit:.1f}/{cooldown_mins} mins).")
+                self._push_log(
+                    f"Skipping {symbol}: Cooldown period active ({mins_since_exit:.1f}/{cooldown_mins} mins)."
+                )
                 return False
 
         # Atomically guard against duplicate entry orders for the same symbol.
@@ -604,8 +612,10 @@ class TradingEngine:
             # JSON-RPC thread or the scanner callback (both need this lock).
             with self._trade_lock:
                 symbols_to_remove = [
-                    s for s in self.active_trades 
-                    if s not in open_symbols and not self.active_trades[s].get("exit_pending")
+                    s
+                    for s in self.active_trades
+                    if s not in open_symbols
+                    and not self.active_trades[s].get("exit_pending")
                 ]
                 tracked = set(self.active_trades.keys())
                 pending = set(self._pending_entries)

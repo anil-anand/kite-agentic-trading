@@ -346,11 +346,13 @@ class ConfigManager:
                     trade["entry_time"] = datetime.datetime.fromisoformat(entry_time)
                 except ValueError:
                     trade["entry_time"] = datetime.datetime.now()
-            
+
             last_reeval_time = trade.get("last_reeval_time")
             if isinstance(last_reeval_time, str):
                 try:
-                    trade["last_reeval_time"] = datetime.datetime.fromisoformat(last_reeval_time)
+                    trade["last_reeval_time"] = datetime.datetime.fromisoformat(
+                        last_reeval_time
+                    )
                 except ValueError:
                     trade["last_reeval_time"] = trade["entry_time"]
         return trades

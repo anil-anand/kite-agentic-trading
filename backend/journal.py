@@ -208,28 +208,34 @@ class TradeJournal:
         """Returns the total number of trades opened today, and trades per symbol."""
         conn = self._get_conn()
         today = datetime.now().date().isoformat()
-        
-        cursor = conn.execute("""
+
+        cursor = conn.execute(
+            """
             SELECT tradingsymbol FROM trades 
             WHERE entry_time >= ?
-        """, (today,))
-        
+        """,
+            (today,),
+        )
+
         counts = {"total": 0, "by_symbol": {}}
         for row in cursor.fetchall():
             symbol = row[0]
             counts["total"] += 1
             counts["by_symbol"][symbol] = counts["by_symbol"].get(symbol, 0) + 1
-            
+
         return counts
 
     def get_last_exit_time(self, symbol: str) -> Optional[datetime]:
         """Returns the last time a trade was exited for a given symbol."""
         conn = self._get_conn()
-        cursor = conn.execute("""
+        cursor = conn.execute(
+            """
             SELECT exit_time FROM trades 
             WHERE tradingsymbol = ? AND exit_time IS NOT NULL
             ORDER BY exit_time DESC LIMIT 1
-        """, (symbol,))
+        """,
+            (symbol,),
+        )
         row = cursor.fetchone()
         if row and row[0]:
             try:
