@@ -250,8 +250,8 @@ def handle_request(req):
         elif method == "analytics_confluence_validation":
             return success(analytics.get_confluence_validation())
 
-        elif method == "analytics_confidence_calibration":
-            return success(analytics.get_confidence_calibration())
+        elif method == "analytics_signal_score_calibration":
+            return success(analytics.get_signal_score_calibration())
 
         elif method == "analytics_exit_reason_effectiveness":
             return success(analytics.get_exit_reason_effectiveness())

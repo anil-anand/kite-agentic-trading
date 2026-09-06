@@ -44,6 +44,12 @@ class TradingEngine:
         self._tick_size_map = {}
         self._reserved_entry_margin = 0.0
 
+        # Dynamic Watchlist State
+        self.dynamic_watchlist = []
+        self.universe_version = 0
+        self.last_universe_refresh_time = None
+        self.watchlist_rankings = {}
+
     # Kite order statuses that mean an order is still live (protecting / working).
     _OPEN_ORDER_STATUSES = {"OPEN", "TRIGGER PENDING"}
 
@@ -355,6 +361,21 @@ class TradingEngine:
             }
         return self._instrument_map
 
+    def _get_current_refresh_interval(self) -> int:
+        screener_config = config_manager.get_screener_config()
+        refresh_schedule = screener_config.get("refreshSchedule", {})
+        opening_mins = refresh_schedule.get("openingPeriodMins", 15)
+        normal_mins = refresh_schedule.get("normalSessionMins", 60)
+        late_mins = refresh_schedule.get("lateSessionMins", 30)
+
+        now = datetime.datetime.now().time()
+        if now < datetime.time(10, 0):
+            return opening_mins
+        elif now < datetime.time(14, 0):
+            return normal_mins
+        else:
+            return late_mins
+
     def scan_and_trade(self):
         can_trade, reason = risk_manager.can_trade()
         if not can_trade:
@@ -368,7 +389,18 @@ class TradingEngine:
             self._notified_cannot_trade = False
 
         # Use our AI/Algorithmic screener to dynamically find "In Play" stocks from NIFTY 100 + Custom Watchlist
-        if not hasattr(self, "dynamic_watchlist") or not self.dynamic_watchlist:
+        now = datetime.datetime.now()
+        needs_refresh = False
+        if not self.dynamic_watchlist:
+            needs_refresh = True
+        elif self.last_universe_refresh_time:
+            interval_mins = self._get_current_refresh_interval()
+            if (
+                now - self.last_universe_refresh_time
+            ).total_seconds() / 60.0 >= interval_mins:
+                needs_refresh = True
+
+        if needs_refresh:
             from .nifty_universe import get_nifty100_universe
             from .screener import screener_engine
 
@@ -378,16 +410,39 @@ class TradingEngine:
             self._push_log(
                 f"Running algorithmic screener on NIFTY 100 + {len(custom_watchlist)} custom stocks..."
             )
-            self.dynamic_watchlist = screener_engine.generate_daily_watchlist(
-                universe=full_universe, limit=12
-            )
-            self._push_log(
-                f"Dynamic Watchlist selected: {', '.join(self.dynamic_watchlist)}"
-            )
+            try:
+                new_watchlist = screener_engine.generate_daily_watchlist(
+                    universe=full_universe, limit=12
+                )
+
+                self.watchlist_rankings = {
+                    symbol: i + 1 for i, symbol in enumerate(new_watchlist)
+                }
+
+                with self._trade_lock:
+                    preserved = set(self.active_trades.keys()) | self._pending_entries
+
+                self.dynamic_watchlist = list(set(new_watchlist) | preserved)
+                self.universe_version += 1
+                self.last_universe_refresh_time = now
+
+                self._push_log(
+                    f"Dynamic Watchlist refreshed (Version: {self.universe_version}): {', '.join(self.dynamic_watchlist)}"
+                )
+            except Exception as e:
+                self._push_log(
+                    f"Dynamic Watchlist refresh failed: {e}. Retaining last known good universe.",
+                    level="error",
+                )
 
         def handle_new_signal(signal):
             # NOTE: This callback is invoked from scanner ThreadPoolExecutor
             # threads, so active_trades access must be guarded by the lock.
+            signal["universe_version"] = str(self.universe_version)
+            signal["screener_ranking"] = self.watchlist_rankings.get(
+                signal["tradingsymbol"]
+            )
+
             if signal["signal_score"] >= 70:
                 self._push_signal(signal)
                 if (
@@ -584,6 +639,8 @@ class TradingEngine:
                         "raw_signals": signal.get("raw_signals"),
                         "regime": signal.get("regime"),
                     },
+                    universe_version=signal.get("universe_version"),
+                    screener_ranking=signal.get("screener_ranking"),
                 )
             except Exception as e:
                 self._push_log(

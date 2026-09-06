@@ -96,6 +96,11 @@ class ConfigManager:
                     "min_volume": 100000,
                     "min_value_traded": 10000000,
                 },
+                "refreshSchedule": {
+                    "openingPeriodMins": 15,
+                    "normalSessionMins": 60,
+                    "lateSessionMins": 30,
+                },
             },
             "credentials": {"apiKey": "", "apiSecret": ""},
             "llm": {

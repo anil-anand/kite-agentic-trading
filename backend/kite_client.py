@@ -169,14 +169,14 @@ class KiteClient:
         if not self.kite:
             return {}
         return broker_gateway.execute(
-            self.kite.quote, priority=Priority.ANALYTICS, instruments=instruments
+            self.kite.quote, Priority.ANALYTICS, False, None, instruments
         )
 
     def get_ltp(self, instruments: List[str]) -> Dict[str, Any]:
         if not self.kite:
             return {}
         return broker_gateway.execute(
-            self.kite.ltp, priority=Priority.ANALYTICS, instruments=instruments
+            self.kite.ltp, Priority.ANALYTICS, False, None, instruments
         )
 
     def get_historical_data(

@@ -204,9 +204,9 @@ export interface Signal {
   exchange: string;
   strategy: StrategyName;
   direction: SignalDirection;
-  signalScore: number;
-  estimatedProbability?: number;
-  calibrationSampleSize?: number; // 0-100
+  signal_score: number;
+  estimated_probability?: number;
+  calibration_sample_size?: number; // 0-100
   entryPrice: number;
   stopLoss: number;
   target: number;
@@ -376,9 +376,9 @@ export interface JournalTrade {
   strategy: string;
   signal_id: string | null;
   reasoning: string | null;
-  signalScore: number | null;
-  estimatedProbability?: number | null;
-  calibrationSampleSize?: number | null;
+  signal_score: number | null;
+  estimated_probability?: number | null;
+  calibration_sample_size?: number | null;
   entry_price: number;
   quantity: number;
   stop_loss: number;

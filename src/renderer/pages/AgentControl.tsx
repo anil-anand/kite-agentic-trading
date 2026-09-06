@@ -70,7 +70,8 @@ const AgentControl: React.FC = () => {
     return Object.values(groups)
       .map(group => {
         group.confluenceScore = group.signals.length;
-        group.avgSignalScore = Math.round(group.signals.reduce((acc, s) => acc + s.signalScore, 0) / group.confluenceScore);
+        const totalScore = group.signals.reduce((acc, s) => acc + (s.signal_score || (s as any).signalScore || 0), 0);
+        group.avgSignalScore = group.confluenceScore > 0 ? Math.round(totalScore / group.confluenceScore) : 0;
         return group;
       })
       .sort((a, b) => {
@@ -160,7 +161,7 @@ const AgentControl: React.FC = () => {
               <div className="text-center text-surface-400 mt-10">No active signals</div>
             ) : (
               groupedSignals.map(group => {
-                const bestSignal = group.signals.reduce((prev, current) => (prev.signalScore > current.signalScore) ? prev : current);
+                const bestSignal = group.signals.reduce((prev, current) => ((prev.signal_score || (prev as any).signalScore || 0) > (current.signal_score || (current as any).signalScore || 0)) ? prev : current);
                 const isBuy = group.direction === 'BUY';
 
                 return (
@@ -180,7 +181,7 @@ const AgentControl: React.FC = () => {
                     <div className="flex flex-wrap gap-1 mt-1">
                       {group.signals.map(s => (
                         <span key={s.id} className="text-[10px] bg-surface-700 text-surface-300 px-2 py-1 rounded" title={s.reasoning}>
-                          {s.strategy} ({s.signalScore}%)
+                          {s.strategy} ({s.signal_score || (s as any).signalScore || 0}%)
                         </span>
                       ))}
                     </div>
