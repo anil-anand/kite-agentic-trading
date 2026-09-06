@@ -55,7 +55,9 @@ class TradeJournal:
                     pnl REAL,
                     status TEXT,
                     confluence_snapshot TEXT,
-                    indicator_snapshot TEXT
+                    indicator_snapshot TEXT,
+                    universe_version TEXT,
+                    screener_ranking INTEGER
                 );
 
                 CREATE TABLE IF NOT EXISTS trade_events (
@@ -83,6 +85,16 @@ class TradeJournal:
             except sqlite3.OperationalError:
                 pass
 
+            try:
+                conn.execute("ALTER TABLE trades ADD COLUMN universe_version TEXT;")
+            except sqlite3.OperationalError:
+                pass
+
+            try:
+                conn.execute("ALTER TABLE trades ADD COLUMN screener_ranking INTEGER;")
+            except sqlite3.OperationalError:
+                pass
+
     def open_trade(
         self,
         trade_id: str,
@@ -102,6 +114,8 @@ class TradeJournal:
         calibration_sample_size: Optional[int] = None,
         confluence_snapshot: Optional[Dict[str, Any]] = None,
         indicator_snapshot: Optional[Dict[str, Any]] = None,
+        universe_version: Optional[str] = None,
+        screener_ranking: Optional[int] = None,
     ):
         """Record a newly opened trade."""
         conn = self._get_conn()
@@ -116,8 +130,9 @@ class TradeJournal:
             INSERT INTO trades (
                 id, tradingsymbol, exchange, direction, product, strategy,
                 signal_id, reasoning, confidence, estimated_probability, calibration_sample_size,
-                entry_price, quantity, stop_loss, target, entry_time, status, confluence_snapshot, indicator_snapshot
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)
+                entry_price, quantity, stop_loss, target, entry_time, status, confluence_snapshot, indicator_snapshot,
+                universe_version, screener_ranking
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?)
         """
         params = (
             trade_id,
@@ -138,6 +153,8 @@ class TradeJournal:
             now,
             confluence_str,
             indicator_str,
+            universe_version,
+            screener_ranking,
         )
 
         with conn:
