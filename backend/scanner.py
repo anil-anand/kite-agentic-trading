@@ -70,6 +70,7 @@ class Scanner:
         }
         self.candle_cache = {}
         self.last_cache_time = {}
+        self.last_scanned_candle = {}
 
     def _fetch_candles(
         self, instrument_token: int, tradingsymbol: str
@@ -129,6 +130,29 @@ class Scanner:
             df, was_cached = self._fetch_candles(token, symbol)
             if df.empty:
                 return []
+
+            evaluate_on_incomplete = strategy_config.get(
+                "evaluateOnIncompleteCandle", False
+            )
+            if not evaluate_on_incomplete:
+                if "date" in df.columns:
+                    if not pd.api.types.is_datetime64_any_dtype(df["date"]):
+                        df["date"] = pd.to_datetime(df["date"])
+
+                    if df["date"].dt.tz is None:
+                        df["date"] = df["date"].dt.tz_localize("Asia/Kolkata")
+
+                    now = pd.Timestamp.now(tz="Asia/Kolkata")
+                    df = df[df["date"] + pd.Timedelta(minutes=5) <= now].copy()
+
+            if df.empty:
+                return []
+
+            if not evaluate_on_incomplete and "date" in df.columns:
+                latest_candle_time = df["date"].iloc[-1]
+                if self.last_scanned_candle.get(symbol) == latest_candle_time:
+                    return []
+                self.last_scanned_candle[symbol] = latest_candle_time
 
             # 1. Classify Regime
             regime_info = regime_classifier.classify(df)
@@ -235,6 +259,28 @@ class Scanner:
         strategy_config = config_manager.get_strategy_config()
 
         df, _ = self._fetch_candles(instrument_token, tradingsymbol)
+        if df.empty:
+            return {
+                "regime": "UNCERTAIN",
+                "buy_signals": 0,
+                "sell_signals": 0,
+                "strategies": [],
+            }
+
+        evaluate_on_incomplete = strategy_config.get(
+            "evaluateOnIncompleteCandle", False
+        )
+        if not evaluate_on_incomplete:
+            if "date" in df.columns:
+                if not pd.api.types.is_datetime64_any_dtype(df["date"]):
+                    df["date"] = pd.to_datetime(df["date"])
+
+                if df["date"].dt.tz is None:
+                    df["date"] = df["date"].dt.tz_localize("Asia/Kolkata")
+
+                now = pd.Timestamp.now(tz="Asia/Kolkata")
+                df = df[df["date"] + pd.Timedelta(minutes=5) <= now].copy()
+
         if df.empty:
             return {
                 "regime": "UNCERTAIN",
