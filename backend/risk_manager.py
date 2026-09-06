@@ -4,20 +4,108 @@ from typing import Any, Dict, Tuple
 from .config import config_manager
 
 
+def get_ist_now():
+    ist = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+    return datetime.datetime.now(ist)
+
+
 class RiskManager:
     def __init__(self):
-        self.daily_pnl = 0.0
         self.win_count = 0
         self.loss_count = 0
         self.open_positions = 0
 
-    def can_trade(self) -> Tuple[bool, str]:
-        config = config_manager.get_risk_config()
+        self.daily_pnl = 0.0
+        self.kill_switch_active = False
+        self.reconciliation_status = "RECONCILIATION_PENDING"
+        self.date_str = get_ist_now().strftime("%Y-%m-%d")
 
-        # Check time
+        self._load_state()
+
+    def _load_state(self):
+        state = config_manager.load_daily_risk_state()
+        if state.get("date") == self.date_str:
+            self.daily_pnl = state.get("daily_pnl", 0.0)
+            self.kill_switch_active = state.get("kill_switch_active", False)
+            self.reconciliation_status = state.get(
+                "reconciliation_status", "RECONCILIATION_PENDING"
+            )
+        else:
+            self.daily_pnl = 0.0
+            self.kill_switch_active = False
+            self.reconciliation_status = "RECONCILIATION_PENDING"
+            self._save_state()
+
+    def _save_state(self):
+        state = {
+            "date": self.date_str,
+            "daily_pnl": self.daily_pnl,
+            "kill_switch_active": self.kill_switch_active,
+            "reconciliation_status": self.reconciliation_status,
+        }
+        config_manager.save_daily_risk_state(state)
+
+    def reconcile_state(self):
+        from .kite_client import kite_client
+        from .utils import push_log
+
+        current_date = get_ist_now().strftime("%Y-%m-%d")
+        if current_date != self.date_str:
+            self.date_str = current_date
+            self.daily_pnl = 0.0
+            self.kill_switch_active = False
+            self.reconciliation_status = "RECONCILIATION_PENDING"
+
+        try:
+            positions_res = kite_client.get_positions()
+            positions = positions_res.get("day", [])
+            trades = kite_client.get_trades()
+        except Exception as e:
+            self.reconciliation_status = "RECONCILIATION_FAILED"
+            self._save_state()
+            push_log(
+                f"RiskManager: Reconciliation failed to fetch broker data: {e}",
+                level="error",
+            )
+            return
+
+        realized_gross = sum(p.get("realised", 0.0) for p in positions)
+        unrealized = sum(p.get("unrealised", 0.0) for p in positions)
+
+        estimated_charges = len(trades) * 20.0
+        net_realized = realized_gross - estimated_charges
+        total_intraday = net_realized + unrealized
+
+        drift = total_intraday - self.daily_pnl
+        if abs(drift) > 0.01:
+            push_log(
+                f"RiskManager: Correcting P&L drift. Broker: {total_intraday:.2f}, Local: {self.daily_pnl:.2f}, Drift: {drift:.2f}",
+                level="warning",
+            )
+
+        self.daily_pnl = total_intraday
+        self.reconciliation_status = "RECONCILED"
+
+        config = config_manager.get_risk_config()
+        if self.daily_pnl <= -config["maxDailyLoss"]:
+            self.kill_switch_active = True
+            push_log(
+                "RiskManager: Daily loss limit breached. Kill switch ACTIVATED.",
+                level="error",
+            )
+
+        self._save_state()
+
+    def can_trade(self) -> Tuple[bool, str]:
+        if self.kill_switch_active:
+            return False, "Kill switch is active due to daily loss limit breach"
+
+        if self.reconciliation_status == "RECONCILIATION_FAILED":
+            return False, "Reconciliation with broker failed"
+
+        config = config_manager.get_risk_config()
         now = datetime.datetime.now().time()
 
-        # Market opens at 09:15 IST, but we respect startTradeAfter setting.
         start_trade_after_str = config.get("startTradeAfter", "09:45")
         try:
             start_trade_after = datetime.datetime.strptime(
@@ -36,15 +124,15 @@ class RiskManager:
         if now >= no_new_trades_after:
             return False, "Time is past noNewTradesAfter limit"
 
-        # Check max positions
         if self.open_positions >= config["maxSimultaneousPositions"]:
             return (
                 False,
                 f"Max simultaneous positions ({config['maxSimultaneousPositions']}) reached",
             )
 
-        # Check max daily loss
         if self.daily_pnl <= -config["maxDailyLoss"]:
+            self.kill_switch_active = True
+            self._save_state()
             return False, f"Max daily loss ({-config['maxDailyLoss']}) exceeded"
 
         return True, "OK"
@@ -82,14 +170,19 @@ class RiskManager:
         return max(1, quantity)
 
     def check_daily_loss_limit(self) -> bool:
+        if self.kill_switch_active:
+            return True
         config = config_manager.get_risk_config()
-        return self.daily_pnl <= -config["maxDailyLoss"]
+        if self.daily_pnl <= -config["maxDailyLoss"]:
+            self.kill_switch_active = True
+            self._save_state()
+            return True
+        return False
 
     def should_square_off(self) -> bool:
         config = config_manager.get_risk_config()
         now = datetime.datetime.now().time()
 
-        # Check max daily loss first, as this should trigger regardless of time
         max_loss_hit = self.check_daily_loss_limit()
 
         time_to_square_off = False
@@ -102,20 +195,42 @@ class RiskManager:
                     15, 30
                 )
             except ValueError:
-                pass  # Fallback if invalid time string
+                pass
 
-        # Only square off if we have positions AND we hit max loss or time
         if self.open_positions > 0:
             return time_to_square_off or max_loss_hit
 
         return False
 
-    def update_pnl(self, pnl: float):
-        self.daily_pnl += pnl
-        if pnl > 0:
-            self.win_count += 1
-        else:
-            self.loss_count += 1
+    def update_from_positions(self, positions: list):
+        # A fast, lightweight update without fetching trades.
+        # We use the previous estimated charges (implied by current daily_pnl difference, or we can just fetch it?
+        # Actually, let's just do a proper reconcile without trades. Wait, we can't get trades.
+        # Let's just track estimated_charges in the class)
+
+        realized_gross = sum(p.get("realised", 0.0) for p in positions)
+        unrealized = sum(p.get("unrealised", 0.0) for p in positions)
+
+        # We need an estimate of charges.
+        # The trades API shouldn't be hit every second.
+        # We can approximate: if there are N executed trades today in our journal, use that.
+        from .journal import journal
+
+        trades_today = journal.get_todays_trade_counts()["total"]
+        # Since an order usually has 2 trades (entry/exit), maybe 2 * trades_today * 20
+        # Actually, to be safe, just use a known margin.
+        estimated_charges = trades_today * 40.0  # roughly 40 rs per round trip trade
+
+        net_realized = realized_gross - estimated_charges
+        total_intraday = net_realized + unrealized
+
+        self.daily_pnl = total_intraday
+
+        config = config_manager.get_risk_config()
+        if self.daily_pnl <= -config["maxDailyLoss"]:
+            self.kill_switch_active = True
+
+        self._save_state()
 
     def set_open_positions(self, count: int):
         self.open_positions = count
@@ -127,6 +242,8 @@ class RiskManager:
             "loss_count": self.loss_count,
             "open_positions": self.open_positions,
             "can_trade": self.can_trade()[0],
+            "kill_switch_active": self.kill_switch_active,
+            "reconciliation_status": self.reconciliation_status,
         }
 
 

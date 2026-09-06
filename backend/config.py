@@ -357,5 +357,21 @@ class ConfigManager:
                     trade["last_reeval_time"] = trade["entry_time"]
         return trades
 
+    def save_daily_risk_state(self, state: dict):
+        """Persist the daily risk state to disk."""
+        path = self.config_dir / "daily_risk_state.json"
+        self._atomic_write_json(path, state)
+
+    def load_daily_risk_state(self) -> dict:
+        """Load persisted daily risk state."""
+        path = self.config_dir / "daily_risk_state.json"
+        if not path.exists():
+            return {}
+        try:
+            with open(path, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
 
 config_manager = ConfigManager()

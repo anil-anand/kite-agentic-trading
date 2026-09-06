@@ -33,6 +33,9 @@ class FakeKiteClient:
         self.modify_calls.append(kwargs)
 
     def get_positions(self):
+        # Return net positions as day positions as well for test simplicity
+        if "day" not in self.positions:
+            self.positions["day"] = self.positions.get("net", [])
         return self.positions
 
     def get_margins(self):
@@ -86,6 +89,17 @@ class FakeRiskManager:
     def update_pnl(self, pnl):
         self.daily_pnl += pnl
         self.pnl_updates.append(pnl)
+
+    def update_from_positions(self, positions):
+        realized_gross = sum(p.get("realised", 0.0) for p in positions)
+        unrealized = sum(p.get("unrealised", 0.0) for p in positions)
+        pnl = realized_gross + unrealized
+        # To make old tests pass, append the delta, wait, old tests look for absolute `daily_pnl` and specific `pnl_updates`
+        # old `update_pnl` took a delta. `update_from_positions` calculates absolute.
+        delta = pnl - self.daily_pnl
+        self.daily_pnl = pnl
+        if delta != 0:
+            self.pnl_updates.append(delta)
 
 
 def _sample_signal():
