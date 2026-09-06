@@ -15,16 +15,21 @@ from backend.trading_engine import TradingEngine
 class FakeJournal:
     def __init__(self):
         self.closed = []  # (trade_id, exit_price, reason)
+        self.updated = []
 
-    def close_trade(self, trade_id, exit_price, reason):
+    def close_trade(self, trade_id, exit_price, reason, exit_time=None):
         self.closed.append((trade_id, exit_price, reason))
+
+    def update_trade_exit(self, trade_id, exit_price, reason, exit_time=None):
+        self.updated.append((trade_id, exit_price, reason))
 
 
 class FakeKite:
-    def __init__(self, ltp=100.0, orders=None, positions_net=None):
+    def __init__(self, ltp=100.0, orders=None, positions_net=None, trades=None):
         self._ltp = ltp
         self._orders = orders or []
         self._net = positions_net if positions_net is not None else []
+        self._trades = trades or []
 
     def get_ltp(self, instruments):
         return {key: {"last_price": self._ltp} for key in instruments}
@@ -34,6 +39,9 @@ class FakeKite:
 
     def get_positions(self):
         return {"net": self._net}
+
+    def get_trades(self):
+        return self._trades
 
     # monitor_positions touches these too
     def cancel_order(self, *a, **k):
@@ -70,6 +78,7 @@ def _trade(**over):
         "exit_pending": False,
         "exit_order_id": None,
         "exchange": "NSE",
+        "quantity": 10,
     }
     base.update(over)
     return base
@@ -82,25 +91,66 @@ class TestJournalExternalClose:
         monkeypatch.setattr(te, "journal", journal)
         return TradingEngine()
 
-    def test_books_close_with_ltp_and_default_reason(self, monkeypatch):
+    def test_books_unreconciled_when_no_trades(self, monkeypatch):
         j = FakeJournal()
-        kite = FakeKite(ltp=97.5, orders=[{"orderId": "STOP1", "status": "OPEN"}])
+        kite = FakeKite(trades=[])
         eng = self._engine(monkeypatch, kite, j)
         eng.active_trades["RELIANCE"] = _trade()
 
         eng._journal_external_close("RELIANCE")
 
-        assert j.closed == [("T1", 97.5, "closed_externally")]
+        assert j.closed == [("T1", 0.0, "UNRECONCILED")]
 
-    def test_reason_is_stop_loss_when_stop_order_complete(self, monkeypatch):
+    def test_calculates_vwap_from_stop_loss_trades(self, monkeypatch):
         j = FakeJournal()
-        kite = FakeKite(ltp=95.0, orders=[{"orderId": "STOP1", "status": "COMPLETE"}])
+        trades = [
+            {
+                "tradingsymbol": "RELIANCE",
+                "orderId": "STOP1",
+                "quantity": 4,
+                "averagePrice": 95.0,
+                "fillTimestamp": "2026-09-06 12:00:00",
+            },
+            {
+                "tradingsymbol": "RELIANCE",
+                "orderId": "STOP1",
+                "quantity": 6,
+                "averagePrice": 94.0,
+                "fillTimestamp": "2026-09-06 12:00:01",
+            },
+        ]
+        kite = FakeKite(trades=trades)
         eng = self._engine(monkeypatch, kite, j)
-        eng.active_trades["RELIANCE"] = _trade()
+        eng.active_trades["RELIANCE"] = _trade(
+            quantity=10, entry_time="2026-09-06T10:00:00"
+        )
 
         eng._journal_external_close("RELIANCE")
 
-        assert j.closed == [("T1", 95.0, "stop_loss")]
+        # VWAP: (4*95 + 6*94) / 10 = (380 + 564) / 10 = 94.4
+        assert j.closed == [("T1", 94.4, "stop_loss")]
+
+    def test_matches_manual_broker_exit(self, monkeypatch):
+        j = FakeJournal()
+        trades = [
+            {
+                "tradingsymbol": "RELIANCE",
+                "transactionType": "SELL",
+                "quantity": 10,
+                "averagePrice": 96.0,
+                "fillTimestamp": "2026-09-06 12:00:00",
+            }
+        ]
+        kite = FakeKite(trades=trades)
+        eng = self._engine(monkeypatch, kite, j)
+        # Entry time is before exit
+        eng.active_trades["RELIANCE"] = _trade(
+            quantity=10, entry_time="2026-09-06T10:00:00", stop_order_id=None
+        )
+
+        eng._journal_external_close("RELIANCE")
+
+        assert j.closed == [("T1", 96.0, "manual_broker_exit")]
 
     def test_noop_when_no_trade_id(self, monkeypatch):
         j = FakeJournal()
@@ -119,19 +169,19 @@ class TestJournalExternalClose:
 
         assert j.closed == []
 
-    def test_ltp_failure_still_closes_with_zero(self, monkeypatch):
+    def test_get_trades_failure_closes_unreconciled(self, monkeypatch):
         j = FakeJournal()
 
         class Boom(FakeKite):
-            def get_ltp(self, instruments):
+            def get_trades(self):
                 raise RuntimeError("network")
 
-        eng = self._engine(monkeypatch, Boom(orders=[]), j)
-        eng.active_trades["RELIANCE"] = _trade(stop_order_id=None)
+        eng = self._engine(monkeypatch, Boom(), j)
+        eng.active_trades["RELIANCE"] = _trade()
 
         eng._journal_external_close("RELIANCE")
 
-        assert j.closed == [("T1", 0.0, "closed_externally")]
+        assert j.closed == [("T1", 0.0, "UNRECONCILED")]
 
     def test_monitor_positions_journals_external_closure(self, monkeypatch):
         # End-to-end: a tracked position is no longer in the open book (its
@@ -139,7 +189,15 @@ class TestJournalExternalClose:
         j = FakeJournal()
         kite = FakeKite(
             ltp=95.0,
-            orders=[{"orderId": "STOP1", "status": "COMPLETE"}],
+            trades=[
+                {
+                    "tradingsymbol": "RELIANCE",
+                    "orderId": "STOP1",
+                    "quantity": 10,
+                    "averagePrice": 94.4,
+                    "fillTimestamp": "2026-09-06 12:00:00",
+                }
+            ],
             positions_net=[],  # RELIANCE is flat / gone
         )
         monkeypatch.setattr(te, "execution_gateway", kite)
@@ -148,11 +206,13 @@ class TestJournalExternalClose:
         monkeypatch.setattr(te, "risk_manager", FakeRisk())
 
         eng = TradingEngine()
-        eng.active_trades["RELIANCE"] = _trade()
+        eng.active_trades["RELIANCE"] = _trade(
+            quantity=10, entry_time="2026-09-06T10:00:00"
+        )
 
         eng.monitor_positions()
 
-        assert ("T1", 95.0, "stop_loss") in j.closed
+        assert ("T1", 94.4, "stop_loss") in j.closed
         assert "RELIANCE" not in eng.active_trades  # tracking dropped
 
     def test_stale_position_snapshot_journals_close_before_cleanup(self, monkeypatch):
@@ -164,7 +224,15 @@ class TestJournalExternalClose:
             def __init__(self):
                 super().__init__(
                     ltp=95.0,
-                    orders=[{"orderId": "STOP1", "status": "COMPLETE"}],
+                    trades=[
+                        {
+                            "tradingsymbol": "RELIANCE",
+                            "orderId": "STOP1",
+                            "quantity": 10,
+                            "averagePrice": 94.4,
+                            "fillTimestamp": "2026-09-06 12:00:00",
+                        }
+                    ],
                     positions_net=[
                         {
                             "tradingsymbol": "RELIANCE",
@@ -188,9 +256,11 @@ class TestJournalExternalClose:
         monkeypatch.setattr(te, "risk_manager", FakeRisk())
 
         eng = TradingEngine()
-        eng.active_trades["RELIANCE"] = _trade()
+        eng.active_trades["RELIANCE"] = _trade(
+            quantity=10, entry_time="2026-09-06T10:00:00"
+        )
 
         eng.monitor_positions()
 
-        assert ("T1", 95.0, "stop_loss") in j.closed
+        assert ("T1", 94.4, "stop_loss") in j.closed
         assert "RELIANCE" not in eng.active_trades
