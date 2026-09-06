@@ -100,7 +100,7 @@ def assert_valid_signal(sig, entry_tolerance=1e-6):
         "exchange",
         "strategy",
         "direction",
-        "confidence",
+        "signal_score",
         "entryPrice",
         "stopLoss",
         "target",
@@ -112,7 +112,7 @@ def assert_valid_signal(sig, entry_tolerance=1e-6):
     assert required.issubset(sig.keys()), f"missing keys: {required - sig.keys()}"
 
     assert sig["direction"] in ("BUY", "SELL")
-    assert 0 <= sig["confidence"] <= 100
+    assert 0 <= sig["signal_score"] <= 100
     assert sig["entryPrice"] > 0
 
     entry, sl, target = sig["entryPrice"], sig["stopLoss"], sig["target"]

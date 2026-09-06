@@ -204,7 +204,9 @@ export interface Signal {
   exchange: string;
   strategy: StrategyName;
   direction: SignalDirection;
-  confidence: number; // 0-100
+  signalScore: number;
+  estimatedProbability?: number;
+  calibrationSampleSize?: number; // 0-100
   entryPrice: number;
   stopLoss: number;
   target: number;
@@ -374,7 +376,9 @@ export interface JournalTrade {
   strategy: string;
   signal_id: string | null;
   reasoning: string | null;
-  confidence: number | null;
+  signalScore: number | null;
+  estimatedProbability?: number | null;
+  calibrationSampleSize?: number | null;
   entry_price: number;
   quantity: number;
   stop_loss: number;
@@ -413,8 +417,8 @@ export interface ConfluenceValidation {
   total_pnl: number;
 }
 
-export interface ConfidenceCalibration {
-  confidence_bucket: string;
+export interface SignalScoreCalibration {
+  signal_score_bucket: string;
   total_trades: number;
   actual_win_rate_pct: number;
 }

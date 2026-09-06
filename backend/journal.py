@@ -42,6 +42,8 @@ class TradeJournal:
                     signal_id TEXT,
                     reasoning TEXT,
                     confidence INTEGER,
+                    estimated_probability REAL,
+                    calibration_sample_size INTEGER,
                     entry_price REAL,
                     quantity INTEGER,
                     stop_loss REAL,
@@ -66,6 +68,21 @@ class TradeJournal:
                 );
             """)
 
+            # Backwards compatibility for existing DBs
+            try:
+                conn.execute(
+                    "ALTER TABLE trades ADD COLUMN estimated_probability REAL;"
+                )
+            except sqlite3.OperationalError:
+                pass
+
+            try:
+                conn.execute(
+                    "ALTER TABLE trades ADD COLUMN calibration_sample_size INTEGER;"
+                )
+            except sqlite3.OperationalError:
+                pass
+
     def open_trade(
         self,
         trade_id: str,
@@ -80,7 +97,9 @@ class TradeJournal:
         target: float,
         signal_id: Optional[str] = None,
         reasoning: Optional[str] = None,
-        confidence: Optional[int] = None,
+        signal_score: Optional[int] = None,
+        estimated_probability: Optional[float] = None,
+        calibration_sample_size: Optional[int] = None,
         confluence_snapshot: Optional[Dict[str, Any]] = None,
         indicator_snapshot: Optional[Dict[str, Any]] = None,
     ):
@@ -96,9 +115,9 @@ class TradeJournal:
         query = """
             INSERT INTO trades (
                 id, tradingsymbol, exchange, direction, product, strategy,
-                signal_id, reasoning, confidence, entry_price, quantity,
-                stop_loss, target, entry_time, status, confluence_snapshot, indicator_snapshot
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)
+                signal_id, reasoning, confidence, estimated_probability, calibration_sample_size,
+                entry_price, quantity, stop_loss, target, entry_time, status, confluence_snapshot, indicator_snapshot
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)
         """
         params = (
             trade_id,
@@ -109,7 +128,9 @@ class TradeJournal:
             strategy,
             signal_id,
             reasoning,
-            confidence,
+            signal_score,
+            estimated_probability,
+            calibration_sample_size,
             entry_price,
             quantity,
             stop_loss,

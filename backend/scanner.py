@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Tuple
 
 import pandas as pd
 
+from .calibration import calibrator
 from .config import config_manager
 from .kite_client import kite_client
 from .regime_classifier import regime_classifier
@@ -166,15 +167,19 @@ class Scanner:
                     if not dir_signals:
                         continue
 
-                    # Base signal for entry, sl, target (use highest confidence)
-                    base_sig = max(dir_signals, key=lambda s: s["confidence"])
+                    # Base signal for entry, sl, target (use highest signal_score)
+                    base_sig = max(dir_signals, key=lambda s: s["signal_score"])
 
-                    avg_conf = sum(s["confidence"] for s in dir_signals) / len(
+                    avg_conf = sum(s["signal_score"] for s in dir_signals) / len(
                         dir_signals
                     )
                     bonus = 5 * (len(dir_signals) - 1)
                     weight = family_config.get(family, {}).get("weight", 1.0)
-                    family_confidence = min(100, int((avg_conf + bonus) * weight))
+                    family_signal_score = min(100, int((avg_conf + bonus) * weight))
+
+                    est_prob, sample_size = calibrator.get_probability(
+                        f"family_{family}", family_signal_score
+                    )
 
                     agg_sig = {
                         "id": str(uuid.uuid4()),
@@ -182,7 +187,9 @@ class Scanner:
                         "exchange": base_sig.get("exchange", "NSE"),
                         "strategy": f"family_{family}",
                         "direction": direction,
-                        "confidence": family_confidence,
+                        "signal_score": family_signal_score,
+                        "estimated_probability": est_prob,
+                        "calibration_sample_size": sample_size,
                         "entryPrice": base_sig["entryPrice"],
                         "stopLoss": base_sig["stopLoss"],
                         "target": base_sig["target"],
@@ -215,7 +222,7 @@ class Scanner:
 
                     print(f"Error in parallel processing: {e}", file=sys.stderr)
 
-        all_signals.sort(key=lambda x: x.get("confidence", 0), reverse=True)
+        all_signals.sort(key=lambda x: x.get("signal_score", 0), reverse=True)
         return all_signals
 
     def evaluate_position(
@@ -258,7 +265,7 @@ class Scanner:
                                 "strategy": strat_id,
                                 "family": family,
                                 "direction": "BUY",
-                                "confidence": sig.get("confidence", 0),
+                                "signal_score": sig.get("signal_score", 0),
                             }
                         )
                     elif sig.get("direction") == "SELL":
@@ -268,7 +275,7 @@ class Scanner:
                                 "strategy": strat_id,
                                 "family": family,
                                 "direction": "SELL",
-                                "confidence": sig.get("confidence", 0),
+                                "signal_score": sig.get("signal_score", 0),
                             }
                         )
             except Exception:

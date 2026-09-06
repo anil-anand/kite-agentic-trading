@@ -204,8 +204,8 @@ export function setupIpcHandlers() {
     return await pythonBridge.call('analytics_confluence_validation');
   });
 
-  ipcMain.handle(channels.ANALYTICS_CONFIDENCE_CALIBRATION, async () => {
-    return await pythonBridge.call('analytics_confidence_calibration');
+  ipcMain.handle(channels.ANALYTICS_SIGNAL_SCORE_CALIBRATION, async () => {
+    return await pythonBridge.call('analytics_signal_score_calibration');
   });
 
   ipcMain.handle(channels.ANALYTICS_EXIT_REASON, async () => {

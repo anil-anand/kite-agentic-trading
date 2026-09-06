@@ -45,8 +45,8 @@ class TestEMACrossover:
         df = build_candles(closes, volumes=volumes)
         sig = _one(EMACrossoverStrategy().calculate_signals(df, "T"))
         assert sig["direction"] == "BUY"
-        # Confidence scales with the volume ratio and is capped at 100.
-        assert sig["confidence"] == 100
+        # SignalScore scales with the volume ratio and is capped at 100.
+        assert sig["signal_score"] == 100
 
     def test_no_signal_without_volume_confirmation(self):
         # Same golden cross, but the breakout bar has below-average volume.

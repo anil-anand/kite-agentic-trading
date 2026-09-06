@@ -155,9 +155,9 @@ class TradeAnalytics:
 
         return results
 
-    def get_confidence_calibration(self) -> List[Dict[str, Any]]:
+    def get_signal_score_calibration(self) -> List[Dict[str, Any]]:
         """
-        Bucket signals by confidence (e.g., 0-10, 10-20...) and compare with actual win rate.
+        Bucket signals by signal score (e.g., 0-10, 10-20...) and compare with actual win rate (R-multiple >= 0.9).
         """
         conn = self._get_conn()
         query = (
@@ -173,8 +173,24 @@ class TradeAnalytics:
             if bucket not in buckets:
                 buckets[bucket] = {"trades": 0, "wins": 0}
 
+            # Only count valid trades
+            if not r["entry_price"] or not r["stop_loss"] or not r["exit_price"]:
+                continue
+
+            risk = abs(r["entry_price"] - r["stop_loss"])
+            if risk == 0:
+                continue
+
             buckets[bucket]["trades"] += 1
-            if (r["pnl"] or 0.0) > 0:
+
+            pnl_per_share = (
+                (r["exit_price"] - r["entry_price"])
+                if r["direction"] == "BUY"
+                else (r["entry_price"] - r["exit_price"])
+            )
+            r_multiple = pnl_per_share / risk
+
+            if r_multiple >= 0.9:
                 buckets[bucket]["wins"] += 1
 
         results = []
@@ -184,7 +200,7 @@ class TradeAnalytics:
             )
             results.append(
                 {
-                    "confidence_bucket": f"{b}-{b + 9}",
+                    "signal_score_bucket": f"{b}-{b + 9}",
                     "total_trades": stats["trades"],
                     "actual_win_rate_pct": round(win_rate, 2),
                 }

@@ -106,7 +106,7 @@ try {
     analytics: {
       getStrategyExpectancy: () => electron.ipcRenderer.invoke(channels.ANALYTICS_STRATEGY_EXPECTANCY),
       getConfluenceValidation: () => electron.ipcRenderer.invoke(channels.ANALYTICS_CONFLUENCE_VALIDATION),
-      getConfidenceCalibration: () => electron.ipcRenderer.invoke(channels.ANALYTICS_CONFIDENCE_CALIBRATION),
+      getSignalScoreCalibration: () => electron.ipcRenderer.invoke(channels.ANALYTICS_SIGNAL_SCORE_CALIBRATION),
       getExitReasonEffectiveness: () => electron.ipcRenderer.invoke(channels.ANALYTICS_EXIT_REASON),
       getTradeReplay: (tradeId: string) => electron.ipcRenderer.invoke(channels.ANALYTICS_TRADE_REPLAY, tradeId),
       getWhatIfAnalysis: (tradeId: string) => electron.ipcRenderer.invoke(channels.ANALYTICS_WHAT_IF, tradeId),
