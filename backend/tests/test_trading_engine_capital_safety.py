@@ -218,7 +218,8 @@ def test_concurrent_entries_do_not_reuse_reserved_margin(monkeypatch):
         target=lambda: second_result.append(engine.execute_signal(second_signal))
     )
     second.start()
-    import time; time.sleep(0.1)
+    import time
+    time.sleep(0.1)
     fake_client.release.set()
     first.join(timeout=1)
     second.join(timeout=1)
