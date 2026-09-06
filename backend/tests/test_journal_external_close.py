@@ -74,6 +74,7 @@ def _trade(**over):
 
 class TestJournalExternalClose:
     def _engine(self, monkeypatch, kite, journal):
+        monkeypatch.setattr(te, "execution_gateway", kite)
         monkeypatch.setattr(te, "kite_client", kite)
         monkeypatch.setattr(te, "journal", journal)
         return TradingEngine()
@@ -138,6 +139,7 @@ class TestJournalExternalClose:
             orders=[{"orderId": "STOP1", "status": "COMPLETE"}],
             positions_net=[],  # RELIANCE is flat / gone
         )
+        monkeypatch.setattr(te, "execution_gateway", kite)
         monkeypatch.setattr(te, "kite_client", kite)
         monkeypatch.setattr(te, "journal", j)
         monkeypatch.setattr(te, "risk_manager", FakeRisk())
@@ -177,6 +179,7 @@ class TestJournalExternalClose:
                 return {"net": self._net}
 
         kite = FlatAfterSnapshotKite()
+        monkeypatch.setattr(te, "execution_gateway", kite)
         monkeypatch.setattr(te, "kite_client", kite)
         monkeypatch.setattr(te, "journal", j)
         monkeypatch.setattr(te, "risk_manager", FakeRisk())

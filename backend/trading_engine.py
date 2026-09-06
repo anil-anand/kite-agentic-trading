@@ -6,6 +6,7 @@ import time
 import uuid
 
 from .config import config_manager
+from .execution_gateway import execution_gateway
 from .journal import journal
 from .kite_client import kite_client
 from .risk_manager import risk_manager
@@ -37,6 +38,8 @@ class TradingEngine:
         # Symbols whose entry orders are in flight but not yet added to
         # active_trades. Prevents monitor_positions from adopting a position
         # that execute_signal is still setting up.
+        # This is kept in TradingEngine because monitor_positions needs it to avoid
+        # premature adoption, while execution_gateway handles duplicate *orders*.
         self._pending_entries: set = set()
         self._tick_size_map = {}
         self._reserved_entry_margin = 0.0
@@ -123,7 +126,7 @@ class TradingEngine:
         stop_id = trade.get("stop_order_id")
         if stop_id and str(stop_id) in open_orders:
             try:
-                kite_client.cancel_order("regular", stop_id)
+                execution_gateway.cancel_order(variety="regular", order_id=stop_id)
             except Exception:
                 pass
 
@@ -362,37 +365,8 @@ class TradingEngine:
     def execute_signal(self, signal: dict):
         symbol = signal["tradingsymbol"]
 
-        # Overtrading protections
-        risk_config = config_manager.get_risk_config()
-        max_daily_trades = risk_config.get("maxDailyTrades", 10)
-        max_symbol_trades = risk_config.get("maxTradesPerSymbolPerDay", 2)
-        cooldown_mins = risk_config.get("tradeCooldownMins", 15)
-
-        todays_counts = journal.get_todays_trade_counts()
-        if todays_counts["total"] >= max_daily_trades:
-            self._push_log(
-                f"Skipping {symbol}: Max daily trades ({max_daily_trades}) reached.",
-                level="warning",
-            )
-            return False
-
-        if todays_counts["by_symbol"].get(symbol, 0) >= max_symbol_trades:
-            self._push_log(
-                f"Skipping {symbol}: Max trades per symbol ({max_symbol_trades}) reached today.",
-                level="warning",
-            )
-            return False
-
-        last_exit = journal.get_last_exit_time(symbol)
-        if last_exit:
-            mins_since_exit = (datetime.datetime.now() - last_exit).total_seconds() / 60
-            if mins_since_exit < cooldown_mins:
-                self._push_log(
-                    f"Skipping {symbol}: Cooldown period active ({mins_since_exit:.1f}/{cooldown_mins} mins)."
-                )
-                return False
-
-        # Atomically guard against duplicate entry orders for the same symbol.
+        # Atomically guard against duplicate entry orders for the same symbol in trading_engine
+        # (execution_gateway also has its own lock to prevent broker-level duplicate orders).
         with self._trade_lock:
             if symbol in self.active_trades or symbol in self._pending_entries:
                 self._push_log(
@@ -410,11 +384,6 @@ class TradingEngine:
     def _execute_signal_inner(self, signal: dict):
         """Core execution logic. Called with the symbol reserved in _pending_entries."""
         symbol = signal["tradingsymbol"]
-
-        can_trade, reason = risk_manager.can_trade()
-        if not can_trade:
-            self._push_log(f"Cannot execute signal {signal['id']}: {reason}")
-            return False
 
         transaction_type = "BUY" if signal["direction"] == "BUY" else "SELL"
         exchange = signal.get("exchange", "NSE")
@@ -450,7 +419,8 @@ class TradingEngine:
 
                 reserved_margin = qty * entry_price
                 self._reserved_entry_margin += reserved_margin
-                order_id = kite_client.place_order(
+                order_id = execution_gateway.place_order(
+                    is_entry=True,
                     variety="regular",
                     exchange=exchange,
                     tradingsymbol=symbol,
@@ -460,6 +430,7 @@ class TradingEngine:
                     order_type="LIMIT",
                     price=entry_price,
                 )
+
             self._push_log(
                 f"Executed {transaction_type} for {symbol}, qty {qty}, order_id {order_id}"
             )
@@ -475,7 +446,7 @@ class TradingEngine:
                     level="warning",
                 )
                 try:
-                    kite_client.cancel_order("regular", order_id)
+                    execution_gateway.cancel_order(variety="regular", order_id=order_id)
                 except Exception:
                     pass
                 return False
@@ -787,7 +758,9 @@ class TradingEngine:
         if lost_race:
             if stop_order_id:
                 try:
-                    kite_client.cancel_order("regular", stop_order_id)
+                    execution_gateway.cancel_order(
+                        variety="regular", order_id=stop_order_id
+                    )
                 except Exception:
                     pass
             return
@@ -955,7 +928,7 @@ class TradingEngine:
             limit_price = self._round_to_tick(limit_price, tick_size)
 
             try:
-                kite_client.modify_order(
+                execution_gateway.modify_order(
                     variety="regular",
                     order_id=stop_order_id,
                     trigger_price=trigger_price,
@@ -1037,7 +1010,7 @@ class TradingEngine:
             time.sleep(self._entry_fill_poll_seconds)
 
         try:
-            kite_client.cancel_order("regular", order_id)
+            execution_gateway.cancel_order(variety="regular", order_id=order_id)
         except Exception:
             pass
         position = self._find_live_position(symbol, direction)
@@ -1094,7 +1067,8 @@ class TradingEngine:
                 limit_price = trigger_price * (1 + buffer_pct)
             limit_price = self._round_to_tick(limit_price, tick_size)
 
-            order_id = kite_client.place_order(
+            order_id = execution_gateway.place_order(
+                is_entry=False,
                 variety="regular",
                 exchange=exchange,
                 tradingsymbol=symbol,
@@ -1143,7 +1117,7 @@ class TradingEngine:
                 return
             trade["stop_order_id"] = None
         try:
-            kite_client.cancel_order("regular", stop_order_id)
+            execution_gateway.cancel_order(variety="regular", order_id=stop_order_id)
         except Exception:
             pass
 
@@ -1185,7 +1159,7 @@ class TradingEngine:
             order_kwargs["price"] = price
 
         try:
-            order_id = kite_client.place_order(**order_kwargs)
+            order_id = execution_gateway.place_order(**order_kwargs)
         except Exception as e:
             if order_type == "LIMIT":
                 self._push_log(
@@ -1196,7 +1170,7 @@ class TradingEngine:
                 if "price" in order_kwargs:
                     del order_kwargs["price"]
                 try:
-                    order_id = kite_client.place_order(**order_kwargs)
+                    order_id = execution_gateway.place_order(**order_kwargs)
                 except Exception as e2:
                     with self._trade_lock:
                         if symbol in self.active_trades:

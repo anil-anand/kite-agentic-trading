@@ -4,6 +4,7 @@ import traceback
 
 from .analytics import analytics
 from .config import config_manager
+from .execution_gateway import execution_gateway
 from .journal import journal
 from .kite_client import kite_client
 from .llm_client import OPENCODE_PLANS, OpenAICompatibleClient
@@ -99,15 +100,16 @@ def handle_request(req):
             return success(kite_client.get_margins())
 
         elif method == "place_order":
-            order_id = kite_client.place_order(**params)
+            params["is_entry"] = True  # Assume UI orders are entries unless specified
+            order_id = execution_gateway.place_order(**params)
             return success({"order_id": order_id})
 
         elif method == "cancel_order":
-            res = kite_client.cancel_order(**params)
+            res = execution_gateway.cancel_order(**params)
             return success(res)
 
         elif method == "modify_order":
-            res = kite_client.modify_order(**params)
+            res = execution_gateway.modify_order(**params)
             return success(res)
 
         elif method == "get_historical":
