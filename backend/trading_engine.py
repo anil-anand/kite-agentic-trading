@@ -572,7 +572,11 @@ class TradingEngine:
                     reasoning=signal.get("reasoning"),
                     confidence=signal.get("confidence"),
                     confluence_snapshot=evaluation,
-                    indicator_snapshot=signal.get("indicators"),
+                    indicator_snapshot={
+                        "features": signal.get("indicators"),
+                        "raw_signals": signal.get("raw_signals"),
+                        "regime": signal.get("regime"),
+                    },
                 )
             except Exception as e:
                 self._push_log(
