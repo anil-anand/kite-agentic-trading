@@ -83,6 +83,20 @@ class ConfigManager:
                 "ULTRACEMCO",
                 "NESTLEIND",
             ],
+            "screener": {
+                "weights": {
+                    "baseline": 1.0,
+                    "gap": 1.0,
+                    "volatility": 1.0,
+                    "trend": 1.0,
+                    "volume": 1.0,
+                    "liquidity": 1.0,
+                },
+                "filters": {
+                    "min_volume": 100000,
+                    "min_value_traded": 10000000,
+                },
+            },
             "credentials": {"apiKey": "", "apiSecret": ""},
             "llm": {
                 "provider": "Gemini",
@@ -253,6 +267,9 @@ class ConfigManager:
 
     def get_families_config(self):
         return self.config.get("families", self.default_config.get("families", {}))
+
+    def get_screener_config(self):
+        return self.config.get("screener", self.default_config.get("screener", {}))
 
     def get_watchlist(self):
         return self.config.get("watchlist", self.default_config["watchlist"])
