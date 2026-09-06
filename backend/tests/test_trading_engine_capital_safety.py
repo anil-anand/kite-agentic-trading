@@ -219,6 +219,7 @@ def test_concurrent_entries_do_not_reuse_reserved_margin(monkeypatch):
     )
     second.start()
     import time
+
     time.sleep(0.1)
     fake_client.release.set()
     first.join(timeout=1)
