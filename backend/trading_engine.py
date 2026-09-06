@@ -276,7 +276,9 @@ class TradingEngine:
 
     def _run_loop(self):
         last_scan_time = 0
+        last_reconcile_time = 0
         scan_interval = 30  # Check for new signals every 30 seconds
+        reconcile_interval = 300  # Reconcile executions every 5 minutes
         monitor_interval = 5  # Check open positions every 5 seconds for rapid exits
 
         while self.running:
@@ -295,6 +297,11 @@ class TradingEngine:
                 if current_time - last_scan_time >= scan_interval:
                     self.scan_and_trade()
                     last_scan_time = current_time
+
+                # 4. Reconcile journal trades periodically
+                if current_time - last_reconcile_time >= reconcile_interval:
+                    self._reconcile_journal_trades()
+                    last_reconcile_time = current_time
 
             except Exception as e:
                 self._push_log(f"Error in trading loop: {e}")
@@ -1248,47 +1255,197 @@ class TradingEngine:
                     del self.active_trades[symbol]
             break
 
+    def _reconcile_execution(self, symbol: str, trade_record: dict) -> tuple:
+        """
+        Query Kite trades to find the actual execution VWAP, reason, and time.
+        Returns (exit_price, exit_reason, exit_time). If not found, returns (0.0, "UNRECONCILED", None).
+        """
+        try:
+            trades = kite_client.get_trades()
+        except Exception as e:
+            self._push_log(
+                f"Failed to fetch trades for reconciliation: {e}", level="warning"
+            )
+            return 0.0, "UNRECONCILED", None
+
+        stop_order_id = str(trade_record.get("stop_order_id", ""))
+        exit_order_id = str(trade_record.get("exit_order_id", ""))
+        entry_time_val = trade_record.get("entry_time")
+        if isinstance(entry_time_val, str):
+            try:
+                entry_time = datetime.datetime.fromisoformat(entry_time_val)
+            except ValueError:
+                entry_time = datetime.datetime.now()
+        elif isinstance(entry_time_val, datetime.datetime):
+            entry_time = entry_time_val
+        else:
+            entry_time = datetime.datetime.now()
+
+        entry_direction = trade_record.get("direction", "BUY")
+        exit_transaction_type = "SELL" if entry_direction == "BUY" else "BUY"
+
+        matched_trades = []
+        for t in trades:
+            if t.get("tradingsymbol") != symbol:
+                continue
+            t_order_id = str(t.get("orderId", ""))
+            t_time_str = t.get("fillTimestamp") or t.get("exchangeTimestamp")
+            try:
+                t_time = (
+                    datetime.datetime.strptime(t_time_str, "%Y-%m-%d %H:%M:%S")
+                    if t_time_str
+                    else datetime.datetime.now()
+                )
+            except ValueError:
+                t_time = datetime.datetime.now()
+
+            # Must be after entry
+            if t_time < entry_time:
+                continue
+
+            # Exact order match
+            if stop_order_id and t_order_id == stop_order_id:
+                matched_trades.append((t, "stop_loss"))
+            elif exit_order_id and t_order_id == exit_order_id:
+                matched_trades.append((t, "target"))
+            # Fallback for manual/broker exits: match by opposite direction
+            elif t.get("transactionType") == exit_transaction_type:
+                matched_trades.append((t, "manual_broker_exit"))
+
+        if not matched_trades:
+            return 0.0, "UNRECONCILED", None
+
+        # Sort by time
+        matched_trades.sort(
+            key=lambda x: (
+                x[0].get("fillTimestamp") or x[0].get("exchangeTimestamp") or ""
+            )
+        )
+
+        target_qty = abs(trade_record.get("quantity", 0))
+        if target_qty == 0:
+            # If not provided, take all matched trades for this symbol
+            accumulated_qty = sum(int(t[0].get("quantity", 0)) for t in matched_trades)
+            target_qty = accumulated_qty or 1
+
+        total_value = 0.0
+        total_qty = 0
+        reasons = set()
+        last_time = None
+
+        for t, reason in matched_trades:
+            qty = int(t.get("quantity", 0))
+            if total_qty + qty > target_qty:
+                qty = target_qty - total_qty
+
+            if qty <= 0:
+                break
+
+            price = float(t.get("averagePrice") or 0.0)
+            total_value += price * qty
+            total_qty += qty
+            reasons.add(reason)
+            last_time = t.get("fillTimestamp") or t.get("exchangeTimestamp")
+
+            if total_qty >= target_qty:
+                break
+
+        if total_qty == 0:
+            return 0.0, "UNRECONCILED", None
+
+        vwap = round(total_value / total_qty, 2)
+
+        # Determine main reason
+        if "stop_loss" in reasons:
+            final_reason = "stop_loss"
+        elif "target" in reasons:
+            final_reason = "target"
+        else:
+            final_reason = "manual_broker_exit"
+
+        if last_time:
+            try:
+                dt = datetime.datetime.strptime(last_time, "%Y-%m-%d %H:%M:%S")
+                last_time = dt.isoformat()
+            except ValueError:
+                pass
+
+        return vwap, final_reason, last_time
+
     def _journal_external_close(self, symbol: str):
         """Book a journal close for a position closed outside the app-side exit
-        path (broker-stop fill or a manual close in Kite). Uses the current LTP
-        as the exit price and infers the reason from the protective stop's
-        status."""
+        path (broker-stop fill or a manual close in Kite)."""
         with self._trade_lock:
             trade = self.active_trades.get(symbol)
             if not trade:
                 return
             trade_id = trade.get("trade_id")
-            stop_order_id = trade.get("stop_order_id")
-            exchange = trade.get("exchange", "NSE")
+            trade_record = dict(trade)
+
         if not trade_id:
             return
 
-        # Exit price: best available post-hoc estimate is the current LTP.
-        exit_price = 0.0
-        try:
-            data = kite_client.get_ltp([f"{exchange}:{symbol}"])
-            exit_price = (data.get(f"{exchange}:{symbol}") or {}).get("last_price", 0.0)
-        except Exception:
-            pass
+        exit_price, reason, exit_time = self._reconcile_execution(symbol, trade_record)
 
-        # If the protective stop shows COMPLETE, the stop closed it.
-        reason = "closed_externally"
-        if stop_order_id:
-            try:
-                for o in kite_client.get_orders():
-                    if str(o.get("orderId")) == str(stop_order_id):
-                        if str(o.get("status", "")).upper() == "COMPLETE":
-                            reason = "stop_loss"
-                        break
-            except Exception:
-                pass
+        if reason == "UNRECONCILED":
+            self._push_log(
+                f"Execution exact details not found for {symbol}. Marking as UNRECONCILED.",
+                level="warning",
+            )
 
         try:
-            journal.close_trade(trade_id, exit_price, reason)
+            journal.close_trade(trade_id, exit_price, reason, exit_time)
         except Exception as e:
             self._push_log(
                 f"Error closing trade in journal for {symbol}: {e}", level="error"
             )
+
+    def _reconcile_journal_trades(self):
+        """Periodically check journal OPEN or UNRECONCILED trades and fix them using broker executions."""
+        try:
+            open_positions = {
+                p["tradingsymbol"]: p
+                for p in kite_client.get_positions().get("net", [])
+                if p.get("quantity", 0) != 0
+            }
+        except Exception as e:
+            self._push_log(
+                f"Reconcile job: failed to fetch positions: {e}", level="warning"
+            )
+            return
+
+        try:
+            journal_trades = journal.get_trades()
+        except Exception:
+            return
+
+        for t in journal_trades:
+            if t["status"] == "OPEN" and t["tradingsymbol"] not in open_positions:
+                # Ghost open position in journal
+                self._push_log(
+                    f"Reconcile job: Found ghost OPEN trade for {t['tradingsymbol']}. Attempting to reconcile."
+                )
+                exit_price, reason, exit_time = self._reconcile_execution(
+                    t["tradingsymbol"], dict(t)
+                )
+                if reason != "UNRECONCILED":
+                    journal.close_trade(t["id"], exit_price, reason, exit_time)
+                    self._push_log(
+                        f"Reconcile job: Closed {t['tradingsymbol']} at {exit_price} ({reason})"
+                    )
+                else:
+                    journal.close_trade(t["id"], 0.0, "UNRECONCILED", None)
+
+            elif t["status"] == "CLOSED" and t["exit_reason"] == "UNRECONCILED":
+                # Try to find fills now
+                exit_price, reason, exit_time = self._reconcile_execution(
+                    t["tradingsymbol"], dict(t)
+                )
+                if reason != "UNRECONCILED":
+                    journal.update_trade_exit(t["id"], exit_price, reason, exit_time)
+                    self._push_log(
+                        f"Reconcile job: Reconciled {t['tradingsymbol']} at {exit_price} ({reason})"
+                    )
 
 
 trading_engine = TradingEngine()

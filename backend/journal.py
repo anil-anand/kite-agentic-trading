@@ -152,10 +152,16 @@ class TradeJournal:
         """
         conn.execute(query, (event_id, trade_id, timestamp, event_type, details_str))
 
-    def close_trade(self, trade_id: str, exit_price: float, exit_reason: str):
+    def close_trade(
+        self,
+        trade_id: str,
+        exit_price: float,
+        exit_reason: str,
+        exit_time: Optional[str] = None,
+    ):
         """Mark a trade as closed and record its outcome."""
         conn = self._get_conn()
-        now = datetime.now().isoformat()
+        now = exit_time or datetime.now().isoformat()
 
         # Calculate PNL
         cursor = conn.execute(
@@ -185,6 +191,46 @@ class TradeJournal:
                 now,
                 "exit_filled",
                 {"exit_price": exit_price, "exit_reason": exit_reason, "pnl": pnl},
+            )
+
+    def update_trade_exit(
+        self, trade_id: str, exit_price: float, exit_reason: str, exit_time: str
+    ):
+        """Update an already closed or unreconciled trade with actual execution details."""
+        conn = self._get_conn()
+
+        cursor = conn.execute(
+            "SELECT direction, entry_price, quantity FROM trades WHERE id = ?",
+            (trade_id,),
+        )
+        row = cursor.fetchone()
+
+        pnl = 0.0
+        if row:
+            direction, entry_price, quantity = row
+            if direction == "BUY":
+                pnl = (exit_price - entry_price) * quantity
+            else:
+                pnl = (entry_price - exit_price) * quantity
+
+        query = """
+            UPDATE trades
+            SET exit_price = ?, exit_time = ?, exit_reason = ?, pnl = ?
+            WHERE id = ?
+        """
+        with conn:
+            conn.execute(query, (exit_price, exit_time, exit_reason, pnl, trade_id))
+            self._log_event_inner(
+                conn,
+                trade_id,
+                datetime.now().isoformat(),
+                "exit_reconciled",
+                {
+                    "exit_price": exit_price,
+                    "exit_reason": exit_reason,
+                    "pnl": pnl,
+                    "actual_exit_time": exit_time,
+                },
             )
 
     def get_trades(self) -> List[Dict[str, Any]]:
