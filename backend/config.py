@@ -33,6 +33,8 @@ class ConfigManager:
                 "positionRevalIntervalMins": 30,
                 "positionRevalWeakExitMins": 60,
                 "positionRevalBreakevenMins": 45,
+                "stopOrderType": "SL",
+                "haltAutoTradesOnStopFailure": True,
             },
             "strategies": {
                 "ema_crossover": {"enabled": True},
