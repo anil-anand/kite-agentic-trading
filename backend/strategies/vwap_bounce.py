@@ -3,7 +3,8 @@ from typing import Any, Dict, List
 import pandas as pd
 from ta.momentum import RSIIndicator
 from ta.trend import EMAIndicator
-from ta.volume import VolumeWeightedAveragePrice
+
+from backend.indicators import SessionVWAP
 
 from .base import BaseStrategy
 
@@ -24,9 +25,7 @@ class VWAPBounceStrategy(BaseStrategy):
         signals = []
         df = df.copy()
 
-        vwap = VolumeWeightedAveragePrice(
-            high=df["high"], low=df["low"], close=df["close"], volume=df["volume"]
-        ).volume_weighted_average_price()
+        vwap = SessionVWAP(df).vwap()
 
         rsi = RSIIndicator(close=df["close"], window=14).rsi()
         fast_ema = EMAIndicator(close=df["close"], window=9).ema_indicator()

@@ -2,7 +2,8 @@ from typing import Any, Dict, List
 
 import pandas as pd
 from ta.momentum import RSIIndicator
-from ta.volume import VolumeWeightedAveragePrice
+
+from backend.indicators import SessionVWAP
 
 from .base import BaseStrategy
 
@@ -24,9 +25,7 @@ class RSIReversalStrategy(BaseStrategy):
         df = df.copy()
 
         rsi = RSIIndicator(close=df["close"], window=14).rsi()
-        vwap = VolumeWeightedAveragePrice(
-            high=df["high"], low=df["low"], close=df["close"], volume=df["volume"]
-        ).volume_weighted_average_price()
+        vwap = SessionVWAP(df).vwap()
 
         df["rsi"] = rsi
         df["vwap"] = vwap
