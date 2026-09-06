@@ -48,7 +48,7 @@ const AgentControl: React.FC = () => {
       tradingsymbol: string;
       direction: 'BUY' | 'SELL';
       signals: typeof signals;
-      avgConfidence: number;
+      avgSignalScore: number;
       confluenceScore: number;
     }> = {};
 
@@ -59,7 +59,7 @@ const AgentControl: React.FC = () => {
           tradingsymbol: sig.tradingsymbol,
           direction: sig.direction,
           signals: [],
-          avgConfidence: 0,
+          avgSignalScore: 0,
           confluenceScore: 0
         };
       }
@@ -70,7 +70,7 @@ const AgentControl: React.FC = () => {
     return Object.values(groups)
       .map(group => {
         group.confluenceScore = group.signals.length;
-        group.avgConfidence = Math.round(group.signals.reduce((acc, s) => acc + s.confidence, 0) / group.confluenceScore);
+        group.avgSignalScore = Math.round(group.signals.reduce((acc, s) => acc + s.signalScore, 0) / group.confluenceScore);
         return group;
       })
       .sort((a, b) => {
@@ -79,7 +79,7 @@ const AgentControl: React.FC = () => {
           return b.confluenceScore - a.confluenceScore;
         }
         // Then by average confidence
-        return b.avgConfidence - a.avgConfidence;
+        return b.avgSignalScore - a.avgSignalScore;
       });
   }, [signals]);
 
@@ -160,7 +160,7 @@ const AgentControl: React.FC = () => {
               <div className="text-center text-surface-400 mt-10">No active signals</div>
             ) : (
               groupedSignals.map(group => {
-                const bestSignal = group.signals.reduce((prev, current) => (prev.confidence > current.confidence) ? prev : current);
+                const bestSignal = group.signals.reduce((prev, current) => (prev.signalScore > current.signalScore) ? prev : current);
                 const isBuy = group.direction === 'BUY';
 
                 return (
@@ -180,7 +180,7 @@ const AgentControl: React.FC = () => {
                     <div className="flex flex-wrap gap-1 mt-1">
                       {group.signals.map(s => (
                         <span key={s.id} className="text-[10px] bg-surface-700 text-surface-300 px-2 py-1 rounded" title={s.reasoning}>
-                          {s.strategy} ({s.confidence}%)
+                          {s.strategy} ({s.signalScore}%)
                         </span>
                       ))}
                     </div>
@@ -202,9 +202,9 @@ const AgentControl: React.FC = () => {
 
                     <div className="flex items-center gap-2 mt-1">
                       <div className="flex-1 bg-surface-700 h-2 rounded-full overflow-hidden">
-                        <div className="h-full bg-accent-light" style={{ width: `${group.avgConfidence}%` }}></div>
+                        <div className="h-full bg-accent-light" style={{ width: `${group.avgSignalScore}%` }}></div>
                       </div>
-                      <span className="text-xs font-mono text-surface-400">Avg {group.avgConfidence}%</span>
+                      <span className="text-xs font-mono text-surface-400">Avg {group.avgSignalScore}%</span>
                     </div>
 
                     <div className="flex gap-2 mt-2 pt-3 border-t border-surface-700">

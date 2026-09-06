@@ -40,14 +40,14 @@ class RSIReversalStrategy(BaseStrategy):
             sl = self.calculate_stop_loss(entry, "BUY")
             target = self.calculate_target(entry, sl)
 
-            confidence = int(70 + (30 - prev["rsi"]))
-            confidence = min(100, max(50, confidence))
+            signal_score = int(70 + (30 - prev["rsi"]))
+            signal_score = min(100, max(50, signal_score))
 
             signals.append(
                 self.format_signal(
                     tradingsymbol,
                     "BUY",
-                    confidence,
+                    signal_score,
                     entry,
                     sl,
                     target,
@@ -65,14 +65,14 @@ class RSIReversalStrategy(BaseStrategy):
             sl = self.calculate_stop_loss(entry, "SELL")
             target = self.calculate_target(entry, sl)
 
-            confidence = int(70 + (prev["rsi"] - 70))
-            confidence = min(100, max(50, confidence))
+            signal_score = int(70 + (prev["rsi"] - 70))
+            signal_score = min(100, max(50, signal_score))
 
             signals.append(
                 self.format_signal(
                     tradingsymbol,
                     "SELL",
-                    confidence,
+                    signal_score,
                     entry,
                     sl,
                     target,

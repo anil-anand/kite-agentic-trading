@@ -53,12 +53,12 @@ class VWAPBounceStrategy(BaseStrategy):
                 sl = self.calculate_stop_loss(entry, "BUY")
                 target = self.calculate_target(entry, sl)
 
-                confidence = 80
+                signal_score = 80
                 signals.append(
                     self.format_signal(
                         tradingsymbol,
                         "BUY",
-                        confidence,
+                        signal_score,
                         entry,
                         sl,
                         target,
@@ -81,12 +81,12 @@ class VWAPBounceStrategy(BaseStrategy):
                 sl = self.calculate_stop_loss(entry, "SELL")
                 target = self.calculate_target(entry, sl)
 
-                confidence = 80
+                signal_score = 80
                 signals.append(
                     self.format_signal(
                         tradingsymbol,
                         "SELL",
-                        confidence,
+                        signal_score,
                         entry,
                         sl,
                         target,

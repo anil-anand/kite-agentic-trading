@@ -50,7 +50,7 @@ class TestFormatSignal:
         assert sig["exchange"] == "NSE"
         assert sig["strategy"] == "EMA Crossover"
         assert sig["direction"] == "BUY"
-        assert sig["confidence"] == 82
+        assert sig["signal_score"] == 82
         assert sig["entryPrice"] == 100.0
         assert sig["stopLoss"] == 98.5
         assert sig["target"] == 103.0

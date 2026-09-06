@@ -91,17 +91,17 @@ def test_confluence_validation(temp_db):
     assert res_2["total_pnl"] == -100
 
 
-def test_confidence_calibration(temp_db):
+def test_signal_score_calibration(temp_db):
     analytics = TradeAnalytics(db_path=temp_db)
-    res = analytics.get_confidence_calibration()
+    res = analytics.get_signal_score_calibration()
     assert len(res) == 2
     # 70-79 bucket (75 conf) -> 1 trade, 0 wins
     # 80-89 bucket (85 conf) -> 1 trade, 1 wins
-    b70 = next(r for r in res if r["confidence_bucket"] == "70-79")
+    b70 = next(r for r in res if r["signal_score_bucket"] == "70-79")
     assert b70["total_trades"] == 1
     assert b70["actual_win_rate_pct"] == 0.0
 
-    b80 = next(r for r in res if r["confidence_bucket"] == "80-89")
+    b80 = next(r for r in res if r["signal_score_bucket"] == "80-89")
     assert b80["total_trades"] == 1
     assert b80["actual_win_rate_pct"] == 100.0
 

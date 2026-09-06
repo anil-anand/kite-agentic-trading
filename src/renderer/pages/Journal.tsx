@@ -4,7 +4,7 @@ import {
   TradeEvent, 
   StrategyExpectancy, 
   ConfluenceValidation, 
-  ConfidenceCalibration, 
+  SignalScoreCalibration, 
   ExitReasonEffectiveness,
   TradeReplayData,
   WhatIfAnalysis,
@@ -34,7 +34,7 @@ const Journal: React.FC = () => {
   // Analytics State
   const [expectancy, setExpectancy] = useState<StrategyExpectancy[]>([]);
   const [confluence, setConfluence] = useState<ConfluenceValidation[]>([]);
-  const [calibration, setCalibration] = useState<ConfidenceCalibration[]>([]);
+  const [calibration, setCalibration] = useState<SignalScoreCalibration[]>([]);
   const [exitReasons, setExitReasons] = useState<ExitReasonEffectiveness[]>([]);
 
   const [loading, setLoading] = useState(false);
@@ -52,7 +52,7 @@ const Journal: React.FC = () => {
 
       const exp = await window.electronAPI.analytics.getStrategyExpectancy();
       const conf = await window.electronAPI.analytics.getConfluenceValidation();
-      const calib = await window.electronAPI.analytics.getConfidenceCalibration();
+      const calib = await window.electronAPI.analytics.getSignalScoreCalibration();
       const exitR = await window.electronAPI.analytics.getExitReasonEffectiveness();
 
       setExpectancy(exp || []);
@@ -215,7 +215,7 @@ const Journal: React.FC = () => {
                                 <div className="bg-surface-800 p-4 rounded-lg border border-surface-700 text-sm text-surface-200 space-y-3">
                                   <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Reasoning</span> {t.reasoning || 'N/A'}</p>
                                   <div className="grid grid-cols-2 gap-4 pt-2 border-t border-surface-700/50">
-                                    <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Confidence</span> {t.confidence ? `${t.confidence}%` : 'N/A'}</p>
+                                    <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Confidence</span> {t.signalScore ? `${t.signalScore}%` : 'N/A'}</p>
                                     <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Status</span> {t.status}</p>
                                   </div>
                                   {t.exit_reason && (
@@ -410,16 +410,16 @@ const Journal: React.FC = () => {
           </div>
         </div>
 
-        {/* Confidence Calibration */}
+        {/* Signal Score Calibration */}
         <div className="bg-surface-800 rounded-xl p-6 border border-surface-700 shadow-lg transition-transform hover:-translate-y-1 duration-300">
           <h3 className="text-lg font-semibold text-white mb-6 flex items-center">
-            <Activity className="mr-2 text-accent-light" size={20} /> Confidence Calibration
+            <Activity className="mr-2 text-accent-light" size={20} /> Signal Score Calibration
           </h3>
           <div className="space-y-5">
             {calibration.map((c, idx) => (
-              <div key={c.confidence_bucket} className="flex flex-col space-y-2">
+              <div key={c.signal_score_bucket} className="flex flex-col space-y-2">
                 <div className="flex justify-between text-sm">
-                  <span className="text-surface-300 font-medium">Predicted: {c.confidence_bucket}%</span>
+                  <span className="text-surface-300 font-medium">Predicted: {c.signal_score_bucket}%</span>
                   <span className="font-semibold text-white">Actual: {c.actual_win_rate_pct}% <span className="text-surface-400 font-normal">({c.total_trades} trades)</span></span>
                 </div>
                 <div className="h-3 w-full bg-surface-900 rounded-full overflow-hidden shadow-inner">

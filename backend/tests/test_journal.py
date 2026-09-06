@@ -31,7 +31,7 @@ def test_journal_open_close_trade(temp_journal):
         target=2540.00,
         signal_id="sig_456",
         reasoning="MACD crossed above signal line",
-        confidence=85,
+        signal_score=85,
         confluence_snapshot={"MACD_Crossover": "BUY"},
         indicator_snapshot={"RSI": 60},
     )

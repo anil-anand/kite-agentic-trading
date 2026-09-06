@@ -388,9 +388,14 @@ class TradingEngine:
         def handle_new_signal(signal):
             # NOTE: This callback is invoked from scanner ThreadPoolExecutor
             # threads, so active_trades access must be guarded by the lock.
-            if signal["confidence"] >= 70:
+            if signal["signal_score"] >= 70:
                 self._push_signal(signal)
-                if self.mode == "auto" and signal["confidence"] >= 80 and can_trade:
+                if (
+                    self.mode == "auto"
+                    and signal.get("estimated_probability") is not None
+                    and signal["estimated_probability"] >= 0.60
+                    and can_trade
+                ):
                     symbol = signal["tradingsymbol"]
                     with self._trade_lock:
                         already_active = (
@@ -570,7 +575,9 @@ class TradingEngine:
                     target=signal["target"],
                     signal_id=signal.get("id"),
                     reasoning=signal.get("reasoning"),
-                    confidence=signal.get("confidence"),
+                    signal_score=signal.get("signal_score"),
+                    estimated_probability=signal.get("estimated_probability"),
+                    calibration_sample_size=signal.get("calibration_sample_size"),
                     confluence_snapshot=evaluation,
                     indicator_snapshot={
                         "features": signal.get("indicators"),

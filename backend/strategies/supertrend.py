@@ -74,13 +74,13 @@ class SupertrendStrategy(BaseStrategy):
                 sl = last["lowerband"]
                 target = self.calculate_target(entry, sl)
 
-                confidence = min(100, int(70 + (last["adx"] - 25)))
+                signal_score = min(100, int(70 + (last["adx"] - 25)))
 
                 signals.append(
                     self.format_signal(
                         tradingsymbol,
                         "BUY",
-                        confidence,
+                        signal_score,
                         entry,
                         sl,
                         target,
@@ -98,13 +98,13 @@ class SupertrendStrategy(BaseStrategy):
                 sl = last["upperband"]
                 target = self.calculate_target(entry, sl)
 
-                confidence = min(100, int(70 + (last["adx"] - 25)))
+                signal_score = min(100, int(70 + (last["adx"] - 25)))
 
                 signals.append(
                     self.format_signal(
                         tradingsymbol,
                         "SELL",
-                        confidence,
+                        signal_score,
                         entry,
                         sl,
                         target,

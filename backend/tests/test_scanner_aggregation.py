@@ -37,7 +37,7 @@ def test_scanner_aggregation_trending(mock_scanner_config, monkeypatch, uptrend)
             {
                 "strategy": "EMA Crossover",
                 "direction": "BUY",
-                "confidence": 85,
+                "signal_score": 85,
                 "entryPrice": 120.0,
                 "stopLoss": 110.0,
                 "target": 140.0,
@@ -87,7 +87,7 @@ def test_scanner_aggregation_breakout(mock_scanner_config, monkeypatch):
             {
                 "strategy": "Bollinger Breakout",
                 "direction": "BUY",
-                "confidence": 90,
+                "signal_score": 90,
                 "entryPrice": 145.0,
                 "stopLoss": 135.0,
                 "target": 160.0,

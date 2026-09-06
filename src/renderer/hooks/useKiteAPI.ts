@@ -38,7 +38,7 @@ export interface ElectronAPI {
   analytics: {
     getStrategyExpectancy(): Promise<any>;
     getConfluenceValidation(): Promise<any>;
-    getConfidenceCalibration(): Promise<any>;
+    getSignalScoreCalibration(): Promise<any>;
     getExitReasonEffectiveness(): Promise<any>;
     getTradeReplay(tradeId: string): Promise<any>;
     getWhatIfAnalysis(tradeId: string): Promise<any>;
