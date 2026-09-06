@@ -121,14 +121,38 @@ class TradeAnalytics:
         confluence_stats = {}
         for r in rows:
             snapshot_str = r["confluence_snapshot"]
+            direction = r["direction"]
             count = 1
             if snapshot_str:
                 try:
                     snapshot = json.loads(snapshot_str)
-                    if isinstance(snapshot, dict):
+                    if not isinstance(snapshot, dict):
+                        raise ValueError("Snapshot is not a dict")
+
+                    if "strategies" in snapshot:
+                        if not isinstance(snapshot["strategies"], list):
+                            raise ValueError("strategies is not a list")
+                        # Explicitly count strategies matching trade direction
+                        count = max(
+                            1,
+                            sum(
+                                1
+                                for s in snapshot["strategies"]
+                                if s.get("direction") == direction
+                            ),
+                        )
+                    else:
+                        metadata_keys = {
+                            "regime",
+                            "regime_features",
+                            "buy_signals",
+                            "sell_signals",
+                        }
+                        if set(snapshot.keys()).intersection(metadata_keys):
+                            raise ValueError("Malformed snapshot")
                         count = max(1, len(snapshot))
                 except Exception:
-                    pass
+                    count = "invalid"
 
             if count not in confluence_stats:
                 confluence_stats[count] = {"trades": 0, "wins": 0, "pnl": 0.0}
@@ -140,7 +164,12 @@ class TradeAnalytics:
             confluence_stats[count]["pnl"] += pnl
 
         results = []
-        for count, stats in sorted(confluence_stats.items()):
+
+        def sort_key(item):
+            k = item[0]
+            return (1, k) if k == "invalid" else (0, k)
+
+        for count, stats in sorted(confluence_stats.items(), key=sort_key):
             win_rate = (
                 (stats["wins"] / stats["trades"]) * 100 if stats["trades"] > 0 else 0
             )
