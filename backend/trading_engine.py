@@ -172,6 +172,40 @@ class TradingEngine:
                 pos.get("exchange", trade.get("exchange", "NSE")),
                 pos.get("product", "MIS"),
             )
+
+            if not new_stop_id or not self._confirm_protective_stop(new_stop_id):
+                self._push_log(
+                    f"CRITICAL: Failed to confirm replaced protective stop for {symbol} during reconcile. Emergency flattening.",
+                    level="error",
+                )
+                try:
+                    execution_gateway.emergency_flatten_position(
+                        variety="regular",
+                        exchange=pos.get("exchange", trade.get("exchange", "NSE")),
+                        tradingsymbol=symbol,
+                        transaction_type="SELL"
+                        if trade["direction"] == "BUY"
+                        else "BUY",
+                        quantity=abs(pos["quantity"]),
+                        product=pos.get("product", "MIS"),
+                        order_type="MARKET",
+                    )
+                except Exception as e:
+                    self._push_log(
+                        f"Emergency flatten failed for {symbol}: {e}", level="error"
+                    )
+
+                risk_config = config_manager.get_risk_config()
+                if risk_config.get("haltAutoTradesOnStopFailure", True):
+                    self._push_log(
+                        "Halting auto trades due to protective stop failure in reconcile.",
+                        level="error",
+                    )
+                    self.stop()
+
+                trade["stop_order_id"] = None
+                return False
+
             trade["stop_order_id"] = new_stop_id or None
 
         # Keep waiting on an exit that's still working; otherwise clear it.
@@ -478,16 +512,36 @@ class TradingEngine:
                 position.get("exchange", signal["exchange"]),
                 position.get("product", "MIS"),
             )
-            if not stop_order_id:
+            if not stop_order_id or not self._confirm_protective_stop(stop_order_id):
                 self._push_log(
-                    f"Failed to place protective stop for {symbol}. Exiting position immediately.",
+                    f"CRITICAL: Failed to confirm protective stop for {symbol}. Emergency flattening.",
                     level="error",
                 )
-                self._exit_position(
-                    position,
-                    symbol,
-                    "Protective stop placement failed",
-                )
+                try:
+                    execution_gateway.emergency_flatten_position(
+                        variety="regular",
+                        exchange=position.get("exchange", signal["exchange"]),
+                        tradingsymbol=symbol,
+                        transaction_type="SELL"
+                        if signal["direction"] == "BUY"
+                        else "BUY",
+                        quantity=abs(position.get("quantity", qty)) or qty,
+                        product=position.get("product", "MIS"),
+                        order_type="MARKET",
+                    )
+                except Exception as e:
+                    self._push_log(
+                        f"Emergency flatten failed for {symbol}: {e}", level="error"
+                    )
+
+                risk_config = config_manager.get_risk_config()
+                if risk_config.get("haltAutoTradesOnStopFailure", True):
+                    self._push_log(
+                        "Halting auto trades due to protective stop failure.",
+                        level="error",
+                    )
+                    self.stop()
+
                 return False
 
             # Get confluence snapshot for journal
@@ -1074,33 +1128,51 @@ class TradingEngine:
     ) -> str:
         try:
             symbol = signal["tradingsymbol"]
+
+            if quantity <= 0:
+                raise ValueError("Protective stop quantity must be > 0")
+            if signal.get("stopLoss", 0) <= 0:
+                raise ValueError("Protective stop trigger price must be > 0")
+            if exchange not in ["NSE", "NFO", "BSE", "MCX", "CDS"]:
+                raise ValueError(f"Invalid exchange {exchange}")
+            if product not in ["MIS", "NRML", "CNC"]:
+                raise ValueError(f"Invalid product {product}")
+
             direction = signal["direction"]
             stop_tx = "SELL" if direction == "BUY" else "BUY"
             tick_size = self._get_tick_size(symbol, exchange)
             trigger_price = self._round_to_tick(signal["stopLoss"], tick_size)
 
-            buffer_pct = 0.01
-            if stop_tx == "SELL":
-                limit_price = trigger_price * (1 - buffer_pct)
-            else:
-                limit_price = trigger_price * (1 + buffer_pct)
-            limit_price = self._round_to_tick(limit_price, tick_size)
+            risk_config = config_manager.get_risk_config()
+            stop_order_type = risk_config.get("stopOrderType", "SL")
 
-            order_id = execution_gateway.place_order(
-                is_entry=False,
-                variety="regular",
-                exchange=exchange,
-                tradingsymbol=symbol,
-                transaction_type=stop_tx,
-                quantity=quantity,
-                product=product,
-                order_type="SL",
-                price=limit_price,
-                trigger_price=trigger_price,
-            )
+            order_args = {
+                "is_entry": False,
+                "variety": "regular",
+                "exchange": exchange,
+                "tradingsymbol": symbol,
+                "transaction_type": stop_tx,
+                "quantity": quantity,
+                "product": product,
+                "order_type": stop_order_type,
+                "trigger_price": trigger_price,
+            }
+
+            limit_price = 0
+            if stop_order_type == "SL":
+                buffer_pct = 0.01
+                if stop_tx == "SELL":
+                    limit_price = trigger_price * (1 - buffer_pct)
+                else:
+                    limit_price = trigger_price * (1 + buffer_pct)
+                limit_price = self._round_to_tick(limit_price, tick_size)
+                order_args["price"] = limit_price
+
+            order_id = execution_gateway.place_order(**order_args)
             self._push_log(
-                f"Placed protective stop for {symbol} at trigger ₹{trigger_price}, limit ₹{limit_price}, order_id {order_id}"
+                f"Placed protective stop ({stop_order_type}) for {symbol} at trigger ₹{trigger_price}, limit ₹{limit_price}, order_id {order_id}"
             )
+
             with self._trade_lock:
                 trade = self.active_trades.get(symbol, {})
                 trade_id = trade.get("trade_id")
@@ -1125,6 +1197,31 @@ class TradingEngine:
                 level="error",
             )
             return ""
+
+    def _confirm_protective_stop(self, order_id: str, timeout_seconds: int = 3) -> bool:
+        """Polls the broker to confirm the protective stop is OPEN or TRIGGER PENDING."""
+        if not order_id:
+            return False
+
+        deadline = time.time() + timeout_seconds
+        while time.time() <= deadline:
+            order = self._find_order(order_id)
+            if order:
+                status = str(order.get("status", "")).upper()
+                if status in {"OPEN", "TRIGGER PENDING"}:
+                    return True
+                elif status in {"REJECTED", "CANCELLED"}:
+                    self._push_log(
+                        f"Protective stop {order_id} failed with status {status}",
+                        level="error",
+                    )
+                    return False
+            time.sleep(0.5)
+
+        self._push_log(
+            f"Timed out confirming protective stop {order_id}", level="error"
+        )
+        return False
 
     def _cancel_protective_stop(self, symbol: str):
         with self._trade_lock:

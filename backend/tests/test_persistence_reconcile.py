@@ -27,10 +27,26 @@ class FakeKiteClient:
         self.orders = []
         self.place_calls = []
         self.cancel_calls = []
+        self.flatten_calls = []
         self._next_id = 1
 
     def place_order(self, **kwargs):
         self.place_calls.append(kwargs)
+        oid = f"OID{self._next_id}"
+        self._next_id += 1
+        status = (
+            "COMPLETE" if kwargs.get("order_type") in ["LIMIT", "MARKET"] else "OPEN"
+        )
+        qty = kwargs.get("quantity", 0) if status == "COMPLETE" else 0
+        self.orders.append(
+            {"orderId": oid, "order_id": oid, "status": status, "filledQuantity": qty}
+        )
+        return oid
+
+    def emergency_flatten_position(self, **kwargs):
+        self.place_calls.append(kwargs)
+        if "tradingsymbol" in kwargs:
+            self.flatten_calls.append(kwargs["tradingsymbol"])
         oid = f"OID{self._next_id}"
         self._next_id += 1
         return oid
@@ -374,14 +390,13 @@ def test_reconcile_isolates_a_malformed_record(monkeypatch):
         orders=[{"orderId": "GOODSTOP", "status": "TRIGGER PENDING"}],
     )
     engine.reconcile_active_trades()
-
     assert "GOOD" in engine.active_trades
     assert "BAD" not in engine.active_trades
 
 
-def test_reconcile_keeps_trade_when_stop_replace_fails(monkeypatch):
-    # If re-placing the protective stop fails, the position is still tracked
-    # (with no broker stop) so the app-side monitor keeps watching it.
+def test_reconcile_flattens_trade_when_stop_replace_fails(monkeypatch):
+    # If re-placing the protective stop fails, it triggers emergency flatten
+    # and removes the trade from active_trades.
     engine, fake_client, _ = _setup_reconcile(
         monkeypatch,
         persisted={"RELIANCE": _trade(stop_order_id=None)},
@@ -392,11 +407,11 @@ def test_reconcile_keeps_trade_when_stop_replace_fails(monkeypatch):
     def boom(**kwargs):
         raise RuntimeError("order rejected")
 
-    fake_client.place_order = boom  # _place_protective_stop swallows -> ""
+    fake_client.place_order = boom
     engine.reconcile_active_trades()
 
-    assert "RELIANCE" in engine.active_trades
-    assert engine.active_trades["RELIANCE"]["stop_order_id"] is None
+    assert "RELIANCE" not in engine.active_trades
+    assert fake_client.flatten_calls == ["RELIANCE"]
 
 
 # ---------------------------------------------------------------------------

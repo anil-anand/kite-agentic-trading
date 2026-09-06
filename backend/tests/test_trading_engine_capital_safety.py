@@ -18,7 +18,45 @@ class FakeKiteClient:
         self.place_calls.append(kwargs)
         order_id = f"OID{self._next_id}"
         self._next_id += 1
+        status = (
+            "COMPLETE" if kwargs.get("order_type") in ["LIMIT", "MARKET"] else "OPEN"
+        )
+        qty = kwargs.get("quantity", 0) if status == "COMPLETE" else 0
+        self.orders.append(
+            {
+                "orderId": order_id,
+                "order_id": order_id,
+                "status": status,
+                "filledQuantity": qty,
+            }
+        )
+
+        if status == "COMPLETE":
+            sym = kwargs.get("tradingsymbol")
+            delta_qty = qty if kwargs.get("transaction_type") == "BUY" else -qty
+            net_pos = self.positions.get("net", [])
+            found = False
+            for p in net_pos:
+                if p.get("tradingsymbol") == sym:
+                    p["quantity"] = p.get("quantity", 0) + delta_qty
+                    found = True
+                    break
+            if not found:
+                net_pos.append(
+                    {
+                        "tradingsymbol": sym,
+                        "quantity": delta_qty,
+                        "exchange": kwargs.get("exchange", "NSE"),
+                        "product": kwargs.get("product", "MIS"),
+                        "lastPrice": kwargs.get("price", 0),
+                    }
+                )
+            self.positions["net"] = net_pos
+
         return order_id
+
+    def emergency_flatten_position(self, **kwargs):
+        return self.place_order(**kwargs)
 
     def cancel_order(self, variety, order_id, parent_order_id=None):
         self.cancel_calls.append(
