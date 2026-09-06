@@ -109,3 +109,59 @@ def test_scanner_aggregation_breakout(mock_scanner_config, monkeypatch):
     assert any(
         sig["strategy"] in ("family_breakout", "family_trend") for sig in signals
     )
+
+
+def test_scanner_incomplete_candle_skipping(mock_scanner_config, monkeypatch):
+    import pandas as pd
+
+    from backend.tests.conftest import build_candles
+
+    now = pd.Timestamp.now(tz="Asia/Kolkata")
+
+    # Create 55 candles ending at `now` (the last one is incomplete)
+    dates = pd.date_range(end=now, periods=55, freq="5min")
+    df = build_candles(np.linspace(100, 140, 55), dates=dates)
+
+    # Force _fetch_candles to return this df
+    monkeypatch.setattr(scanner, "_fetch_candles", lambda t, s: (df, False))
+
+    called_df_length = []
+
+    def mock_calc_signals(self, df_in, symbol):
+        called_df_length.append(len(df_in))
+        return [
+            {
+                "strategy": "EMA Crossover",
+                "direction": "BUY",
+                "signal_score": 85,
+                "entryPrice": 120.0,
+                "stopLoss": 110.0,
+                "target": 140.0,
+                "reasoning": "mock",
+                "timestamp": "2026-09-06",
+                "indicators": {},
+            }
+        ]
+
+    monkeypatch.setattr(
+        scanner.strategies["ema_crossover"],
+        "calculate_signals",
+        mock_calc_signals.__get__(scanner.strategies["ema_crossover"]),
+    )
+
+    # First call
+    signals = scanner.scan_watchlist(["TEST"])
+
+    # Should slice out the incomplete candle (so length is 54)
+    assert len(called_df_length) > 0
+    assert called_df_length[0] == 54
+    assert len(signals) > 0
+
+    called_df_length.clear()
+
+    # Second call right away
+    signals2 = scanner.scan_watchlist(["TEST"])
+
+    # Should be empty because the completed candle timestamp hasn't changed
+    assert len(signals2) == 0
+    assert len(called_df_length) == 0

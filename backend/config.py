@@ -37,6 +37,7 @@ class ConfigManager:
                 "haltAutoTradesOnStopFailure": True,
             },
             "strategies": {
+                "evaluateOnIncompleteCandle": False,
                 "ema_crossover": {"enabled": True},
                 "rsi_reversal": {"enabled": True},
                 "vwap_bounce": {"enabled": True},
