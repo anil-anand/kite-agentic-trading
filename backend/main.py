@@ -8,6 +8,7 @@ from .execution_gateway import execution_gateway
 from .journal import journal
 from .kite_client import kite_client
 from .llm_client import OPENCODE_PLANS, OpenAICompatibleClient
+from .risk_manager import risk_manager
 from .scanner import scanner
 from .ticker import ticker_manager
 from .trading_engine import trading_engine
@@ -228,6 +229,8 @@ def handle_request(req):
                 "winRate": round(win_rate, 2),
                 "availableMargin": available_margin,
                 "usedMargin": used_margin,
+                "killSwitchActive": risk_manager.kill_switch_active,
+                "reconciliationStatus": risk_manager.reconciliation_status,
             }
             return success(summary)
 

@@ -50,6 +50,9 @@ class FakeRisk:
     def update_pnl(self, pnl):
         pass
 
+    def update_from_positions(self, positions):
+        pass
+
     def set_open_positions(self, n):
         pass
 

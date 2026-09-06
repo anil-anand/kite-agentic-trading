@@ -78,6 +78,10 @@ class KiteClient:
 
         return convert_keys(all_orders)
 
+    def get_trades(self) -> List[Dict[str, Any]]:
+        res = self.kite.trades() if self.kite else []
+        return convert_keys(res)
+
     def place_order(
         self,
         variety,

@@ -60,6 +60,9 @@ class FakeRiskManager:
     def update_pnl(self, pnl):
         pass
 
+    def update_from_positions(self, positions):
+        pass
+
 
 def _trade(**over):
     base = {

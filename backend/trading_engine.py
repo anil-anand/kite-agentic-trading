@@ -209,12 +209,22 @@ class TradingEngine:
             return
 
         self.mode = mode
+        # Reconcile risk manager state from broker
+        try:
+            risk_manager.reconcile_state()
+        except Exception as e:
+            self._push_log(
+                f"Risk manager reconcile on start failed: {e}", level="error"
+            )
+
         # Resume managing any positions that were open when we last ran, before
         # the monitor loop starts. Failures here must not block startup.
         try:
             self.reconcile_active_trades()
         except Exception as e:
-            self._push_log(f"Reconcile on start failed: {e}", level="error")
+            self._push_log(
+                f"Reconcile active trades on start failed: {e}", level="error"
+            )
 
         self.running = True
         self.thread = threading.Thread(target=self._run_loop)
@@ -547,18 +557,20 @@ class TradingEngine:
 
     def monitor_positions(self):
         try:
-            positions = kite_client.get_positions().get("net", [])
-            total_pnl = sum(
-                p.get("realised", 0.0) + p.get("unrealised", 0.0) for p in positions
-            )
-            pnl_delta = total_pnl - risk_manager.daily_pnl
-            if pnl_delta != 0:
-                risk_manager.update_pnl(pnl_delta)
-            open_count = sum(1 for p in positions if p["quantity"] != 0)
+            positions_data = kite_client.get_positions()
+            positions_net = positions_data.get("net", [])
+            positions_day = positions_data.get("day", [])
+
+            # Fast in-memory update using day positions (only today's trades)
+            risk_manager.update_from_positions(positions_day)
+
+            open_count = sum(1 for p in positions_net if p["quantity"] != 0)
             risk_manager.set_open_positions(open_count)
 
             # Get symbols of currently open positions to track manual closures
-            open_symbols = {p["tradingsymbol"] for p in positions if p["quantity"] != 0}
+            open_symbols = {
+                p["tradingsymbol"] for p in positions_net if p["quantity"] != 0
+            }
 
             # 1. Sync pending exits FIRST. If an exit order was filled, the position
             # drops from 'open_symbols'. We must process the pending exit before
@@ -607,7 +619,7 @@ class TradingEngine:
 
             # Evaluate each open position. Trade state is re-read under a short
             # lock immediately before each decision.
-            for p in positions:
+            for p in positions_net:
                 if p["quantity"] == 0:
                     continue
                 symbol = p["tradingsymbol"]
