@@ -258,24 +258,20 @@ class Scanner:
                 signals = strategy.calculate_signals(df, tradingsymbol)
                 for sig in signals:
                     family = self.family_mapping.get(strat_id, "unknown")
-                    if sig.get("direction") == "BUY":
-                        buy_signals += 1
+                    direction = sig.get("direction")
+                    if direction in ("BUY", "SELL"):
+                        if direction == "BUY":
+                            buy_signals += 1
+                        else:
+                            sell_signals += 1
                         triggered_strategies.append(
                             {
                                 "strategy": strat_id,
                                 "family": family,
-                                "direction": "BUY",
+                                "direction": direction,
                                 "signal_score": sig.get("signal_score", 0),
-                            }
-                        )
-                    elif sig.get("direction") == "SELL":
-                        sell_signals += 1
-                        triggered_strategies.append(
-                            {
-                                "strategy": strat_id,
-                                "family": family,
-                                "direction": "SELL",
-                                "signal_score": sig.get("signal_score", 0),
+                                "timestamp": sig.get("timestamp"),
+                                "indicator_snapshot": sig.get("indicators", {}),
                             }
                         )
             except Exception:

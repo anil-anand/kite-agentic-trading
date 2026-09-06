@@ -47,7 +47,7 @@ def temp_db(tmp_path):
     conn.execute(
         """
         INSERT INTO trades (id, tradingsymbol, strategy, direction, confidence, entry_price, stop_loss, quantity, exit_price, pnl, entry_time, exit_time, exit_reason, status, confluence_snapshot)
-        VALUES ('1', 'TCS', 'MACD', 'BUY', 85, 100, 95, 10, 110, 100, ?, ?, 'target_hit', 'CLOSED', '{"MACD": {}}')
+        VALUES ('1', 'TCS', 'MACD', 'BUY', 85, 100, 95, 10, 110, 100, ?, ?, 'target_hit', 'CLOSED', '{"strategies": [{"strategy": "MACD", "direction": "BUY"}]}')
     """,
         (t1_entry.isoformat(), t1_exit.isoformat()),
     )
@@ -55,7 +55,15 @@ def temp_db(tmp_path):
     conn.execute(
         """
         INSERT INTO trades (id, tradingsymbol, strategy, direction, confidence, entry_price, stop_loss, quantity, exit_price, pnl, entry_time, exit_time, exit_reason, status, confluence_snapshot)
-        VALUES ('2', 'INFY', 'MACD', 'SELL', 75, 100, 105, 10, 110, -100, ?, ?, 'stop_hit', 'CLOSED', '{"MACD": {}, "RSI": {}}')
+        VALUES ('2', 'INFY', 'MACD', 'SELL', 75, 100, 105, 10, 110, -100, ?, ?, 'stop_hit', 'CLOSED', '{"strategies": [{"strategy": "MACD", "direction": "SELL"}, {"strategy": "RSI", "direction": "SELL"}]}')
+    """,
+        (t1_entry.isoformat(), t1_exit.isoformat()),
+    )
+
+    conn.execute(
+        """
+        INSERT INTO trades (id, tradingsymbol, strategy, direction, confidence, entry_price, stop_loss, quantity, exit_price, pnl, entry_time, exit_time, exit_reason, status, confluence_snapshot)
+        VALUES ('3', 'WIPRO', 'RSI', 'BUY', 75, 100, 95, 10, 110, 100, ?, ?, 'target_hit', 'CLOSED', '{"regime": "BULL", "buy_signals": 1}')
     """,
         (t1_entry.isoformat(), t1_exit.isoformat()),
     )
@@ -69,8 +77,8 @@ def temp_db(tmp_path):
 def test_strategy_expectancy(temp_db):
     analytics = TradeAnalytics(db_path=temp_db)
     res = analytics.get_strategy_expectancy()
-    assert len(res) == 1
-    macd = res[0]
+    assert len(res) == 2
+    macd = next(r for r in res if r["strategy"] == "MACD")
     assert macd["strategy"] == "MACD"
     assert macd["total_trades"] == 2
     assert macd["win_rate_pct"] == 50.0
@@ -80,8 +88,8 @@ def test_strategy_expectancy(temp_db):
 def test_confluence_validation(temp_db):
     analytics = TradeAnalytics(db_path=temp_db)
     res = analytics.get_confluence_validation()
-    assert len(res) == 2
-    # one trade has 1 strategy, another has 2
+    assert len(res) == 3
+    # one trade has 1 strategy, another has 2, another is invalid
     res_1 = next(r for r in res if r["confluence_count"] == 1)
     assert res_1["total_trades"] == 1
     assert res_1["total_pnl"] == 100
@@ -90,16 +98,20 @@ def test_confluence_validation(temp_db):
     assert res_2["total_trades"] == 1
     assert res_2["total_pnl"] == -100
 
+    res_inv = next(r for r in res if r["confluence_count"] == "invalid")
+    assert res_inv["total_trades"] == 1
+    assert res_inv["total_pnl"] == 100
+
 
 def test_signal_score_calibration(temp_db):
     analytics = TradeAnalytics(db_path=temp_db)
     res = analytics.get_signal_score_calibration()
     assert len(res) == 2
-    # 70-79 bucket (75 conf) -> 1 trade, 0 wins
+    # 70-79 bucket (75 conf) -> 2 trades, 1 win, 1 loss
     # 80-89 bucket (85 conf) -> 1 trade, 1 wins
     b70 = next(r for r in res if r["signal_score_bucket"] == "70-79")
-    assert b70["total_trades"] == 1
-    assert b70["actual_win_rate_pct"] == 0.0
+    assert b70["total_trades"] == 2
+    assert b70["actual_win_rate_pct"] == 50.0
 
     b80 = next(r for r in res if r["signal_score_bucket"] == "80-89")
     assert b80["total_trades"] == 1
@@ -112,7 +124,9 @@ def test_exit_reason_effectiveness(temp_db):
     assert len(res) == 2
     # target_hit, stop_hit
     target = next(r for r in res if r["exit_reason"] == "target_hit")
-    assert target["total_pnl"] == 100
+    assert target["total_trades"] == 2
+    assert target["total_pnl"] == 200.0
+
     stop = next(r for r in res if r["exit_reason"] == "stop_hit")
     assert stop["total_pnl"] == -100
 
