@@ -1,7 +1,8 @@
 import pandas as pd
 from ta.trend import ADXIndicator, EMAIndicator
 from ta.volatility import AverageTrueRange
-from ta.volume import VolumeWeightedAveragePrice
+
+from backend.indicators import SessionVWAP
 
 
 class RegimeClassifier:
@@ -36,14 +37,8 @@ class RegimeClassifier:
         )
         df["atr"] = atr_ind.average_true_range()
 
-        vwap_ind = VolumeWeightedAveragePrice(
-            high=df["high"],
-            low=df["low"],
-            close=df["close"],
-            volume=df["volume"],
-            window=14,
-        )
-        df["vwap"] = vwap_ind.volume_weighted_average_price()
+        vwap_ind = SessionVWAP(df)
+        df["vwap"] = vwap_ind.vwap()
 
         last = df.iloc[-1]
         prev = df.iloc[-2]

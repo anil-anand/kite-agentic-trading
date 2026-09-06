@@ -21,7 +21,9 @@ _TMP_HOME = tempfile.mkdtemp(prefix="kite-test-home-")
 os.environ["HOME"] = _TMP_HOME
 
 
-def build_candles(closes, *, opens=None, highs=None, lows=None, volumes=None):
+def build_candles(
+    closes, *, opens=None, highs=None, lows=None, volumes=None, dates=None
+):
     """Build an OHLCV DataFrame from a close-price series.
 
     Missing columns are derived sensibly: open defaults to the previous close,
@@ -54,8 +56,16 @@ def build_candles(closes, *, opens=None, highs=None, lows=None, volumes=None):
     else:
         volumes = np.asarray(volumes, dtype=float)
 
+    if dates is None:
+        dates = pd.date_range(
+            "2026-09-01 09:15:00", periods=n, freq="5min", tz="Asia/Kolkata"
+        )
+    else:
+        dates = pd.to_datetime(dates)
+
     return pd.DataFrame(
         {
+            "date": dates,
             "open": opens,
             "high": highs,
             "low": lows,
