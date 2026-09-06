@@ -34,9 +34,13 @@ class FakeKiteClient:
         self.place_calls.append(kwargs)
         oid = f"OID{self._next_id}"
         self._next_id += 1
-        status = "COMPLETE" if kwargs.get("order_type") in ["LIMIT", "MARKET"] else "OPEN"
+        status = (
+            "COMPLETE" if kwargs.get("order_type") in ["LIMIT", "MARKET"] else "OPEN"
+        )
         qty = kwargs.get("quantity", 0) if status == "COMPLETE" else 0
-        self.orders.append({"orderId": oid, "order_id": oid, "status": status, "filledQuantity": qty})
+        self.orders.append(
+            {"orderId": oid, "order_id": oid, "status": status, "filledQuantity": qty}
+        )
         return oid
 
     def emergency_flatten_position(self, **kwargs):
