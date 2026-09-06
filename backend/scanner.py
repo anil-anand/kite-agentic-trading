@@ -1,11 +1,13 @@
 import datetime
 import time
+import uuid
 from typing import Any, Dict, List, Tuple
 
 import pandas as pd
 
 from .config import config_manager
 from .kite_client import kite_client
+from .regime_classifier import regime_classifier
 from .strategies.adx_momentum import ADXMomentumStrategy
 from .strategies.awesome_oscillator import AwesomeOscillatorStrategy
 from .strategies.bollinger_breakout import BollingerBreakoutStrategy
@@ -45,6 +47,25 @@ class Scanner:
             "awesome_oscillator": AwesomeOscillatorStrategy(),
             "tsi_cross": TSICrossStrategy(),
             "stoc_rsi": StochRSIStrategy(),
+        }
+        self.family_mapping = {
+            "ema_crossover": "trend",
+            "macd_cross": "trend",
+            "supertrend": "trend",
+            "psar_trend": "trend",
+            "tsi_cross": "trend",
+            "adx_momentum": "trend",
+            "awesome_oscillator": "trend",
+            "rsi_reversal": "mean_reversion",
+            "stochastic_reversal": "mean_reversion",
+            "stoc_rsi": "mean_reversion",
+            "cci_reversal": "mean_reversion",
+            "williams_r": "mean_reversion",
+            "vwap_bounce": "mean_reversion",
+            "mfi_exhaustion": "mean_reversion",
+            "bollinger_breakout": "breakout",
+            "keltner_breakout": "breakout",
+            "donchian_breakout": "breakout",
         }
         self.candle_cache = {}
         self.last_cache_time = {}
@@ -92,6 +113,7 @@ class Scanner:
 
         all_signals = []
         strategy_config = config_manager.get_strategy_config()
+        family_config = config_manager.get_families_config()
 
         instruments = kite_client.get_instruments("NSE")
         instrument_map = {
@@ -107,21 +129,77 @@ class Scanner:
             if df.empty:
                 return []
 
-            symbol_signals = []
+            # 1. Classify Regime
+            regime_info = regime_classifier.classify(df)
+            regime = regime_info["regime"]
+
+            raw_signals = []
             for strat_id, strategy in self.strategies.items():
                 config = strategy_config.get(strat_id, {})
                 if config.get("enabled", False):
                     signals = strategy.calculate_signals(df, symbol)
-                    symbol_signals.extend(signals)
+                    for s in signals:
+                        s["strategy_id"] = strat_id
+                        s["family"] = self.family_mapping.get(strat_id)
+                    raw_signals.extend(signals)
 
-            # Protect Kite API limits (max 3 historical requests per second total)
-            # Only sleep if we actually hit the API. If we used cache, run instantly!
+            # 2. Gating and Aggregation
+            allowed_families = []
+            if regime == "TRENDING":
+                allowed_families = ["trend"]
+            elif regime == "RANGING":
+                allowed_families = ["mean_reversion"]
+            elif regime == "BREAKOUT":
+                allowed_families = ["breakout", "trend"]
+
+            symbol_aggregated_signals = []
+
+            for family in allowed_families:
+                if not family_config.get(family, {}).get("enabled", True):
+                    continue
+
+                f_signals = [s for s in raw_signals if s["family"] == family]
+                buys = [s for s in f_signals if s["direction"] == "BUY"]
+                sells = [s for s in f_signals if s["direction"] == "SELL"]
+
+                for direction, dir_signals in [("BUY", buys), ("SELL", sells)]:
+                    if not dir_signals:
+                        continue
+
+                    # Base signal for entry, sl, target (use highest confidence)
+                    base_sig = max(dir_signals, key=lambda s: s["confidence"])
+
+                    avg_conf = sum(s["confidence"] for s in dir_signals) / len(
+                        dir_signals
+                    )
+                    bonus = 5 * (len(dir_signals) - 1)
+                    weight = family_config.get(family, {}).get("weight", 1.0)
+                    family_confidence = min(100, int((avg_conf + bonus) * weight))
+
+                    agg_sig = {
+                        "id": str(uuid.uuid4()),
+                        "tradingsymbol": symbol,
+                        "exchange": base_sig.get("exchange", "NSE"),
+                        "strategy": f"family_{family}",
+                        "direction": direction,
+                        "confidence": family_confidence,
+                        "entryPrice": base_sig["entryPrice"],
+                        "stopLoss": base_sig["stopLoss"],
+                        "target": base_sig["target"],
+                        "riskReward": base_sig.get("riskReward", 0),
+                        "reasoning": f"{regime} regime active. {len(dir_signals)} {family} indicators aligned. Base: {base_sig['reasoning']}",
+                        "timestamp": base_sig.get("timestamp"),
+                        "indicators": regime_info["features"],
+                        "raw_signals": dir_signals,
+                        "regime": regime,
+                    }
+                    symbol_aggregated_signals.append(agg_sig)
+
             if not was_cached:
                 time.sleep(1.1)
 
-            return symbol_signals
+            return symbol_aggregated_signals
 
-        # Run with max_workers=3 to safely fetch data in parallel without hitting 429 Too Many Requests
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
             futures = [executor.submit(process_symbol, symbol) for symbol in symbols]
             for future in concurrent.futures.as_completed(futures):
@@ -137,7 +215,6 @@ class Scanner:
 
                     print(f"Error in parallel processing: {e}", file=sys.stderr)
 
-        # Sort by confidence descending
         all_signals.sort(key=lambda x: x.get("confidence", 0), reverse=True)
         return all_signals
 
@@ -145,14 +222,21 @@ class Scanner:
         self, tradingsymbol: str, instrument_token: int
     ) -> Dict[str, Any]:
         """
-        Re-evaluate a single symbol against all enabled strategies.
+        Re-evaluate a single symbol against all enabled strategies and regime.
         Returns a directional summary for thesis invalidation checks.
         """
         strategy_config = config_manager.get_strategy_config()
 
         df, _ = self._fetch_candles(instrument_token, tradingsymbol)
         if df.empty:
-            return {"buy_signals": 0, "sell_signals": 0, "strategies": []}
+            return {
+                "regime": "UNCERTAIN",
+                "buy_signals": 0,
+                "sell_signals": 0,
+                "strategies": [],
+            }
+
+        regime_info = regime_classifier.classify(df)
 
         buy_signals = 0
         sell_signals = 0
@@ -166,11 +250,13 @@ class Scanner:
             try:
                 signals = strategy.calculate_signals(df, tradingsymbol)
                 for sig in signals:
+                    family = self.family_mapping.get(strat_id, "unknown")
                     if sig.get("direction") == "BUY":
                         buy_signals += 1
                         triggered_strategies.append(
                             {
                                 "strategy": strat_id,
+                                "family": family,
                                 "direction": "BUY",
                                 "confidence": sig.get("confidence", 0),
                             }
@@ -180,6 +266,7 @@ class Scanner:
                         triggered_strategies.append(
                             {
                                 "strategy": strat_id,
+                                "family": family,
                                 "direction": "SELL",
                                 "confidence": sig.get("confidence", 0),
                             }
@@ -188,6 +275,8 @@ class Scanner:
                 pass  # Skip individual strategy failures silently
 
         return {
+            "regime": regime_info["regime"],
+            "regime_features": regime_info["features"],
             "buy_signals": buy_signals,
             "sell_signals": sell_signals,
             "strategies": triggered_strategies,

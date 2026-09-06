@@ -55,6 +55,11 @@ class ConfigManager:
                 "tsi_cross": {"enabled": True},
                 "stoc_rsi": {"enabled": True},
             },
+            "families": {
+                "trend": {"weight": 1.0, "enabled": True},
+                "mean_reversion": {"weight": 1.0, "enabled": True},
+                "breakout": {"weight": 1.0, "enabled": True},
+            },
             "watchlist": [
                 "RELIANCE",
                 "TCS",
@@ -244,6 +249,9 @@ class ConfigManager:
 
     def get_strategy_config(self):
         return self.config.get("strategies", self.default_config["strategies"])
+
+    def get_families_config(self):
+        return self.config.get("families", self.default_config.get("families", {}))
 
     def get_watchlist(self):
         return self.config.get("watchlist", self.default_config["watchlist"])
