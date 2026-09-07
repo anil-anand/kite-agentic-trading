@@ -12,7 +12,7 @@ class SimulatedBroker:
         self.initial_capital = initial_capital
         self.cash = initial_capital
         self.positions: Dict[str, Dict[str, Any]] = {}  # symbol -> position details
-        self.trades: List[Dict[str, Any]] = []          # completed trades
+        self.trades: List[Dict[str, Any]] = []  # completed trades
 
         # order book for pending limit/stop orders
         self.pending_orders: List[Dict[str, Any]] = []
@@ -31,10 +31,22 @@ class SimulatedBroker:
                 equity += (entry_price - current_price) * qty
         return equity
 
-    def place_market_order(self, symbol: str, direction: str, quantity: int, price: float, timestamp: datetime.datetime, signal_info: Dict[str, Any] = None) -> str:
+    def place_market_order(
+        self,
+        symbol: str,
+        direction: str,
+        quantity: int,
+        price: float,
+        timestamp: datetime.datetime,
+        signal_info: Dict[str, Any] = None,
+    ) -> str:
         # Simulate slippage: 0.05%
         slippage_pct = 0.0005
-        executed_price = price * (1 + slippage_pct) if direction == "BUY" else price * (1 - slippage_pct)
+        executed_price = (
+            price * (1 + slippage_pct)
+            if direction == "BUY"
+            else price * (1 - slippage_pct)
+        )
         executed_price = round(executed_price, 2)
 
         # Calculate costs
@@ -82,9 +94,13 @@ class SimulatedBroker:
 
                     del self.positions[symbol]
                 else:
-                    raise NotImplementedError("Partial fills/exits not implemented in mock broker yet.")
+                    raise NotImplementedError(
+                        "Partial fills/exits not implemented in mock broker yet."
+                    )
             else:
-                raise NotImplementedError("Pyramiding not implemented in mock broker yet.")
+                raise NotImplementedError(
+                    "Pyramiding not implemented in mock broker yet."
+                )
         else:
             # Open new position
             self.positions[symbol] = {
@@ -95,8 +111,8 @@ class SimulatedBroker:
                 "signal_info": signal_info or {},
                 "sl": signal_info.get("stopLoss") if signal_info else None,
                 "target": signal_info.get("target") if signal_info else None,
-                "mfe": executed_price, # Maximum Favorable Excursion
-                "mae": executed_price, # Maximum Adverse Excursion
+                "mfe": executed_price,  # Maximum Favorable Excursion
+                "mae": executed_price,  # Maximum Adverse Excursion
             }
 
         return order_id
@@ -140,4 +156,6 @@ class SimulatedBroker:
         if exit_price is not None:
             # Place exit market order
             exit_dir = "SELL" if direction == "BUY" else "BUY"
-            self.place_market_order(symbol, exit_dir, pos["quantity"], exit_price, timestamp)
+            self.place_market_order(
+                symbol, exit_dir, pos["quantity"], exit_price, timestamp
+            )

@@ -12,7 +12,9 @@ class RegressionSuite:
     def __init__(self, data_dir: str):
         self.data_dir = data_dir
 
-    def run_regression_test(self, test_name: str, strategy: BaseStrategy, expected_metrics: Dict[str, Any]) -> bool:
+    def run_regression_test(
+        self, test_name: str, strategy: BaseStrategy, expected_metrics: Dict[str, Any]
+    ) -> bool:
         """
         Runs a regression test using a known dataset and compares metrics.
         Raises AssertionError if metrics deviate significantly.
@@ -27,7 +29,9 @@ class RegressionSuite:
         engine.load_data("TEST_SYM", df)
         engine.run()
 
-        metrics = MetricsEvaluator.evaluate(engine.broker.trades, engine.broker.initial_capital)
+        metrics = MetricsEvaluator.evaluate(
+            engine.broker.trades, engine.broker.initial_capital
+        )
 
         # Compare key metrics
         for key, expected_value in expected_metrics.items():
@@ -37,16 +41,24 @@ class RegressionSuite:
             actual_value = metrics[key]
 
             # Allow minor floating point deviations
-            if isinstance(expected_value, (int, float)) and isinstance(actual_value, (int, float)):
+            if isinstance(expected_value, (int, float)) and isinstance(
+                actual_value, (int, float)
+            ):
                 if abs(expected_value - actual_value) > 0.05:
-                    raise AssertionError(f"Metric {key} mismatch. Expected: {expected_value}, Actual: {actual_value}")
+                    raise AssertionError(
+                        f"Metric {key} mismatch. Expected: {expected_value}, Actual: {actual_value}"
+                    )
             else:
                 if expected_value != actual_value:
-                    raise AssertionError(f"Metric {key} mismatch. Expected: {expected_value}, Actual: {actual_value}")
+                    raise AssertionError(
+                        f"Metric {key} mismatch. Expected: {expected_value}, Actual: {actual_value}"
+                    )
 
         return True
 
-    def generate_regression_baseline(self, test_name: str, strategy: BaseStrategy) -> Dict[str, Any]:
+    def generate_regression_baseline(
+        self, test_name: str, strategy: BaseStrategy
+    ) -> Dict[str, Any]:
         """
         Utility to generate the expected metrics for a new regression test dataset.
         """
@@ -57,7 +69,9 @@ class RegressionSuite:
         engine.load_data("TEST_SYM", df)
         engine.run()
 
-        metrics = MetricsEvaluator.evaluate(engine.broker.trades, engine.broker.initial_capital)
+        metrics = MetricsEvaluator.evaluate(
+            engine.broker.trades, engine.broker.initial_capital
+        )
 
         # We might only care about high-level metrics for regression
         important_keys = ["trade_count", "win_rate", "net_profit", "max_drawdown"]

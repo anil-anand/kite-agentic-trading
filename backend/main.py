@@ -278,18 +278,22 @@ def handle_request(req):
                 return error(-32602, f"Strategy {strategy_id} not found")
 
             import datetime
+
             import pandas as pd
+
             from .backtesting.backtest_engine import BacktestEngine
             from .backtesting.metrics_evaluator import MetricsEvaluator
 
             # Fetch data (mocking the date range based on days parameter)
             now = datetime.datetime.now()
             from_date = now - datetime.timedelta(days=days)
-            
+
             instruments = kite_client.get_instruments("NSE")
-            instrument_map = {i["tradingsymbol"]: i["instrument_token"] for i in instruments}
+            instrument_map = {
+                i["tradingsymbol"]: i["instrument_token"] for i in instruments
+            }
             token = instrument_map.get(symbol)
-            
+
             if not token:
                 return error(-32602, f"Symbol {symbol} not found in instruments")
 
@@ -297,7 +301,7 @@ def handle_request(req):
                 instrument_token=token,
                 from_date=from_date,
                 to_date=now,
-                interval="5minute"
+                interval="5minute",
             )
 
             if not records:
@@ -313,10 +317,7 @@ def handle_request(req):
             engine.run()
 
             metrics = MetricsEvaluator.evaluate(engine.broker.trades, initial_capital)
-            return success({
-                "metrics": metrics,
-                "trades": engine.broker.trades
-            })
+            return success({"metrics": metrics, "trades": engine.broker.trades})
 
         else:
             return error(-32601, f"Method '{method}' not found")
