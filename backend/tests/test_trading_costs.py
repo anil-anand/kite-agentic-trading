@@ -1,5 +1,5 @@
-import pytest
 from backend.trading_costs import cost_calculator
+
 
 def test_calculate_leg_charges_buy():
     # Buy 100 shares at 1000 = 1,00,000 turnover
@@ -19,6 +19,7 @@ def test_calculate_leg_charges_buy():
     # Total
     assert charges["total"] == round(20.0 + 0.0 + 3.22 + 0.1 + 4.2 + 3.0, 2)
 
+
 def test_calculate_leg_charges_sell():
     # Sell 100 shares at 1010 = 1,01,000 turnover
     charges = cost_calculator.calculate_leg_charges(1010.0, 100, "SELL")
@@ -37,6 +38,7 @@ def test_calculate_leg_charges_sell():
     # Total
     assert charges["total"] == round(20.0 + 25.0 + 3.25 + 0.1 + 4.2 + 0.0, 2)
 
+
 def test_calculate_trade_charges():
     # Buy 100 shares at 1000, sell at 1010.
     # Gross P&L = 1000
@@ -45,13 +47,13 @@ def test_calculate_trade_charges():
         entry_price=1000.0,
         exit_price=1010.0,
         quantity=100,
-        signal_entry_price=999.0,   # Intended to buy at 999, actually bought at 1000 (slippage -100)
-        signal_exit_price=1012.0    # Intended to sell at 1012, actually sold at 1010 (slippage -200)
+        signal_entry_price=999.0,  # Intended to buy at 999, actually bought at 1000 (slippage -100)
+        signal_exit_price=1012.0,  # Intended to sell at 1012, actually sold at 1010 (slippage -200)
     )
-    
+
     assert res["gross_pnl"] == 1000.0
     assert res["slippage"] == -300.0
-    
+
     # Check if total fees is approximately correct
     # Buy charges ~ 30.52
     # Sell charges ~ 52.55
@@ -62,14 +64,12 @@ def test_calculate_trade_charges():
     assert res["exchange_charges"] == round(3.22 + 3.25 + 0.1 + 0.1, 2)
     assert res["net_pnl"] == round(1000.0 - res["total_fees"], 2)
 
+
 def test_calculate_trade_charges_sell_first():
     # Short 100 shares at 1010, cover at 1000
     # Gross P&L = 1000
     res = cost_calculator.calculate_trade_charges(
-        direction="SELL",
-        entry_price=1010.0,
-        exit_price=1000.0,
-        quantity=100
+        direction="SELL", entry_price=1010.0, exit_price=1000.0, quantity=100
     )
     assert res["gross_pnl"] == 1000.0
     # Brokerage: 40.0

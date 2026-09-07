@@ -17,10 +17,14 @@ class FakeJournal:
         self.closed = []  # (trade_id, exit_price, reason)
         self.updated = []
 
-    def close_trade(self, trade_id, exit_price, reason, exit_time=None, cost_details=None):
+    def close_trade(
+        self, trade_id, exit_price, reason, exit_time=None, cost_details=None
+    ):
         self.closed.append((trade_id, exit_price, reason))
 
-    def update_trade_exit(self, trade_id, exit_price, reason, exit_time=None, cost_details=None):
+    def update_trade_exit(
+        self, trade_id, exit_price, reason, exit_time=None, cost_details=None
+    ):
         self.updated.append((trade_id, exit_price, reason))
 
 

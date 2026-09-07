@@ -42,10 +42,13 @@ class TradeAnalytics:
                 }
 
             strategies[strat]["trades"] += 1
-            
-            pnl = r["net_pnl"] if "net_pnl" in r.keys() and r["net_pnl"] is not None else (r["pnl"] or 0.0)
-            gross_pnl = r["gross_pnl"] if "gross_pnl" in r.keys() and r["gross_pnl"] is not None else pnl
-            
+
+            pnl = (
+                r["net_pnl"]
+                if "net_pnl" in r.keys() and r["net_pnl"] is not None
+                else (r["pnl"] or 0.0)
+            )
+
             if pnl > 0:
                 strategies[strat]["wins"] += 1
                 strategies[strat]["gross_profit"] += pnl
@@ -161,7 +164,11 @@ class TradeAnalytics:
                 confluence_stats[count] = {"trades": 0, "wins": 0, "pnl": 0.0}
 
             confluence_stats[count]["trades"] += 1
-            pnl = r["net_pnl"] if "net_pnl" in r.keys() and r["net_pnl"] is not None else (r["pnl"] or 0.0)
+            pnl = (
+                r["net_pnl"]
+                if "net_pnl" in r.keys() and r["net_pnl"] is not None
+                else (r["pnl"] or 0.0)
+            )
             if pnl > 0:
                 confluence_stats[count]["wins"] += 1
             confluence_stats[count]["pnl"] += pnl
@@ -356,15 +363,17 @@ class TradeAnalytics:
             dt = c["date"]
             if isinstance(dt, str):
                 dt = datetime.fromisoformat(dt.replace("+05:30", ""))
-            
-            formatted_candles.append({
-                "time": int(dt.timestamp()),
-                "open": c["open"],
-                "high": c["high"],
-                "low": c["low"],
-                "close": c["close"],
-                "volume": c.get("volume", 0)
-            })
+
+            formatted_candles.append(
+                {
+                    "time": int(dt.timestamp()),
+                    "open": c["open"],
+                    "high": c["high"],
+                    "low": c["low"],
+                    "close": c["close"],
+                    "volume": c.get("volume", 0),
+                }
+            )
 
         return {"trade": dict(trade), "candles": formatted_candles}
 
@@ -416,11 +425,11 @@ class TradeAnalytics:
         for c in post_entry_candles:
             if direction == "BUY" and c["high"] >= target:
                 target_hit = True
-                target_hit_time = str(c["date"])
+                target_hit_time = str(datetime.fromtimestamp(c["time"]))
                 break
             elif direction == "SELL" and c["low"] <= target:
                 target_hit = True
-                target_hit_time = str(c["date"])
+                target_hit_time = str(datetime.fromtimestamp(c["time"]))
                 break
 
         # 3. Wider Stop (1.5x)

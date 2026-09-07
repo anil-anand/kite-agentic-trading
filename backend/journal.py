@@ -106,9 +106,14 @@ class TradeJournal:
                 pass
 
             new_columns = [
-                "gross_pnl REAL", "net_pnl REAL", "brokerage REAL", 
-                "taxes REAL", "exchange_charges REAL", "other_fees REAL", 
-                "slippage REAL", "signal_entry_price REAL"
+                "gross_pnl REAL",
+                "net_pnl REAL",
+                "brokerage REAL",
+                "taxes REAL",
+                "exchange_charges REAL",
+                "other_fees REAL",
+                "slippage REAL",
+                "signal_entry_price REAL",
             ]
             for col in new_columns:
                 try:
@@ -241,7 +246,7 @@ class TradeJournal:
         exchange_charges = 0.0
         other_fees = 0.0
         slippage = 0.0
-        
+
         if row:
             direction, entry_price, quantity = row
             if cost_details:
@@ -259,7 +264,7 @@ class TradeJournal:
                     direction=direction,
                     entry_price=entry_price,
                     exit_price=exit_price,
-                    quantity=quantity
+                    quantity=quantity,
                 )
                 gross_pnl = charges["gross_pnl"]
                 net_pnl = charges["net_pnl"]
@@ -278,11 +283,23 @@ class TradeJournal:
             WHERE id = ?
         """
         with conn:
-            conn.execute(query, (
-                exit_price, now, exit_reason, pnl,
-                gross_pnl, net_pnl, brokerage, taxes, exchange_charges, other_fees, slippage,
-                trade_id
-            ))
+            conn.execute(
+                query,
+                (
+                    exit_price,
+                    now,
+                    exit_reason,
+                    pnl,
+                    gross_pnl,
+                    net_pnl,
+                    brokerage,
+                    taxes,
+                    exchange_charges,
+                    other_fees,
+                    slippage,
+                    trade_id,
+                ),
+            )
             self._log_event_inner(
                 conn,
                 trade_id,
@@ -292,7 +309,12 @@ class TradeJournal:
             )
 
     def update_trade_exit(
-        self, trade_id: str, exit_price: float, exit_reason: str, exit_time: str, cost_details: Optional[Dict[str, Any]] = None
+        self,
+        trade_id: str,
+        exit_price: float,
+        exit_reason: str,
+        exit_time: str,
+        cost_details: Optional[Dict[str, Any]] = None,
     ):
         """Update an already closed or unreconciled trade with actual execution details."""
         conn = self._get_conn()
@@ -311,7 +333,7 @@ class TradeJournal:
         exchange_charges = 0.0
         other_fees = 0.0
         slippage = 0.0
-        
+
         if row:
             direction, entry_price, quantity = row
             if cost_details:
@@ -339,11 +361,23 @@ class TradeJournal:
             WHERE id = ?
         """
         with conn:
-            conn.execute(query, (
-                exit_price, exit_time, exit_reason, pnl,
-                gross_pnl, net_pnl, brokerage, taxes, exchange_charges, other_fees, slippage,
-                trade_id
-            ))
+            conn.execute(
+                query,
+                (
+                    exit_price,
+                    exit_time,
+                    exit_reason,
+                    pnl,
+                    gross_pnl,
+                    net_pnl,
+                    brokerage,
+                    taxes,
+                    exchange_charges,
+                    other_fees,
+                    slippage,
+                    trade_id,
+                ),
+            )
             self._log_event_inner(
                 conn,
                 trade_id,

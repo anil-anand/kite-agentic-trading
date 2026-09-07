@@ -79,13 +79,13 @@ class RiskManager:
         unrealized = sum(p.get("unrealised", 0.0) for p in positions)
 
         from .trading_costs import cost_calculator
-        
+
         estimated_charges = 0.0
         for t in trades:
             estimated_charges += cost_calculator.calculate_leg_charges(
-                float(t.get("averagePrice", 0)), 
-                int(t.get("quantity", 0)), 
-                t.get("transactionType", "BUY")
+                float(t.get("averagePrice", 0)),
+                int(t.get("quantity", 0)),
+                t.get("transactionType", "BUY"),
             )["total"]
         net_realized = realized_gross - estimated_charges
         total_intraday = net_realized + unrealized
