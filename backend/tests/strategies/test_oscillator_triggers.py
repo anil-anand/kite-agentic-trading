@@ -114,7 +114,8 @@ class TestVWAPBounce:
         # Strong uptrend (fast EMA > slow EMA, RSI > 40) with a final green bar
         # that pulls back to close just above VWAP within the 0.2% band.
         base = list(np.linspace(100, 112, 34))
-        closes = base + [106.12]
+        closes = base + [106.12, 107.0]
         opens = list(closes)
-        opens[-1] = 106.12 * 0.999  # green candle
+        opens[-2] = 106.12 * 0.999  # touches VWAP
+        opens[-1] = 106.5  # reclaims VWAP
         _one("vwap_bounce", build_candles(closes, opens=opens), "BUY")
