@@ -1,7 +1,10 @@
 import datetime
 from typing import Any, Dict, Tuple
 
+import pandas as pd
+
 from .config import config_manager
+from .nifty_universe import get_sector
 
 
 def get_ist_now():
@@ -19,6 +22,9 @@ class RiskManager:
         self.kill_switch_active = False
         self.reconciliation_status = "RECONCILIATION_PENDING"
         self.date_str = get_ist_now().strftime("%Y-%m-%d")
+
+        self._correlation_cache = {}
+        self._last_corr_date = None
 
         self._load_state()
 
@@ -245,6 +251,163 @@ class RiskManager:
             "kill_switch_active": self.kill_switch_active,
             "reconciliation_status": self.reconciliation_status,
         }
+
+    def _get_correlation(self, symbol_a: str, symbol_b: str) -> float:
+        today = get_ist_now().date()
+        if self._last_corr_date != today:
+            self._correlation_cache.clear()
+            self._last_corr_date = today
+
+        pair_key = tuple(sorted([symbol_a, symbol_b]))
+        if pair_key in self._correlation_cache:
+            return self._correlation_cache[pair_key]
+
+        from .kite_client import kite_client
+
+        config = config_manager.get_risk_config()
+        lookback_days = config.get("correlationLookbackDays", 30)
+
+        try:
+            now = datetime.datetime.now()
+            from_date = now - datetime.timedelta(days=lookback_days + 15)
+
+            token_a = None
+            token_b = None
+            instruments = kite_client.get_instruments("NSE")
+            for i in instruments:
+                if i["tradingsymbol"] == symbol_a:
+                    token_a = i["instrument_token"]
+                if i["tradingsymbol"] == symbol_b:
+                    token_b = i["instrument_token"]
+                if token_a and token_b:
+                    break
+
+            if not token_a or not token_b:
+                return 0.0
+
+            hist_a = kite_client.get_historical_data(token_a, from_date, now, "day")
+            hist_b = kite_client.get_historical_data(token_b, from_date, now, "day")
+
+            if not hist_a or not hist_b:
+                return 0.0
+
+            df_a = pd.DataFrame(hist_a)[["date", "close"]].set_index("date")
+            df_b = pd.DataFrame(hist_b)[["date", "close"]].set_index("date")
+
+            df = df_a.join(df_b, lsuffix="_a", rsuffix="_b", how="inner")
+            if len(df) < 5:
+                return 0.0
+
+            returns_a = df["close_a"].pct_change().dropna()
+            returns_b = df["close_b"].pct_change().dropna()
+
+            corr = returns_a.corr(returns_b)
+            if pd.isna(corr):
+                corr = 0.0
+
+            self._correlation_cache[pair_key] = corr
+            return corr
+
+        except Exception as e:
+            from .utils import push_log
+
+            push_log(
+                f"RiskManager: Error computing correlation between {symbol_a} and {symbol_b}: {e}",
+                level="warning",
+            )
+            return 0.0
+
+    def can_accept_position(
+        self,
+        symbol: str,
+        direction: str,
+        qty: int,
+        price: float,
+        active_trades: dict,
+        open_orders: list,
+    ) -> Tuple[bool, str]:
+
+        config = config_manager.get_risk_config()
+        max_gross = config.get("maxGrossExposure", 200000)
+        max_net = config.get("maxNetExposure", 100000)
+        max_single = config.get("maxSingleSymbolExposure", 50000)
+        max_sector = config.get("maxSectorExposure", 75000)
+        max_corr_exposure = config.get("maxCorrelatedExposure", 75000)
+        corr_threshold = config.get("correlationThreshold", 0.70)
+
+        proposed_value = qty * price
+        proposed_signed = proposed_value if direction == "BUY" else -proposed_value
+
+        current_gross = 0.0
+        current_net = 0.0
+        symbol_exposures = {}
+        sector_exposures = {}
+
+        def add_exposure(sym, val, is_buy):
+            nonlocal current_gross, current_net
+            current_gross += val
+            current_net += val if is_buy else -val
+            symbol_exposures[sym] = symbol_exposures.get(sym, 0.0) + val
+
+            sec = get_sector(sym)
+            sector_exposures[sec] = sector_exposures.get(sec, 0.0) + val
+
+        for sym, trade in active_trades.items():
+            val = trade.get("quantity", 0) * trade.get("entry_price", 0.0)
+            if val > 0:
+                is_buy = trade.get("direction", "BUY") == "BUY"
+                add_exposure(sym, val, is_buy)
+
+        for order in open_orders:
+            sym = order.get("tradingsymbol")
+            q = float(order.get("quantity", 0)) - float(order.get("filled_quantity", 0))
+            p = float(order.get("price", 0.0))
+            if q > 0 and p > 0:
+                val = q * p
+                is_buy = order.get("transaction_type", "BUY") == "BUY"
+                add_exposure(sym, val, is_buy)
+
+        if current_gross + proposed_value > max_gross:
+            return (
+                False,
+                f"GROSS_EXPOSURE_LIMIT: {current_gross + proposed_value:.2f} > {max_gross}",
+            )
+
+        if abs(current_net + proposed_signed) > max_net:
+            return (
+                False,
+                f"NET_EXPOSURE_LIMIT: abs({current_net + proposed_signed:.2f}) > {max_net}",
+            )
+
+        if symbol_exposures.get(symbol, 0.0) + proposed_value > max_single:
+            return (
+                False,
+                f"SINGLE_SYMBOL_LIMIT: {symbol} exposure would exceed {max_single}",
+            )
+
+        proposed_sector = get_sector(symbol)
+        if sector_exposures.get(proposed_sector, 0.0) + proposed_value > max_sector:
+            return (
+                False,
+                f"SECTOR_EXPOSURE_LIMIT: Sector {proposed_sector} exposure would exceed {max_sector}",
+            )
+
+        correlated_exposure = proposed_value
+        correlated_symbols = [symbol]
+        for active_sym in symbol_exposures.keys():
+            if active_sym != symbol:
+                corr = self._get_correlation(symbol, active_sym)
+                if corr >= corr_threshold:
+                    correlated_exposure += symbol_exposures[active_sym]
+                    correlated_symbols.append(active_sym)
+
+        if correlated_exposure > max_corr_exposure:
+            return (
+                False,
+                f"CORRELATED_EXPOSURE_LIMIT: Group {correlated_symbols} exposure {correlated_exposure:.2f} > {max_corr_exposure}",
+            )
+
+        return True, "OK"
 
 
 risk_manager = RiskManager()

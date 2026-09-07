@@ -528,6 +528,22 @@ class TradingEngine:
                     )
                     return False
 
+                open_orders = kite_client.get_orders()
+                can_accept, reject_reason = risk_manager.can_accept_position(
+                    symbol=symbol,
+                    direction=signal["direction"],
+                    qty=qty,
+                    price=entry_price,
+                    active_trades=self.active_trades,
+                    open_orders=open_orders,
+                )
+                if not can_accept:
+                    self._push_log(
+                        f"Portfolio risk limit rejected {symbol}: {reject_reason}",
+                        level="warning",
+                    )
+                    return False
+
                 reserved_margin = qty * entry_price
                 self._reserved_entry_margin += reserved_margin
                 order_id = execution_gateway.place_order(
@@ -638,6 +654,10 @@ class TradingEngine:
                         "features": signal.get("indicators"),
                         "raw_signals": signal.get("raw_signals"),
                         "regime": signal.get("regime"),
+                        "portfolio_state": {
+                            "open_positions": risk_manager.open_positions,
+                            "daily_pnl": risk_manager.daily_pnl,
+                        },
                     },
                     universe_version=signal.get("universe_version"),
                     screener_ranking=signal.get("screener_ranking"),
