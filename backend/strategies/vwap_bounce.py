@@ -10,6 +10,10 @@ from .base import BaseStrategy
 
 
 class VWAPBounceStrategy(BaseStrategy):
+    def __init__(self, *args, vwap_tolerance: float = 0.002, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.vwap_tolerance = vwap_tolerance
+
     def get_name(self) -> str:
         return "VWAP Bounce"
 
@@ -36,19 +40,37 @@ class VWAPBounceStrategy(BaseStrategy):
         df["fast_ema"] = fast_ema
         df["slow_ema"] = slow_ema
 
-        last = df.iloc[-1]
+        if len(df) < 2:
+            return signals
 
-        dist_to_vwap = abs(last["close"] - last["vwap"]) / last["vwap"]
+        current = df.iloc[-1]
+        prior = df.iloc[-2]
 
-        if dist_to_vwap <= 0.002:  # Within 0.2% of VWAP
-            # BUY Condition
-            if (
-                last["close"] > last["open"]
-                and last["rsi"] > 40
-                and last["fast_ema"] > last["slow_ema"]
-                and last["close"] >= last["vwap"]
-            ):
-                entry = last["close"]
+        # Long Bounce Logic
+        long_touch = prior["low"] <= prior["vwap"] * (
+            1 + self.vwap_tolerance
+        ) and prior["high"] >= prior["vwap"] * (1 - self.vwap_tolerance)
+        long_rejection = prior["close"] > prior["low"] or current["low"] > prior["low"]
+        long_reclaim = (
+            current["close"] > current["open"] and current["close"] > current["vwap"]
+        )
+        long_confirmation = (
+            current["rsi"] > 40 and current["fast_ema"] > current["slow_ema"]
+        )
+
+        if long_touch and long_reclaim:
+            evidence = {
+                "vwap_touch": bool(long_touch),
+                "rejection": bool(long_rejection),
+                "reclaim": bool(long_reclaim),
+                "confirmation": bool(long_confirmation),
+                "vwap": float(current["vwap"]),
+                "rsi": float(current["rsi"]),
+                "prior_low": float(prior["low"]),
+                "current_close": float(current["close"]),
+            }
+            if long_confirmation:
+                entry = current["close"]
                 sl = self.calculate_stop_loss(entry, "BUY")
                 target = self.calculate_target(entry, sl)
 
@@ -61,22 +83,44 @@ class VWAPBounceStrategy(BaseStrategy):
                         entry,
                         sl,
                         target,
-                        round(abs(target - last["close"]) / abs(last["close"] - sl), 2)
-                        if last["close"] != sl
+                        round(
+                            abs(target - current["close"]) / abs(current["close"] - sl),
+                            2,
+                        )
+                        if current["close"] != sl
                         else 0,
-                        "Bullish bounce off VWAP, RSI > 40, trend aligned",
-                        {"vwap": last["vwap"], "rsi": last["rsi"]},
+                        "Bullish bounce off VWAP",
+                        evidence,
                     )
                 )
 
-            # SELL Condition
-            elif (
-                last["close"] < last["open"]
-                and last["rsi"] < 60
-                and last["fast_ema"] < last["slow_ema"]
-                and last["close"] <= last["vwap"]
-            ):
-                entry = last["close"]
+        # Short Bounce Logic
+        short_touch = prior["high"] >= prior["vwap"] * (
+            1 - self.vwap_tolerance
+        ) and prior["low"] <= prior["vwap"] * (1 + self.vwap_tolerance)
+        short_rejection = (
+            prior["close"] < prior["high"] or current["high"] < prior["high"]
+        )
+        short_reclaim = (
+            current["close"] < current["open"] and current["close"] < current["vwap"]
+        )
+        short_confirmation = (
+            current["rsi"] < 60 and current["fast_ema"] < current["slow_ema"]
+        )
+
+        if short_touch and short_reclaim:
+            evidence = {
+                "vwap_touch": bool(short_touch),
+                "rejection": bool(short_rejection),
+                "reclaim": bool(short_reclaim),
+                "confirmation": bool(short_confirmation),
+                "vwap": float(current["vwap"]),
+                "rsi": float(current["rsi"]),
+                "prior_high": float(prior["high"]),
+                "current_close": float(current["close"]),
+            }
+            if short_confirmation:
+                entry = current["close"]
                 sl = self.calculate_stop_loss(entry, "SELL")
                 target = self.calculate_target(entry, sl)
 
@@ -89,11 +133,14 @@ class VWAPBounceStrategy(BaseStrategy):
                         entry,
                         sl,
                         target,
-                        round(abs(target - last["close"]) / abs(last["close"] - sl), 2)
-                        if last["close"] != sl
+                        round(
+                            abs(target - current["close"]) / abs(current["close"] - sl),
+                            2,
+                        )
+                        if current["close"] != sl
                         else 0,
-                        "Bearish rejection from VWAP, RSI < 60, trend aligned",
-                        {"vwap": last["vwap"], "rsi": last["rsi"]},
+                        "Bearish rejection from VWAP",
+                        evidence,
                     )
                 )
 
