@@ -1,5 +1,3 @@
-import json
-
 from backend.config import ConfigManager
 
 
@@ -22,26 +20,7 @@ def test_default_llm_profile_is_gemini_compatible(tmp_path, monkeypatch):
     }
 
 
-def test_legacy_llm_key_is_migrated_and_not_returned(tmp_path, monkeypatch):
-    manager = make_manager(tmp_path, monkeypatch)
-    manager.config_file.write_text(
-        json.dumps(
-            {
-                "credentials": {"llmApiKey": manager._encrypt("legacy-key")},
-            }
-        )
-    )
-    manager.load()
-
-    assert manager.get_credentials()["llmApiKey"] == "legacy-key"
-    assert manager.get_settings()["llm"]["apiKey"] == ""
-    assert "legacy-key" not in json.dumps(manager.get_settings())
-    assert manager.config["llm"]["apiKey"] != "legacy-key"
-
-
-def test_save_settings_encrypts_llm_key_and_preserves_it_when_masked(
-    tmp_path, monkeypatch
-):
+def test_save_settings_updates_in_memory_llm_key(tmp_path, monkeypatch):
     manager = make_manager(tmp_path, monkeypatch)
     manager.save_settings(
         {
@@ -53,6 +32,13 @@ def test_save_settings_encrypts_llm_key_and_preserves_it_when_masked(
             }
         }
     )
+
+    # Should be stored in memory, not in the disk config
+    assert manager.get_credentials()["llmApiKey"] == "secret-key"
+    assert manager.get_settings()["llm"]["apiKey"] == ""
+    assert manager.config["llm"]["apiKey"] == ""
+
+    # Subsequent saves without the key shouldn't wipe it
     manager.save_settings(
         {
             "llm": {

@@ -130,3 +130,38 @@ def test_discover_models_allows_opencode_without_api_key():
     discover.assert_called_once_with(
         "OpenCode", "https://opencode.ai/zen/v1", "", plan="zen"
     )
+
+
+def test_set_credentials_updates_config_manager():
+    with patch("backend.main.config_manager.set_credentials") as set_creds:
+        result = handle_request(
+            {
+                "id": 7,
+                "method": "set_credentials",
+                "params": {"credentials": {"apiKey": "abc"}},
+            }
+        )
+
+    assert result["result"] == {"status": "credentials_set"}
+    set_creds.assert_called_once_with({"apiKey": "abc"})
+
+
+def test_migrate_credentials_calls_config_manager():
+    with patch("backend.main.config_manager.get_legacy_credentials") as get_legacy:
+        get_legacy.return_value = {"apiKey": "legacy-key"}
+        result = handle_request(
+            {"id": 8, "method": "migrate_credentials", "params": {}}
+        )
+
+    assert result["result"] == {"apiKey": "legacy-key"}
+    get_legacy.assert_called_once()
+
+
+def test_clear_legacy_credentials_calls_config_manager():
+    with patch("backend.main.config_manager.clear_legacy_credentials") as clear_legacy:
+        result = handle_request(
+            {"id": 9, "method": "clear_legacy_credentials", "params": {}}
+        )
+
+    assert result["result"] == {"status": "legacy_credentials_cleared"}
+    clear_legacy.assert_called_once()

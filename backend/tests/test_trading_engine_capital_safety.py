@@ -324,7 +324,7 @@ def test_monitor_positions_updates_pnl_and_prevents_double_exit(monkeypatch):
                 "lastPrice": 94.0,
                 "realised": -50.0,
                 "unrealised": -25.0,
-                "averagePrice": 100.0,
+                "average_price": 100.0,
             }
         ]
     }
@@ -404,7 +404,7 @@ def test_adopted_position_gets_protective_stop(monkeypatch):
                 "exchange": "NSE",
                 "product": "MIS",
                 "lastPrice": 200.0,
-                "averagePrice": 200.0,
+                "average_price": 200.0,
                 "realised": 0.0,
                 "unrealised": 0.0,
             }
@@ -632,7 +632,7 @@ def test_pending_entries_prevents_adoption(monkeypatch):
                 "exchange": "NSE",
                 "product": "MIS",
                 "lastPrice": 100.0,
-                "averagePrice": 100.0,
+                "average_price": 100.0,
                 "realised": 0.0,
                 "unrealised": 0.0,
             }
@@ -735,7 +735,7 @@ def test_monitor_skips_exit_when_broker_stop_already_closed(monkeypatch):
             "lastPrice": 94.0,  # <= sl of 95 -> stop hit
             "realised": 0.0,
             "unrealised": -60.0,
-            "averagePrice": 100.0,
+            "average_price": 100.0,
         }
     ]
     # 1st get_positions (snapshot) = open; 2nd (pre-exit re-read) = flat.
@@ -803,7 +803,7 @@ def test_trade_lock_not_held_during_order_io(monkeypatch):
                 "lastPrice": 111.0,  # >= target of 110 -> target hit
                 "realised": 0.0,
                 "unrealised": 0.0,
-                "averagePrice": 100.0,
+                "average_price": 100.0,
             }
         ]
     }

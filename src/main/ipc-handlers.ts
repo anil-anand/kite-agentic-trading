@@ -3,6 +3,7 @@ import * as channels from '../shared/ipc-channels';
 import { pythonBridge } from './python-bridge';
 import { authManager } from './auth-manager';
 import { AppSettings } from '../shared/types';
+import { secureStorage } from './secure-storage';
 
 export function setupIpcHandlers() {
   
@@ -151,11 +152,23 @@ export function setupIpcHandlers() {
   });
   
   ipcMain.handle(channels.SETTINGS_SAVE, async (_, settings: AppSettings) => {
+    if (settings.credentials) {
+      secureStorage.updateCredentials(settings.credentials);
+      await pythonBridge.call('set_credentials', { credentials: secureStorage.loadCredentials() });
+    }
+    if (settings.llm && settings.llm.apiKey && settings.llm.apiKey !== '********') {
+      secureStorage.updateCredentials({ llmApiKey: settings.llm.apiKey });
+      await pythonBridge.call('set_credentials', { credentials: secureStorage.loadCredentials() });
+    }
     return await pythonBridge.call('save_settings', settings as unknown as Record<string, unknown>);
   });
   
   ipcMain.handle(channels.SETTINGS_SAVE_LLM_KEY, async (_, llmApiKey: string) => {
-    return await pythonBridge.call('save_llm_api_key', { llmApiKey });
+    if (llmApiKey && llmApiKey !== '********') {
+      secureStorage.updateCredentials({ llmApiKey });
+      await pythonBridge.call('set_credentials', { credentials: secureStorage.loadCredentials() });
+    }
+    return { status: 'saved' }; // No need to call python since it's just saving to secure storage
   });
 
   ipcMain.handle(channels.SETTINGS_DISCOVER_MODELS, async (_, params: any) => {

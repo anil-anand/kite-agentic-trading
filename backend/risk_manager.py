@@ -83,9 +83,9 @@ class RiskManager:
         estimated_charges = 0.0
         for t in trades:
             estimated_charges += cost_calculator.calculate_leg_charges(
-                float(t.get("averagePrice", 0)),
+                float(t.get("average_price", 0)),
                 int(t.get("quantity", 0)),
-                t.get("transactionType", "BUY"),
+                t.get("transaction_type", "BUY"),
             )["total"]
         net_realized = realized_gross - estimated_charges
         total_intraday = net_realized + unrealized

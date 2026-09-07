@@ -641,7 +641,7 @@ class TradingEngine:
                     direction=signal["direction"],
                     product=position.get("product", "MIS"),
                     strategy=signal.get("strategy", "unknown"),
-                    entry_price=position.get("averagePrice", signal["entryPrice"]),
+                    entry_price=position.get("average_price", signal["entryPrice"]),
                     quantity=abs(position.get("quantity", qty)) or qty,
                     stop_loss=signal["stopLoss"],
                     target=signal["target"],
@@ -675,7 +675,7 @@ class TradingEngine:
                     "sl": signal["stopLoss"],
                     "target": signal["target"],
                     "direction": signal["direction"],
-                    "entry_price": position.get("averagePrice", signal["entryPrice"]),
+                    "entry_price": position.get("average_price", signal["entryPrice"]),
                     "entry_time": datetime.datetime.now(),
                     "original_strategy": signal.get("strategy", "unknown"),
                     "entry_order_id": order_id,
@@ -852,7 +852,7 @@ class TradingEngine:
         cancels the just-placed stop to avoid an orphaned broker order.
         """
         symbol = p["tradingsymbol"]
-        avg_price = p.get("averagePrice", 0)
+        avg_price = p.get("average_price", 0)
         if avg_price <= 0:
             return
 
@@ -984,7 +984,7 @@ class TradingEngine:
                 continue  # Position already closed
 
             if entry_price == 0:
-                entry_price = pos.get("averagePrice", 0)
+                entry_price = pos.get("average_price", 0)
 
             # Evaluate current strategy signals for this symbol.
             # This is network I/O — intentionally NOT under the lock.
@@ -1425,7 +1425,7 @@ class TradingEngine:
                     exit_reason = self.active_trades[symbol].get(
                         "exit_reason", "unknown"
                     )
-                    avg_price = float(order.get("averagePrice") or 0)
+                    avg_price = float(order.get("average_price") or 0)
 
                     if trade_id:
                         try:
@@ -1501,7 +1501,7 @@ class TradingEngine:
             elif exit_order_id and t_order_id == exit_order_id:
                 matched_trades.append((t, "target"))
             # Fallback for manual/broker exits: match by opposite direction
-            elif t.get("transactionType") == exit_transaction_type:
+            elif t.get("transaction_type") == exit_transaction_type:
                 matched_trades.append((t, "manual_broker_exit"))
 
         if not matched_trades:
@@ -1533,7 +1533,7 @@ class TradingEngine:
             if qty <= 0:
                 break
 
-            price = float(t.get("averagePrice") or 0.0)
+            price = float(t.get("average_price") or 0.0)
             total_value += price * qty
             total_qty += qty
             reasons.add(reason)
