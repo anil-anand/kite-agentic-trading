@@ -42,6 +42,7 @@ def test_scanner_aggregation_trending(mock_scanner_config, monkeypatch, uptrend)
                 "stopLoss": 110.0,
                 "target": 140.0,
                 "reasoning": "mock",
+                "family": "trend",
                 "timestamp": "2026-09-06",
                 "indicators": {},
             }
@@ -56,7 +57,7 @@ def test_scanner_aggregation_trending(mock_scanner_config, monkeypatch, uptrend)
     signals = scanner.scan_watchlist(["TEST"])
     # Should yield family_trend signals
     assert len(signals) > 0
-    assert any(sig["strategy"] == "family_trend" for sig in signals)
+    assert any(sig["strategy"] == "Trend Pullback" for sig in signals)
 
     # Check that regime was correctly identified
     assert any(sig["regime"] == "TRENDING" for sig in signals)
@@ -92,6 +93,7 @@ def test_scanner_aggregation_breakout(mock_scanner_config, monkeypatch):
                 "stopLoss": 135.0,
                 "target": 160.0,
                 "reasoning": "mock",
+                "family": "trend",
                 "timestamp": "2026-09-06",
                 "indicators": {},
             }
@@ -106,9 +108,7 @@ def test_scanner_aggregation_breakout(mock_scanner_config, monkeypatch):
     signals = scanner.scan_watchlist(["TEST"])
     assert any(sig["regime"] == "BREAKOUT" for sig in signals)
     # Breakout regime allows breakout and trend families
-    assert any(
-        sig["strategy"] in ("family_breakout", "family_trend") for sig in signals
-    )
+    assert any(sig["strategy"] in ("Breakout", "Trend Pullback") for sig in signals)
 
 
 def test_scanner_incomplete_candle_skipping(mock_scanner_config, monkeypatch):
@@ -138,6 +138,7 @@ def test_scanner_incomplete_candle_skipping(mock_scanner_config, monkeypatch):
                 "stopLoss": 110.0,
                 "target": 140.0,
                 "reasoning": "mock",
+                "family": "trend",
                 "timestamp": "2026-09-06",
                 "indicators": {},
             }

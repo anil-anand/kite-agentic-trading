@@ -1,6 +1,5 @@
 import datetime
 import time
-import uuid
 from typing import Any, Dict, List, Tuple
 
 import pandas as pd
@@ -8,6 +7,7 @@ import pandas as pd
 from .calibration import calibrator
 from .config import config_manager
 from .kite_client import kite_client
+from .playbooks import BreakoutPlaybook, MeanReversionPlaybook, TrendPullbackPlaybook
 from .regime_classifier import regime_classifier
 from .strategies.adx_momentum import ADXMomentumStrategy
 from .strategies.awesome_oscillator import AwesomeOscillatorStrategy
@@ -71,6 +71,11 @@ class Scanner:
         self.candle_cache = {}
         self.last_cache_time = {}
         self.last_scanned_candle = {}
+        self.playbooks = [
+            TrendPullbackPlaybook(),
+            BreakoutPlaybook(),
+            MeanReversionPlaybook(),
+        ]
 
     def _fetch_candles(
         self, instrument_token: int, tradingsymbol: str
@@ -115,7 +120,6 @@ class Scanner:
 
         all_signals = []
         strategy_config = config_manager.get_strategy_config()
-        family_config = config_manager.get_families_config()
 
         instruments = kite_client.get_instruments("NSE")
         instrument_map = {
@@ -157,6 +161,7 @@ class Scanner:
             # 1. Classify Regime
             regime_info = regime_classifier.classify(df)
             regime = regime_info["regime"]
+            regime_state = regime_info
 
             raw_signals = []
             for strat_id, strategy in self.strategies.items():
@@ -169,62 +174,27 @@ class Scanner:
                     raw_signals.extend(signals)
 
             # 2. Gating and Aggregation
-            allowed_families = []
-            if regime == "TRENDING":
-                allowed_families = ["trend"]
-            elif regime == "RANGING":
-                allowed_families = ["mean_reversion"]
-            elif regime == "BREAKOUT":
-                allowed_families = ["breakout", "trend"]
-
             symbol_aggregated_signals = []
-
-            for family in allowed_families:
-                if not family_config.get(family, {}).get("enabled", True):
+            for playbook in self.playbooks:
+                if regime not in playbook.applicable_regimes():
                     continue
 
-                f_signals = [s for s in raw_signals if s["family"] == family]
-                buys = [s for s in f_signals if s["direction"] == "BUY"]
-                sells = [s for s in f_signals if s["direction"] == "SELL"]
-
-                for direction, dir_signals in [("BUY", buys), ("SELL", sells)]:
-                    if not dir_signals:
-                        continue
-
-                    # Base signal for entry, sl, target (use highest signal_score)
-                    base_sig = max(dir_signals, key=lambda s: s["signal_score"])
-
-                    avg_conf = sum(s["signal_score"] for s in dir_signals) / len(
-                        dir_signals
-                    )
-                    bonus = 5 * (len(dir_signals) - 1)
-                    weight = family_config.get(family, {}).get("weight", 1.0)
-                    family_signal_score = min(100, int((avg_conf + bonus) * weight))
-
+                decision = playbook.evaluate_entry(raw_signals, regime_state)
+                if decision:
                     est_prob, sample_size = calibrator.get_probability(
-                        f"family_{family}", family_signal_score
+                        f"playbook_{playbook.get_name()}", decision["signal_score"]
                     )
 
-                    agg_sig = {
-                        "id": str(uuid.uuid4()),
-                        "tradingsymbol": symbol,
-                        "exchange": base_sig.get("exchange", "NSE"),
-                        "strategy": f"family_{family}",
-                        "direction": direction,
-                        "signal_score": family_signal_score,
-                        "estimated_probability": est_prob,
-                        "calibration_sample_size": sample_size,
-                        "entryPrice": base_sig["entryPrice"],
-                        "stopLoss": base_sig["stopLoss"],
-                        "target": base_sig["target"],
-                        "riskReward": base_sig.get("riskReward", 0),
-                        "reasoning": f"{regime} regime active. {len(dir_signals)} {family} indicators aligned. Base: {base_sig['reasoning']}",
-                        "timestamp": base_sig.get("timestamp"),
-                        "indicators": regime_info["features"],
-                        "raw_signals": dir_signals,
-                        "regime": regime,
-                    }
-                    symbol_aggregated_signals.append(agg_sig)
+                    decision.update(
+                        {
+                            "estimated_probability": est_prob,
+                            "calibration_sample_size": sample_size,
+                            "indicators": regime_info["features"],
+                            "raw_signals": raw_signals,
+                            "regime": regime,
+                        }
+                    )
+                    symbol_aggregated_signals.append(decision)
 
             if not was_cached:
                 time.sleep(1.1)
