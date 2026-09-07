@@ -112,14 +112,14 @@ class TestJournalExternalClose:
                 "tradingsymbol": "RELIANCE",
                 "orderId": "STOP1",
                 "quantity": 4,
-                "averagePrice": 95.0,
+                "average_price": 95.0,
                 "fillTimestamp": "2026-09-06 12:00:00",
             },
             {
                 "tradingsymbol": "RELIANCE",
                 "orderId": "STOP1",
                 "quantity": 6,
-                "averagePrice": 94.0,
+                "average_price": 94.0,
                 "fillTimestamp": "2026-09-06 12:00:01",
             },
         ]
@@ -139,9 +139,9 @@ class TestJournalExternalClose:
         trades = [
             {
                 "tradingsymbol": "RELIANCE",
-                "transactionType": "SELL",
+                "transaction_type": "SELL",
                 "quantity": 10,
-                "averagePrice": 96.0,
+                "average_price": 96.0,
                 "fillTimestamp": "2026-09-06 12:00:00",
             }
         ]
@@ -198,7 +198,7 @@ class TestJournalExternalClose:
                     "tradingsymbol": "RELIANCE",
                     "orderId": "STOP1",
                     "quantity": 10,
-                    "averagePrice": 94.4,
+                    "average_price": 94.4,
                     "fillTimestamp": "2026-09-06 12:00:00",
                 }
             ],
@@ -233,7 +233,7 @@ class TestJournalExternalClose:
                             "tradingsymbol": "RELIANCE",
                             "orderId": "STOP1",
                             "quantity": 10,
-                            "averagePrice": 94.4,
+                            "average_price": 94.4,
                             "fillTimestamp": "2026-09-06 12:00:00",
                         }
                     ],

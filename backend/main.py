@@ -31,7 +31,18 @@ def handle_request(req):
         }
 
     try:
-        if method == "login":
+        if method == "set_credentials":
+            config_manager.set_credentials(params.get("credentials", {}))
+            return success({"status": "credentials_set"})
+
+        elif method == "migrate_credentials":
+            return success(config_manager.get_legacy_credentials())
+
+        elif method == "clear_legacy_credentials":
+            config_manager.clear_legacy_credentials()
+            return success({"status": "legacy_credentials_cleared"})
+
+        elif method == "login":
             creds = config_manager.get_credentials()
             api_key = params.get("api_key", creds.get("apiKey"))
             api_secret = params.get("api_secret", creds.get("apiSecret"))
@@ -196,6 +207,16 @@ def handle_request(req):
             if not available_margin:
                 available_margin = equity_margin.get("net", 0)
 
+            if risk_manager.reconciliation_status == "RECONCILIATION_PENDING":
+                try:
+                    risk_manager.reconcile_state()
+                except Exception as e:
+                    from .utils import push_log
+
+                    push_log(
+                        f"Auto-reconcile on dashboard failed: {e}", level="warning"
+                    )
+
             positions = kite_client.get_positions().get("net", [])
             total_pnl = sum(p.get("pnl", p.get("m2m", 0)) for p in positions)
 
@@ -203,12 +224,12 @@ def handle_request(req):
             for p in positions:
                 if p.get("quantity", 0) != 0:
                     multiplier = 0.2 if p.get("product") == "MIS" else 1.0
-                    avg_price = p.get("averagePrice", 0)
+                    avg_price = p.get("average_price", 0)
                     if avg_price == 0:
                         avg_price = (
-                            p.get("buyPrice", 0)
+                            p.get("buy_price", 0)
                             if p.get("quantity", 0) > 0
-                            else p.get("sellPrice", 0)
+                            else p.get("sell_price", 0)
                         )
                     calculated_used_margin += (
                         abs(p.get("quantity", 0)) * avg_price * multiplier

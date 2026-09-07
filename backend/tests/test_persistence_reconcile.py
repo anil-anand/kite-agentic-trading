@@ -110,7 +110,7 @@ def _open_position(qty=10):
         "exchange": "NSE",
         "product": "MIS",
         "lastPrice": 100.0,
-        "averagePrice": 100.0,
+        "average_price": 100.0,
     }
 
 
