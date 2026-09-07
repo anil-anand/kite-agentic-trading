@@ -83,3 +83,6 @@ export const ANALYTICS_EXIT_REASON = 'analytics:exit-reason';
 export const ANALYTICS_TRADE_REPLAY = 'analytics:trade-replay';
 export const ANALYTICS_WHAT_IF = 'analytics:what-if';
 export const ANALYTICS_LLM_POST_MORTEM = 'analytics:llm-post-mortem';
+
+// ─── Backtesting ──────────────────────────────────────────────────
+export const BACKTEST_RUN = 'backtest:run';

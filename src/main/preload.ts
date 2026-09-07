@@ -112,6 +112,9 @@ try {
       getWhatIfAnalysis: (tradeId: string) => electron.ipcRenderer.invoke(channels.ANALYTICS_WHAT_IF, tradeId),
       getLlmPostMortem: (tradeId: string) => electron.ipcRenderer.invoke(channels.ANALYTICS_LLM_POST_MORTEM, tradeId),
     },
+    backtest: {
+      run: (params: any) => electron.ipcRenderer.invoke(channels.BACKTEST_RUN, params),
+    },
     app: {
       onPythonStatus: (callback: (data: any) => void) => {
         const listener = (_: any, data: any) => callback(data);

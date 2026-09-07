@@ -10,6 +10,7 @@ import Watchlist from './pages/Watchlist';
 import ActivityLog from './pages/ActivityLog';
 import Settings from './pages/Settings';
 import Journal from './pages/Journal';
+import Backtesting from './pages/Backtesting';
 import LoginModal from './components/LoginModal';
 import { useTradingStore } from './stores/trading-store';
 import { useKiteAPI } from './hooks/useKiteAPI';
@@ -33,6 +34,7 @@ const App: React.FC = () => {
             <Route path="/watchlist" element={<Watchlist />} />
             <Route path="/activity" element={<ActivityLog />} />
             <Route path="/settings" element={<Settings />} />
+            <Route path="/backtesting" element={<Backtesting />} />
           </Routes>
           {!auth.isLoggedIn && <LoginModal />}
         </main>
