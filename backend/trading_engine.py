@@ -1476,12 +1476,15 @@ class TradingEngine:
             t_order_id = str(t.get("orderId", ""))
             t_time_str = t.get("fillTimestamp") or t.get("exchangeTimestamp")
             try:
-                t_time = (
-                    datetime.datetime.strptime(t_time_str, "%Y-%m-%d %H:%M:%S")
-                    if t_time_str
-                    else datetime.datetime.now()
-                )
-            except ValueError:
+                if isinstance(t_time_str, datetime.datetime):
+                    t_time = t_time_str
+                else:
+                    t_time = (
+                        datetime.datetime.strptime(t_time_str, "%Y-%m-%d %H:%M:%S")
+                        if t_time_str
+                        else datetime.datetime.now()
+                    )
+            except (ValueError, TypeError):
                 t_time = datetime.datetime.now()
 
             # Must be after entry
@@ -1549,11 +1552,14 @@ class TradingEngine:
             final_reason = "manual_broker_exit"
 
         if last_time:
-            try:
-                dt = datetime.datetime.strptime(last_time, "%Y-%m-%d %H:%M:%S")
-                last_time = dt.isoformat()
-            except ValueError:
-                pass
+            if isinstance(last_time, datetime.datetime):
+                last_time = last_time.isoformat()
+            else:
+                try:
+                    dt = datetime.datetime.strptime(last_time, "%Y-%m-%d %H:%M:%S")
+                    last_time = dt.isoformat()
+                except (ValueError, TypeError):
+                    pass
 
         return vwap, final_reason, last_time
 
