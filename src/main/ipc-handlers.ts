@@ -223,4 +223,9 @@ export function setupIpcHandlers() {
   ipcMain.handle(channels.ANALYTICS_LLM_POST_MORTEM, async (_, trade_id: string) => {
     return await pythonBridge.call('analytics_llm_post_mortem', { trade_id });
   });
+
+  // ─── Backtesting ──────────────────────────────────────────────────
+  ipcMain.handle(channels.BACKTEST_RUN, async (_, params: any) => {
+    return await pythonBridge.call('run_backtest', params);
+  });
 }

@@ -266,6 +266,58 @@ def handle_request(req):
         elif method == "analytics_llm_post_mortem":
             return success(analytics.generate_llm_post_mortem(params.get("trade_id")))
 
+        elif method == "run_backtest":
+            strategy_id = params.get("strategy_id")
+            symbol = params.get("symbol")
+            days = params.get("days", 30)
+            initial_capital = params.get("initial_capital", 100000.0)
+
+            # Look up the strategy from scanner
+            strategy = scanner.strategies.get(strategy_id)
+            if not strategy:
+                return error(-32602, f"Strategy {strategy_id} not found")
+
+            import datetime
+            import pandas as pd
+            from .backtesting.backtest_engine import BacktestEngine
+            from .backtesting.metrics_evaluator import MetricsEvaluator
+
+            # Fetch data (mocking the date range based on days parameter)
+            now = datetime.datetime.now()
+            from_date = now - datetime.timedelta(days=days)
+            
+            instruments = kite_client.get_instruments("NSE")
+            instrument_map = {i["tradingsymbol"]: i["instrument_token"] for i in instruments}
+            token = instrument_map.get(symbol)
+            
+            if not token:
+                return error(-32602, f"Symbol {symbol} not found in instruments")
+
+            records = kite_client.get_historical_data(
+                instrument_token=token,
+                from_date=from_date,
+                to_date=now,
+                interval="5minute"
+            )
+
+            if not records:
+                return error(-32000, "No historical data found for backtest")
+
+            df = pd.DataFrame(records)
+            for col in ["open", "high", "low", "close"]:
+                if col in df.columns:
+                    df[col] = df[col].astype(float)
+
+            engine = BacktestEngine(strategy, initial_capital=initial_capital)
+            engine.load_data(symbol, df)
+            engine.run()
+
+            metrics = MetricsEvaluator.evaluate(engine.broker.trades, initial_capital)
+            return success({
+                "metrics": metrics,
+                "trades": engine.broker.trades
+            })
+
         else:
             return error(-32601, f"Method '{method}' not found")
 
