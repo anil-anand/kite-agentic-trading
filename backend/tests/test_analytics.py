@@ -372,3 +372,53 @@ def test_llm_post_mortem_failure_not_cached(
     assert recovered["analysis"] == "Recovered analysis."
     assert recovered["cached"] is False
     assert mock_generate.call_count == 2
+
+
+@patch("backend.config.config_manager.get_credentials")
+@patch("backend.config.config_manager.get_llm_settings")
+@patch("backend.analytics.OpenAICompatibleClient.generate")
+def test_llm_post_mortem_returns_analysis_when_cache_write_fails(
+    mock_generate, mock_get_llm_settings, mock_get_credentials, temp_db
+):
+    """A successful analysis must still be returned even if persisting it fails."""
+    mock_get_credentials.return_value = {"llmApiKey": "fake_key"}
+    mock_get_llm_settings.return_value = {
+        "provider": "Gemini",
+        "baseUrl": "https://example.test/v1",
+        "model": "gemini-2.5-flash",
+    }
+    mock_generate.return_value = "This is a post-mortem analysis."
+
+    _prepare_trade_events_table(temp_db)
+    analytics = TradeAnalytics(db_path=temp_db)
+    real_get_conn = analytics._get_conn
+
+    class _FailingInsertConn:
+        """Wraps a real sqlite3 connection, failing only INSERTs into the cache table."""
+
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, *args, **kwargs):
+            if "INSERT INTO llm_post_mortems" in sql:
+                raise sqlite3.OperationalError("database is locked")
+            return self._conn.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+        def __enter__(self):
+            return self._conn.__enter__()
+
+        def __exit__(self, *exc_info):
+            return self._conn.__exit__(*exc_info)
+
+    def _wrapped_get_conn():
+        return _FailingInsertConn(real_get_conn())
+
+    with patch.object(analytics, "_get_conn", _wrapped_get_conn):
+        res = analytics.generate_llm_post_mortem("1")
+
+    assert "error" not in res
+    assert res["analysis"] == "This is a post-mortem analysis."
+    assert res["cached"] is False

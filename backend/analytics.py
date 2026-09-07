@@ -501,6 +501,13 @@ Trade Timeline Events:
                 provider=provider,
                 plan=llm.get("openCodePlan", "zen"),
             )
+        except Exception as e:
+            return {"error": f"LLM Generation failed: {str(e)}"}
+
+        # Persisting the cache entry is best-effort: a successfully generated
+        # analysis must still be returned to the caller even if the cache
+        # write itself fails (e.g. the database is locked or unwritable).
+        try:
             with conn:
                 conn.execute(
                     """
@@ -525,9 +532,10 @@ Trade Timeline Events:
                         datetime.now().isoformat(),
                     ),
                 )
-            return {"analysis": analysis, "cached": False}
-        except Exception as e:
-            return {"error": f"LLM Generation failed: {str(e)}"}
+        except sqlite3.Error:
+            pass
+
+        return {"analysis": analysis, "cached": False}
 
     @staticmethod
     def _post_mortem_cache_key(
