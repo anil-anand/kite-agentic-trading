@@ -165,13 +165,19 @@ def test_what_if_analysis(mock_replay, temp_db):
         },
         "candles": [
             {
-                "date": now - timedelta(minutes=5),
+                "time": int((now - timedelta(minutes=5)).timestamp()),
                 "open": 100,
                 "high": 115,
                 "low": 98,
                 "close": 110,
             },
-            {"date": now, "open": 110, "high": 112, "low": 105, "close": 108},
+            {
+                "time": int(now.timestamp()),
+                "open": 110,
+                "high": 112,
+                "low": 105,
+                "close": 108,
+            },
         ],
     }
 

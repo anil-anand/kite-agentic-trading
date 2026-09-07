@@ -78,7 +78,15 @@ class RiskManager:
         realized_gross = sum(p.get("realised", 0.0) for p in positions)
         unrealized = sum(p.get("unrealised", 0.0) for p in positions)
 
-        estimated_charges = len(trades) * 20.0
+        from .trading_costs import cost_calculator
+
+        estimated_charges = 0.0
+        for t in trades:
+            estimated_charges += cost_calculator.calculate_leg_charges(
+                float(t.get("averagePrice", 0)),
+                int(t.get("quantity", 0)),
+                t.get("transactionType", "BUY"),
+            )["total"]
         net_realized = realized_gross - estimated_charges
         total_intraday = net_realized + unrealized
 
@@ -217,15 +225,15 @@ class RiskManager:
         realized_gross = sum(p.get("realised", 0.0) for p in positions)
         unrealized = sum(p.get("unrealised", 0.0) for p in positions)
 
-        # We need an estimate of charges.
-        # The trades API shouldn't be hit every second.
-        # We can approximate: if there are N executed trades today in our journal, use that.
-        from .journal import journal
-
-        trades_today = journal.get_todays_trade_counts()["total"]
-        # Since an order usually has 2 trades (entry/exit), maybe 2 * trades_today * 20
-        # Actually, to be safe, just use a known margin.
-        estimated_charges = trades_today * 40.0  # roughly 40 rs per round trip trade
+        # We can approximate charges using actual position turnover
+        estimated_charges = 0.0
+        for p in positions:
+            buy_val = p.get("buy_value", 0.0)
+            sell_val = p.get("sell_value", 0.0)
+            # Rough estimate: ~0.04% of total turnover, but bounded by typical flat ₹40 max brokerage + ~0.03% STT/Txn
+            turnover = buy_val + sell_val
+            # Brokerage is max 40 per symbol round trip, plus variable taxes ~0.03% of turnover
+            estimated_charges += min(turnover * 0.0003, 40.0) + (turnover * 0.0003)
 
         net_realized = realized_gross - estimated_charges
         total_intraday = net_realized + unrealized

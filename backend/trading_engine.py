@@ -11,6 +11,7 @@ from .journal import journal
 from .kite_client import kite_client
 from .risk_manager import risk_manager
 from .scanner import scanner
+from .trading_costs import cost_calculator
 from .utils import DateTimeEncoder
 
 # Module-level lock for stdout to prevent interleaved JSON output between
@@ -657,6 +658,7 @@ class TradingEngine:
                     },
                     universe_version=signal.get("universe_version"),
                     screener_ranking=signal.get("screener_ranking"),
+                    signal_entry_price=signal["entryPrice"],
                 )
             except Exception as e:
                 self._push_log(
@@ -1423,6 +1425,8 @@ class TradingEngine:
 
                     if trade_id:
                         try:
+                            # Try to compute cost if possible, though _sync_exit_pending_status might not have all trades.
+                            # Reconcile job will fix if needed. For now, pass no cost_details or try a quick calculate.
                             journal.close_trade(trade_id, avg_price, exit_reason)
                         except Exception as e:
                             self._push_log(
@@ -1439,7 +1443,7 @@ class TradingEngine:
     def _reconcile_execution(self, symbol: str, trade_record: dict) -> tuple:
         """
         Query Kite trades to find the actual execution VWAP, reason, and time.
-        Returns (exit_price, exit_reason, exit_time). If not found, returns (0.0, "UNRECONCILED", None).
+        Returns (exit_price, exit_reason, exit_time, cost_details). If not found, returns (0.0, "UNRECONCILED", None, None).
         """
         try:
             trades = kite_client.get_trades()
@@ -1447,7 +1451,7 @@ class TradingEngine:
             self._push_log(
                 f"Failed to fetch trades for reconciliation: {e}", level="warning"
             )
-            return 0.0, "UNRECONCILED", None
+            return 0.0, "UNRECONCILED", None, None
 
         stop_order_id = str(trade_record.get("stop_order_id", ""))
         exit_order_id = str(trade_record.get("exit_order_id", ""))
@@ -1497,7 +1501,7 @@ class TradingEngine:
                 matched_trades.append((t, "manual_broker_exit"))
 
         if not matched_trades:
-            return 0.0, "UNRECONCILED", None
+            return 0.0, "UNRECONCILED", None, None
 
         # Sort by time
         matched_trades.sort(
@@ -1535,7 +1539,7 @@ class TradingEngine:
                 break
 
         if total_qty == 0:
-            return 0.0, "UNRECONCILED", None
+            return 0.0, "UNRECONCILED", None, None
 
         vwap = round(total_value / total_qty, 2)
 
@@ -1557,7 +1561,29 @@ class TradingEngine:
                 except (ValueError, TypeError):
                     pass
 
-        return vwap, final_reason, last_time
+        cost_details = None
+        if final_reason != "UNRECONCILED":
+            # Determine slippage limits if available
+            entry_price = float(trade_record.get("entry_price", 0.0))
+            direction = trade_record.get("direction", "BUY")
+            signal_entry_price = trade_record.get("signal_entry_price")
+
+            signal_exit_price = None
+            if final_reason == "stop_loss":
+                signal_exit_price = trade_record.get("sl")
+            elif final_reason == "target":
+                signal_exit_price = trade_record.get("target")
+
+            cost_details = cost_calculator.calculate_trade_charges(
+                direction=direction,
+                entry_price=entry_price,
+                exit_price=vwap,
+                quantity=total_qty,
+                signal_entry_price=signal_entry_price,
+                signal_exit_price=signal_exit_price,
+            )
+
+        return vwap, final_reason, last_time, cost_details
 
     def _journal_external_close(self, symbol: str):
         """Book a journal close for a position closed outside the app-side exit
@@ -1572,7 +1598,9 @@ class TradingEngine:
         if not trade_id:
             return
 
-        exit_price, reason, exit_time = self._reconcile_execution(symbol, trade_record)
+        exit_price, reason, exit_time, cost_details = self._reconcile_execution(
+            symbol, trade_record
+        )
 
         if reason == "UNRECONCILED":
             self._push_log(
@@ -1581,7 +1609,9 @@ class TradingEngine:
             )
 
         try:
-            journal.close_trade(trade_id, exit_price, reason, exit_time)
+            journal.close_trade(
+                trade_id, exit_price, reason, exit_time, cost_details=cost_details
+            )
         except Exception as e:
             self._push_log(
                 f"Error closing trade in journal for {symbol}: {e}", level="error"
@@ -1612,11 +1642,17 @@ class TradingEngine:
                 self._push_log(
                     f"Reconcile job: Found ghost OPEN trade for {t['tradingsymbol']}. Attempting to reconcile."
                 )
-                exit_price, reason, exit_time = self._reconcile_execution(
+                exit_price, reason, exit_time, cost_details = self._reconcile_execution(
                     t["tradingsymbol"], dict(t)
                 )
                 if reason != "UNRECONCILED":
-                    journal.close_trade(t["id"], exit_price, reason, exit_time)
+                    journal.close_trade(
+                        t["id"],
+                        exit_price,
+                        reason,
+                        exit_time,
+                        cost_details=cost_details,
+                    )
                     self._push_log(
                         f"Reconcile job: Closed {t['tradingsymbol']} at {exit_price} ({reason})"
                     )
@@ -1625,11 +1661,17 @@ class TradingEngine:
 
             elif t["status"] == "CLOSED" and t["exit_reason"] == "UNRECONCILED":
                 # Try to find fills now
-                exit_price, reason, exit_time = self._reconcile_execution(
+                exit_price, reason, exit_time, cost_details = self._reconcile_execution(
                     t["tradingsymbol"], dict(t)
                 )
                 if reason != "UNRECONCILED":
-                    journal.update_trade_exit(t["id"], exit_price, reason, exit_time)
+                    journal.update_trade_exit(
+                        t["id"],
+                        exit_price,
+                        reason,
+                        exit_time,
+                        cost_details=cost_details,
+                    )
                     self._push_log(
                         f"Reconcile job: Reconciled {t['tradingsymbol']} at {exit_price} ({reason})"
                     )

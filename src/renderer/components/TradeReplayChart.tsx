@@ -50,7 +50,7 @@ const TradeReplayChart: React.FC<TradeReplayChartProps> = ({ candles, trade }) =
       wickUpColor: '#10B981',
       wickDownColor: '#EF4444',
     });
-    
+
     seriesRef.current = candlestickSeries;
 
     // Convert API candles to lightweight-charts format
@@ -66,7 +66,7 @@ const TradeReplayChart: React.FC<TradeReplayChartProps> = ({ candles, trade }) =
 
     // Add markers for entry and exit
     const markers: any[] = [];
-    
+
     if (trade.entry_time) {
       const entryTime = Math.floor(new Date(trade.entry_time).getTime() / 1000);
       markers.push({
