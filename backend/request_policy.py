@@ -170,9 +170,10 @@ class BrokerGateway:
 
             except Exception as e:
                 latency = time.time() - start_time
-                self._record_failure()
 
                 classification = self._classify_error(e)
+                if classification != ErrorClassification.NON_RETRYABLE:
+                    self._record_failure()
 
                 if (
                     classification == ErrorClassification.AMBIGUOUS

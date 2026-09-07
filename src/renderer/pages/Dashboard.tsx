@@ -25,6 +25,7 @@ const Dashboard: React.FC = () => {
 
   React.useEffect(() => {
     const fetchData = async () => {
+      if (!useTradingStore.getState().auth.isLoggedIn) return;
       try {
         const summary = await window.electronAPI?.dashboard.summary();
         if (summary) setDashboard(summary);

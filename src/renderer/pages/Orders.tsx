@@ -8,6 +8,7 @@ const Orders: React.FC = () => {
 
   React.useEffect(() => {
     const fetchOrders = async () => {
+      if (!useTradingStore.getState().auth.isLoggedIn) return;
       try {
         const response = await window.electronAPI?.orders.getAll();
         if (response) {
