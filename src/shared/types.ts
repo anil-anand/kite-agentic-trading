@@ -400,6 +400,24 @@ export interface JournalTrade {
   status: 'OPEN' | 'CLOSED';
   confluence_snapshot: string | null;
   indicator_snapshot: string | null;
+  market_regime?: string | null;
+  strategy_family?: string | null;
+  production_playbook?: string | null;
+  raw_evidence?: string | null;
+  feature_values?: string | null;
+  signal_time?: string | null;
+  candle_time?: string | null;
+  entry_quote?: number | null;
+  exit_quote?: number | null;
+  stop_distance?: number | null;
+  target_distance?: number | null;
+  initial_r?: number | null;
+  realized_r?: number | null;
+  mae?: number | null;
+  mfe?: number | null;
+  holding_time_seconds?: number | null;
+  screener_score?: number | null;
+  strategy_version?: string | null;
 }
 
 export interface TradeEvent {
