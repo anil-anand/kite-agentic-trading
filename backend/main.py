@@ -225,6 +225,7 @@ def handle_request(req):
 
             summary = {
                 "totalPnl": round(total_pnl, 2),
+                "netPnl": round(risk_manager.daily_pnl, 2),
                 "tradesToday": trades_today,
                 "winRate": round(win_rate, 2),
                 "availableMargin": available_margin,

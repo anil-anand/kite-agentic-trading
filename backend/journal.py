@@ -6,6 +6,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from backend.trading_costs import TradingCostCalculator
+
 
 class TradeJournal:
     def __init__(self, db_path: str = None):
@@ -53,6 +55,14 @@ class TradeJournal:
                     exit_time TIMESTAMP,
                     exit_reason TEXT,
                     pnl REAL,
+                    gross_pnl REAL,
+                    net_pnl REAL,
+                    brokerage REAL,
+                    taxes REAL,
+                    exchange_charges REAL,
+                    other_fees REAL,
+                    slippage REAL,
+                    signal_entry_price REAL,
                     status TEXT,
                     confluence_snapshot TEXT,
                     indicator_snapshot TEXT,
@@ -95,6 +105,17 @@ class TradeJournal:
             except sqlite3.OperationalError:
                 pass
 
+            new_columns = [
+                "gross_pnl REAL", "net_pnl REAL", "brokerage REAL", 
+                "taxes REAL", "exchange_charges REAL", "other_fees REAL", 
+                "slippage REAL", "signal_entry_price REAL"
+            ]
+            for col in new_columns:
+                try:
+                    conn.execute(f"ALTER TABLE trades ADD COLUMN {col};")
+                except sqlite3.OperationalError:
+                    pass
+
     def open_trade(
         self,
         trade_id: str,
@@ -116,6 +137,7 @@ class TradeJournal:
         indicator_snapshot: Optional[Dict[str, Any]] = None,
         universe_version: Optional[str] = None,
         screener_ranking: Optional[int] = None,
+        signal_entry_price: Optional[float] = None,
     ):
         """Record a newly opened trade."""
         conn = self._get_conn()
@@ -131,8 +153,9 @@ class TradeJournal:
                 id, tradingsymbol, exchange, direction, product, strategy,
                 signal_id, reasoning, confidence, estimated_probability, calibration_sample_size,
                 entry_price, quantity, stop_loss, target, entry_time, status, confluence_snapshot, indicator_snapshot,
-                universe_version, screener_ranking
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?)
+                universe_version, screener_ranking, signal_entry_price,
+                gross_pnl, net_pnl, brokerage, taxes, exchange_charges, other_fees, slippage
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
         """
         params = (
             trade_id,
@@ -155,6 +178,7 @@ class TradeJournal:
             indicator_str,
             universe_version,
             screener_ranking,
+            signal_entry_price,
         )
 
         with conn:
@@ -196,6 +220,7 @@ class TradeJournal:
         exit_price: float,
         exit_reason: str,
         exit_time: Optional[str] = None,
+        cost_details: Optional[Dict[str, Any]] = None,
     ):
         """Mark a trade as closed and record its outcome."""
         conn = self._get_conn()
@@ -209,20 +234,55 @@ class TradeJournal:
         row = cursor.fetchone()
 
         pnl = 0.0
+        gross_pnl = 0.0
+        net_pnl = 0.0
+        brokerage = 0.0
+        taxes = 0.0
+        exchange_charges = 0.0
+        other_fees = 0.0
+        slippage = 0.0
+        
         if row:
             direction, entry_price, quantity = row
-            if direction == "BUY":
-                pnl = (exit_price - entry_price) * quantity
+            if cost_details:
+                gross_pnl = cost_details.get("gross_pnl", 0.0)
+                net_pnl = cost_details.get("net_pnl", 0.0)
+                brokerage = cost_details.get("brokerage", 0.0)
+                taxes = cost_details.get("taxes", 0.0)
+                exchange_charges = cost_details.get("exchange_charges", 0.0)
+                other_fees = cost_details.get("other_fees", 0.0)
+                slippage = cost_details.get("slippage", 0.0)
+                pnl = net_pnl
             else:
-                pnl = (entry_price - exit_price) * quantity
+                calc = TradingCostCalculator()
+                charges = calc.calculate_trade_charges(
+                    direction=direction,
+                    entry_price=entry_price,
+                    exit_price=exit_price,
+                    quantity=quantity
+                )
+                gross_pnl = charges["gross_pnl"]
+                net_pnl = charges["net_pnl"]
+                brokerage = charges["brokerage"]
+                taxes = charges["taxes"]
+                exchange_charges = charges["exchange_charges"]
+                other_fees = charges["other_fees"]
+                slippage = charges["slippage"]
+                pnl = net_pnl
 
         query = """
             UPDATE trades
-            SET status = 'CLOSED', exit_price = ?, exit_time = ?, exit_reason = ?, pnl = ?
+            SET status = 'CLOSED', exit_price = ?, exit_time = ?, exit_reason = ?, pnl = ?,
+                gross_pnl = ?, net_pnl = ?, brokerage = ?, taxes = ?, exchange_charges = ?,
+                other_fees = ?, slippage = ?
             WHERE id = ?
         """
         with conn:
-            conn.execute(query, (exit_price, now, exit_reason, pnl, trade_id))
+            conn.execute(query, (
+                exit_price, now, exit_reason, pnl,
+                gross_pnl, net_pnl, brokerage, taxes, exchange_charges, other_fees, slippage,
+                trade_id
+            ))
             self._log_event_inner(
                 conn,
                 trade_id,
@@ -232,7 +292,7 @@ class TradeJournal:
             )
 
     def update_trade_exit(
-        self, trade_id: str, exit_price: float, exit_reason: str, exit_time: str
+        self, trade_id: str, exit_price: float, exit_reason: str, exit_time: str, cost_details: Optional[Dict[str, Any]] = None
     ):
         """Update an already closed or unreconciled trade with actual execution details."""
         conn = self._get_conn()
@@ -244,20 +304,46 @@ class TradeJournal:
         row = cursor.fetchone()
 
         pnl = 0.0
+        gross_pnl = 0.0
+        net_pnl = 0.0
+        brokerage = 0.0
+        taxes = 0.0
+        exchange_charges = 0.0
+        other_fees = 0.0
+        slippage = 0.0
+        
         if row:
             direction, entry_price, quantity = row
-            if direction == "BUY":
-                pnl = (exit_price - entry_price) * quantity
+            if cost_details:
+                gross_pnl = cost_details.get("gross_pnl", 0.0)
+                net_pnl = cost_details.get("net_pnl", 0.0)
+                brokerage = cost_details.get("brokerage", 0.0)
+                taxes = cost_details.get("taxes", 0.0)
+                exchange_charges = cost_details.get("exchange_charges", 0.0)
+                other_fees = cost_details.get("other_fees", 0.0)
+                slippage = cost_details.get("slippage", 0.0)
+                pnl = net_pnl
             else:
-                pnl = (entry_price - exit_price) * quantity
+                if direction == "BUY":
+                    pnl = (exit_price - entry_price) * quantity
+                else:
+                    pnl = (entry_price - exit_price) * quantity
+                gross_pnl = pnl
+                net_pnl = pnl
 
         query = """
             UPDATE trades
-            SET exit_price = ?, exit_time = ?, exit_reason = ?, pnl = ?
+            SET exit_price = ?, exit_time = ?, exit_reason = ?, pnl = ?,
+                gross_pnl = ?, net_pnl = ?, brokerage = ?, taxes = ?, exchange_charges = ?,
+                other_fees = ?, slippage = ?
             WHERE id = ?
         """
         with conn:
-            conn.execute(query, (exit_price, exit_time, exit_reason, pnl, trade_id))
+            conn.execute(query, (
+                exit_price, exit_time, exit_reason, pnl,
+                gross_pnl, net_pnl, brokerage, taxes, exchange_charges, other_fees, slippage,
+                trade_id
+            ))
             self._log_event_inner(
                 conn,
                 trade_id,

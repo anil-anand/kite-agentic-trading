@@ -353,6 +353,7 @@ export interface RPCEvent {
 
 export interface DashboardSummary {
   totalPnl: number;
+  netPnl: number;
   realisedPnl: number;
   unrealisedPnl: number;
   tradesToday: number;
@@ -388,6 +389,14 @@ export interface JournalTrade {
   exit_time: string | null;
   exit_reason: string | null;
   pnl: number | null;
+  gross_pnl: number | null;
+  net_pnl: number | null;
+  brokerage: number | null;
+  taxes: number | null;
+  exchange_charges: number | null;
+  other_fees: number | null;
+  slippage: number | null;
+  signal_entry_price: number | null;
   status: 'OPEN' | 'CLOSED';
   confluence_snapshot: string | null;
   indicator_snapshot: string | null;
