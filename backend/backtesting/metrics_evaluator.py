@@ -35,10 +35,10 @@ class MetricsEvaluator:
         avg_win = wins["net_pnl"].mean() if len(wins) > 0 else 0
         avg_loss = abs(losses["net_pnl"].mean()) if len(losses) > 0 else 0
 
-        profit_factor = (
+        profit_factor: float | None = (
             (wins["net_pnl"].sum() / abs(losses["net_pnl"].sum()))
             if abs(losses["net_pnl"].sum()) > 0
-            else float("inf")
+            else None  # No losses: profit_factor is undefined; use None for JSON safety
         )
 
         # Expectancy = (Win Rate * Average Win) - (Loss Rate * Average Loss)
@@ -47,7 +47,9 @@ class MetricsEvaluator:
         # Equity Curve & Drawdown
         df = df.sort_values("exit_time")
         df["equity"] = initial_capital + df["net_pnl"].cumsum()
-        df["peak_equity"] = df["equity"].cummax()
+        # Peak must start at initial_capital so that any first-trade loss
+        # is captured in drawdown rather than silently discarded.
+        df["peak_equity"] = df["equity"].cummax().clip(lower=initial_capital)
         df["drawdown"] = df["peak_equity"] - df["equity"]
         max_drawdown = df["drawdown"].max()
 
@@ -91,7 +93,9 @@ class MetricsEvaluator:
             "trade_count": len(df),
             "win_rate": round(win_rate, 4),
             "expectancy": round(expectancy, 2),
-            "profit_factor": round(profit_factor, 2),
+            "profit_factor": round(profit_factor, 2)
+            if profit_factor is not None
+            else None,
             "avg_win": round(avg_win, 2),
             "avg_loss": round(avg_loss, 2),
             "avg_r": round(avg_r, 2),

@@ -12,9 +12,14 @@ class AuthManager {
         console.log('[AuthManager] No secrets file found. Attempting migration from backend...');
         const legacyCreds = await pythonBridge.call('migrate_credentials');
         if (legacyCreds && Object.keys(legacyCreds).length > 0) {
-          secureStorage.saveCredentials(legacyCreds);
-          await pythonBridge.call('clear_legacy_credentials');
-          console.log('[AuthManager] Migration successful.');
+          try {
+            secureStorage.saveCredentials(legacyCreds);
+            // Only delete the legacy copy after confirming the new write succeeded.
+            await pythonBridge.call('clear_legacy_credentials');
+            console.log('[AuthManager] Migration successful.');
+          } catch (saveErr) {
+            console.error('[AuthManager] Migration aborted: saveCredentials failed. Legacy credentials preserved.', saveErr);
+          }
         } else {
           console.log('[AuthManager] No legacy credentials to migrate.');
         }

@@ -29,6 +29,14 @@ class BacktestEngine:
     def run(self):
         """
         Runs the backtest by iterating through the timeline chronologically across all symbols.
+
+        Execution model (avoids look-ahead bias):
+          - Signals generated from the slice ending at bar T are queued.
+          - They are filled at the OPEN of bar T+1, not at T's close which is
+            unknowable until the bar completes.
+        End-of-test policy:
+          - Any position still open after the last bar is liquidated at that
+            bar's close and the trade is recorded with reason 'end_of_test'.
         """
         # Find the global timeline
         all_dates = []
@@ -40,26 +48,43 @@ class BacktestEngine:
 
         unique_dates = sorted(list(set(all_dates)))
 
-        # We need at least enough history to generate first signals
-        # Let's start from index 50 to give strategies a warm-up period
-        # Alternatively, we just iterate from start and pass available slices.
-        # Strategies typically have an early return if len(df) < required_window
-
         # Pre-align dataframes
         aligned_data = {}
         for symbol, df in self.market_data.items():
             aligned_data[symbol] = df.set_index("date")
 
+        # pending_orders: signals queued at bar T, to be filled at bar T+1 open.
+        # { symbol -> [{"direction", "qty", "signal_info", "queued_at"}] }
+        pending_orders: Dict[str, list] = {}
+
         for current_time in unique_dates:
-            # 1. Process open positions (check stops/targets hit in this candle)
+            # 1. Fill any orders queued at the previous bar — at this bar's open.
+            for symbol, orders in list(pending_orders.items()):
+                df_sym = aligned_data.get(symbol)
+                if df_sym is None or current_time not in df_sym.index:
+                    continue
+                next_open = float(df_sym.loc[current_time, "open"])
+                for order in orders:
+                    if symbol not in self.broker.positions:
+                        self.broker.place_market_order(
+                            symbol=symbol,
+                            direction=order["direction"],
+                            quantity=order["qty"],
+                            price=next_open,  # filled at next bar's open
+                            timestamp=current_time,
+                            signal_info=order["signal_info"],
+                        )
+                del pending_orders[symbol]
+
+            # 2. Process open positions (check stops/targets hit in this candle)
             for symbol in list(self.broker.positions.keys()):
                 df_sym = aligned_data.get(symbol)
                 if df_sym is not None and current_time in df_sym.index:
-                    candle = df_sym.loc[current_time]
+                    candle = df_sym.loc[current_time].copy()
                     candle["date"] = current_time
                     self.broker.process_candle(symbol, candle)
 
-            # 2. Evaluate strategies on the slice up to current_time
+            # 3. Evaluate strategies on the completed slice up to and including current_time
             for symbol, df_sym in aligned_data.items():
                 if current_time in df_sym.index:
                     slice_df = df_sym.loc[
@@ -70,24 +95,34 @@ class BacktestEngine:
                     if len(slice_df) > 0:
                         signals = self.strategy.calculate_signals(slice_df, symbol)
 
-                        # Process signals
+                        # Queue signals for next-bar execution (avoids look-ahead bias)
                         for signal in signals:
-                            # Simple execution: place market order for entry
                             direction = signal["direction"]
-                            entry_price = signal[
-                                "entryPrice"
-                            ]  # This is the price the strategy assumed
+                            entry_price = signal["entryPrice"]
 
-                            # Simple position sizing: e.g. 1% risk
-                            # But for backtesting, let's keep it simple: use 10% of equity per trade
+                            # Position sizing: 10% of current equity per trade
                             qty = max(1, int((self.broker.cash * 0.1) / entry_price))
 
                             if symbol not in self.broker.positions:
-                                self.broker.place_market_order(
-                                    symbol=symbol,
-                                    direction=direction,
-                                    quantity=qty,
-                                    price=entry_price,  # Use close of this candle
-                                    timestamp=current_time,
-                                    signal_info=signal,
+                                pending_orders.setdefault(symbol, []).append(
+                                    {
+                                        "direction": direction,
+                                        "qty": qty,
+                                        "signal_info": signal,
+                                        "queued_at": current_time,
+                                    }
                                 )
+
+        # 4. End-of-test: liquidate any positions still open at the final bar's close.
+        if unique_dates:
+            last_time = unique_dates[-1]
+            for symbol in list(self.broker.positions.keys()):
+                df_sym = aligned_data.get(symbol)
+                if df_sym is not None and last_time in df_sym.index:
+                    exit_price = float(df_sym.loc[last_time, "close"])
+                    self.broker.close_position(
+                        symbol=symbol,
+                        price=exit_price,
+                        timestamp=last_time,
+                        reason="end_of_test",
+                    )

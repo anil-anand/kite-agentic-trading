@@ -117,6 +117,58 @@ class SimulatedBroker:
 
         return order_id
 
+    def close_position(
+        self,
+        symbol: str,
+        price: float,
+        timestamp: datetime.datetime,
+        reason: str = "forced_close",
+    ) -> None:
+        """
+        Forcibly closes an open position at `price` (e.g. end-of-test liquidation).
+        Applies the same slippage model as place_market_order and records the trade.
+        """
+        if symbol not in self.positions:
+            return
+
+        pos = self.positions[symbol]
+        direction = pos["direction"]
+        quantity = pos["quantity"]
+        entry_price = pos["entry_price"]
+
+        # Apply slippage in the direction adverse to the position
+        slippage_pct = 0.0005
+        if direction == "BUY":
+            exit_price = price * (1 - slippage_pct)
+        else:
+            exit_price = price * (1 + slippage_pct)
+        exit_price = round(exit_price, 2)
+
+        trade_charges = cost_calculator.calculate_trade_charges(
+            direction, entry_price, exit_price, quantity
+        )
+
+        trade_record = {
+            "symbol": symbol,
+            "direction": direction,
+            "entry_time": pos["entry_time"],
+            "exit_time": timestamp,
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+            "quantity": quantity,
+            "mfe": pos["mfe"],
+            "mae": pos["mae"],
+            "signal_info": pos.get("signal_info", {}),
+            "exit_reason": reason,
+        }
+        trade_record.update(trade_charges)
+        self.trades.append(trade_record)
+
+        gross_pnl = trade_charges["gross_pnl"]
+        self.cash += gross_pnl - trade_charges.get("total_fees", 0)
+
+        del self.positions[symbol]
+
     def process_candle(self, symbol: str, candle: pd.Series):
         if symbol not in self.positions:
             return

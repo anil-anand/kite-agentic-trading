@@ -57,7 +57,7 @@ const Dashboard: React.FC = () => {
           netAmount={dashboard?.netPnl}
           percentage={
             ((dashboard?.availableMargin || 0) + (dashboard?.usedMargin || 0)) > 0 
-              ? ((dashboard?.totalPnl || 0) / ((dashboard?.availableMargin || 0) + (dashboard?.usedMargin || 0))) * 100 
+              ? ((dashboard?.netPnl ?? dashboard?.totalPnl ?? 0) / ((dashboard?.availableMargin || 0) + (dashboard?.usedMargin || 0))) * 100 
               : undefined
           } 
         />

@@ -61,25 +61,23 @@ class SecureStorage {
   public saveCredentials(creds: SecureCredentials): void {
     const toSave: Record<string, string> = {};
 
-    try {
-      if (this.isAvailable) {
-        if (creds.apiKey) toSave.apiKey = safeStorage.encryptString(creds.apiKey).toString('base64');
-        if (creds.apiSecret) toSave.apiSecret = safeStorage.encryptString(creds.apiSecret).toString('base64');
-        if (creds.accessToken) toSave.accessToken = safeStorage.encryptString(creds.accessToken).toString('base64');
-        if (creds.llmApiKey) toSave.llmApiKey = safeStorage.encryptString(creds.llmApiKey).toString('base64');
-      } else {
-        console.warn('safeStorage is not available. Saving credentials as base64 with restrictive permissions. Consider this a residual risk on unsupported systems.');
-        if (creds.apiKey) toSave.apiKey = Buffer.from(creds.apiKey, 'utf-8').toString('base64');
-        if (creds.apiSecret) toSave.apiSecret = Buffer.from(creds.apiSecret, 'utf-8').toString('base64');
-        if (creds.accessToken) toSave.accessToken = Buffer.from(creds.accessToken, 'utf-8').toString('base64');
-        if (creds.llmApiKey) toSave.llmApiKey = Buffer.from(creds.llmApiKey, 'utf-8').toString('base64');
-      }
-
-      // Write with restrictive permissions (0o600)
-      fs.writeFileSync(SECRETS_FILE, JSON.stringify(toSave, null, 2), { mode: 0o600 });
-    } catch (e) {
-      console.error('Failed to save secure credentials', e);
+    if (this.isAvailable) {
+      if (creds.apiKey) toSave.apiKey = safeStorage.encryptString(creds.apiKey).toString('base64');
+      if (creds.apiSecret) toSave.apiSecret = safeStorage.encryptString(creds.apiSecret).toString('base64');
+      if (creds.accessToken) toSave.accessToken = safeStorage.encryptString(creds.accessToken).toString('base64');
+      if (creds.llmApiKey) toSave.llmApiKey = safeStorage.encryptString(creds.llmApiKey).toString('base64');
+    } else {
+      console.warn('safeStorage is not available. Saving credentials as base64 with restrictive permissions. Consider this a residual risk on unsupported systems.');
+      if (creds.apiKey) toSave.apiKey = Buffer.from(creds.apiKey, 'utf-8').toString('base64');
+      if (creds.apiSecret) toSave.apiSecret = Buffer.from(creds.apiSecret, 'utf-8').toString('base64');
+      if (creds.accessToken) toSave.accessToken = Buffer.from(creds.accessToken, 'utf-8').toString('base64');
+      if (creds.llmApiKey) toSave.llmApiKey = Buffer.from(creds.llmApiKey, 'utf-8').toString('base64');
     }
+
+    // Write with restrictive permissions (0o600).
+    // Do NOT catch here: callers must know if the save failed so they never
+    // delete a legacy copy before confirming the new write succeeded.
+    fs.writeFileSync(SECRETS_FILE, JSON.stringify(toSave, null, 2), { mode: 0o600 });
   }
 
   public updateCredentials(updates: Partial<SecureCredentials>): void {

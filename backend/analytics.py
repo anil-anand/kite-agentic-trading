@@ -362,7 +362,10 @@ class TradeAnalytics:
             # kiteconnect returns 'date' as a datetime object or string
             dt = c["date"]
             if isinstance(dt, str):
-                dt = datetime.fromisoformat(dt.replace("+05:30", ""))
+                # Preserve the ISO offset — stripping it would produce a naive
+                # datetime that timestamp() interprets in the host timezone,
+                # shifting all candles by 5.5 h on a UTC server.
+                dt = datetime.fromisoformat(dt)
 
             formatted_candles.append(
                 {

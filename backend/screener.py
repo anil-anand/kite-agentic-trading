@@ -99,7 +99,9 @@ class DynamicScreener:
                 )
 
             if not scored_stocks:
-                return universe[:limit]
+                # All candidates failed the liquidity/volume filters.
+                # Return empty rather than letting the rejected instruments through.
+                return []
 
             # Normalization (Min-Max Scaling)
             def normalize(items, key):

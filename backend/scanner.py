@@ -188,7 +188,7 @@ class Scanner:
                 decision = playbook.evaluate_entry(raw_signals, regime_state)
                 if decision:
                     est_prob, sample_size = calibrator.get_probability(
-                        f"playbook_{playbook.get_name()}", decision["signal_score"]
+                        playbook.get_name(), decision["signal_score"]
                     )
 
                     decision.update(

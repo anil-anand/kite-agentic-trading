@@ -27,11 +27,19 @@ class AgentGateway:
 
         try:
             proposal = json.loads(llm_output)
-            decision["proposal"] = proposal
         except json.JSONDecodeError:
             decision["reason"] = "Malformed output: Not valid JSON"
             self._audit_log(model_info, llm_output, decision)
             return decision
+
+        if not isinstance(proposal, dict):
+            decision["reason"] = (
+                "Malformed output: JSON must be an object, not array/null/scalar"
+            )
+            self._audit_log(model_info, llm_output, decision)
+            return decision
+
+        decision["proposal"] = proposal
 
         symbol = proposal.get("tradingsymbol")
         direction = proposal.get("direction")
@@ -102,6 +110,16 @@ class AgentGateway:
             self._audit_log(model_info, llm_output, decision)
             return decision
 
+        # Recompute quantity using the deterministic risk sizing path to enforce
+        # the configured per-trade risk budget; treat the LLM's quantity as advisory.
+        sized_quantity = risk_manager.calculate_position_size(price, stop_loss)
+        if sized_quantity <= 0:
+            decision["reason"] = "Risk manager returned zero position size"
+            self._audit_log(model_info, llm_output, decision)
+            return decision
+        # Clamp: never exceed what the LLM requested, and always use the risk-sized value.
+        quantity = min(quantity, sized_quantity)
+
         candidate_signal = {
             "id": str(uuid.uuid4()),
             "tradingsymbol": symbol,
@@ -113,7 +131,8 @@ class AgentGateway:
             "strategy": "llm_agent",
             "reasoning": proposal.get("reasoning", ""),
             "signal_score": 100,
-            "estimated_probability": 0.8,
+            # estimated_probability is intentionally omitted: the normal calibration
+            # pipeline will populate it only when statistically backed.
         }
 
         try:

@@ -44,6 +44,9 @@ class BrokerGateway:
         self.consecutive_failures = 0
         self.circuit_open = False
         self.circuit_open_time = 0.0
+        # HALF_OPEN: one probe request is in-flight; circuit_open remains True
+        # until the probe succeeds (→ CLOSED) or fails (→ OPEN with fresh timestamp).
+        self.circuit_half_open = False
 
     def _update_tokens(self):
         now = time.time()
@@ -86,8 +89,20 @@ class BrokerGateway:
             if self.circuit_open:
                 now = time.time()
                 if now - self.circuit_open_time > self.circuit_breaker_reset_seconds:
-                    # Half-open: let the request through to see if it succeeds
-                    pass
+                    if not self.circuit_half_open:
+                        # Transition to HALF_OPEN: allow a single probe through.
+                        self.circuit_half_open = True
+                        push_log(
+                            "Circuit breaker entering HALF_OPEN — sending probe request.",
+                            level="info",
+                        )
+                        return  # let this request through
+                    else:
+                        # A probe is already in-flight; block non-critical requests.
+                        if priority > Priority.CRITICAL:
+                            raise Exception(
+                                "Circuit breaker is HALF_OPEN. Probe already in-flight; rejecting non-critical request."
+                            )
                 else:
                     if priority > Priority.CRITICAL:
                         raise Exception(
@@ -97,14 +112,25 @@ class BrokerGateway:
     def _record_success(self):
         with self._lock:
             if self.circuit_open:
-                push_log("Circuit breaker reset to CLOSED.", level="info")
+                push_log(
+                    "Circuit breaker probe succeeded — reset to CLOSED.", level="info"
+                )
             self.circuit_open = False
+            self.circuit_half_open = False
             self.consecutive_failures = 0
 
     def _record_failure(self):
         with self._lock:
             self.consecutive_failures += 1
-            if (
+            if self.circuit_half_open:
+                # Probe failed: reopen with a fresh timestamp so the timer resets.
+                self.circuit_half_open = False
+                self.circuit_open_time = time.time()
+                push_log(
+                    "Circuit breaker probe FAILED — reopened with fresh timer.",
+                    level="error",
+                )
+            elif (
                 self.consecutive_failures >= self.circuit_breaker_threshold
                 and not self.circuit_open
             ):
