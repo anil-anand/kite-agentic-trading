@@ -173,9 +173,11 @@ class Scanner:
                         s["family"] = self.family_mapping.get(strat_id)
                     raw_signals.extend(signals)
 
+            from .strategies.breakout_evidence import BreakoutEvidence
             from .strategies.oscillator_evidence import OscillatorEvidence
 
             raw_signals = OscillatorEvidence.aggregate(raw_signals)
+            raw_signals = BreakoutEvidence.aggregate(raw_signals, df)
 
             # 2. Gating and Aggregation
             symbol_aggregated_signals = []
@@ -280,9 +282,11 @@ class Scanner:
             except Exception:
                 pass  # Skip individual strategy failures silently
 
+        from .strategies.breakout_evidence import BreakoutEvidence
         from .strategies.oscillator_evidence import OscillatorEvidence
 
         aggregated_signals = OscillatorEvidence.aggregate(raw_signals)
+        aggregated_signals = BreakoutEvidence.aggregate(aggregated_signals, df)
 
         buy_signals = 0
         sell_signals = 0
