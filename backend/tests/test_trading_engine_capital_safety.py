@@ -124,6 +124,11 @@ class FakeRiskManager:
     def set_open_positions(self, count):
         self.open_positions = count
 
+    def can_accept_position(
+        self, symbol, direction, qty, price, active_trades, open_orders
+    ):
+        return True, "OK"
+
     def update_pnl(self, pnl):
         self.daily_pnl += pnl
         self.pnl_updates.append(pnl)

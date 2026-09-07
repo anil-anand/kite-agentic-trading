@@ -35,6 +35,13 @@ class ConfigManager:
                 "positionRevalBreakevenMins": 45,
                 "stopOrderType": "SL",
                 "haltAutoTradesOnStopFailure": True,
+                "maxGrossExposure": 200000,
+                "maxNetExposure": 100000,
+                "maxSingleSymbolExposure": 50000,
+                "maxSectorExposure": 75000,
+                "maxCorrelatedExposure": 75000,
+                "correlationThreshold": 0.70,
+                "correlationLookbackDays": 30,
             },
             "strategies": {
                 "evaluateOnIncompleteCandle": False,

@@ -70,6 +70,11 @@ class FakeRiskManager:
     def can_trade(self):
         return True, "OK"
 
+    def can_accept_position(
+        self, symbol, direction, qty, price, active_trades, open_orders
+    ):
+        return True, "OK"
+
     def set_open_positions(self, count):
         pass
 
