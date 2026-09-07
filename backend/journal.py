@@ -67,7 +67,25 @@ class TradeJournal:
                     confluence_snapshot TEXT,
                     indicator_snapshot TEXT,
                     universe_version TEXT,
-                    screener_ranking INTEGER
+                    screener_ranking INTEGER,
+                    market_regime TEXT,
+                    strategy_family TEXT,
+                    production_playbook TEXT,
+                    raw_evidence TEXT,
+                    feature_values TEXT,
+                    signal_time TIMESTAMP,
+                    candle_time TIMESTAMP,
+                    entry_quote REAL,
+                    exit_quote REAL,
+                    stop_distance REAL,
+                    target_distance REAL,
+                    initial_r REAL,
+                    realized_r REAL,
+                    mae REAL,
+                    mfe REAL,
+                    holding_time_seconds INTEGER,
+                    screener_score REAL,
+                    strategy_version TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS trade_events (
@@ -114,6 +132,24 @@ class TradeJournal:
                 "other_fees REAL",
                 "slippage REAL",
                 "signal_entry_price REAL",
+                "market_regime TEXT",
+                "strategy_family TEXT",
+                "production_playbook TEXT",
+                "raw_evidence TEXT",
+                "feature_values TEXT",
+                "signal_time TIMESTAMP",
+                "candle_time TIMESTAMP",
+                "entry_quote REAL",
+                "exit_quote REAL",
+                "stop_distance REAL",
+                "target_distance REAL",
+                "initial_r REAL",
+                "realized_r REAL",
+                "mae REAL",
+                "mfe REAL",
+                "holding_time_seconds INTEGER",
+                "screener_score REAL",
+                "strategy_version TEXT",
             ]
             for col in new_columns:
                 try:
@@ -143,6 +179,19 @@ class TradeJournal:
         universe_version: Optional[str] = None,
         screener_ranking: Optional[int] = None,
         signal_entry_price: Optional[float] = None,
+        market_regime: Optional[str] = None,
+        strategy_family: Optional[str] = None,
+        production_playbook: Optional[str] = None,
+        raw_evidence: Optional[str] = None,
+        feature_values: Optional[str] = None,
+        signal_time: Optional[str] = None,
+        candle_time: Optional[str] = None,
+        entry_quote: Optional[float] = None,
+        screener_score: Optional[float] = None,
+        strategy_version: Optional[str] = None,
+        stop_distance: Optional[float] = None,
+        target_distance: Optional[float] = None,
+        initial_r: Optional[float] = None,
     ):
         """Record a newly opened trade."""
         conn = self._get_conn()
@@ -159,8 +208,11 @@ class TradeJournal:
                 signal_id, reasoning, confidence, estimated_probability, calibration_sample_size,
                 entry_price, quantity, stop_loss, target, entry_time, status, confluence_snapshot, indicator_snapshot,
                 universe_version, screener_ranking, signal_entry_price,
-                gross_pnl, net_pnl, brokerage, taxes, exchange_charges, other_fees, slippage
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                gross_pnl, net_pnl, brokerage, taxes, exchange_charges, other_fees, slippage,
+                market_regime, strategy_family, production_playbook, raw_evidence, feature_values,
+                signal_time, candle_time, entry_quote, screener_score, strategy_version,
+                stop_distance, target_distance, initial_r
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         params = (
             trade_id,
@@ -184,6 +236,19 @@ class TradeJournal:
             universe_version,
             screener_ranking,
             signal_entry_price,
+            market_regime,
+            strategy_family,
+            production_playbook,
+            raw_evidence,
+            feature_values,
+            signal_time,
+            candle_time,
+            entry_quote,
+            screener_score,
+            strategy_version,
+            stop_distance,
+            target_distance,
+            initial_r,
         )
 
         with conn:
@@ -226,6 +291,11 @@ class TradeJournal:
         exit_reason: str,
         exit_time: Optional[str] = None,
         cost_details: Optional[Dict[str, Any]] = None,
+        exit_quote: Optional[float] = None,
+        realized_r: Optional[float] = None,
+        mae: Optional[float] = None,
+        mfe: Optional[float] = None,
+        holding_time_seconds: Optional[int] = None,
     ):
         """Mark a trade as closed and record its outcome."""
         conn = self._get_conn()
@@ -279,7 +349,8 @@ class TradeJournal:
             UPDATE trades
             SET status = 'CLOSED', exit_price = ?, exit_time = ?, exit_reason = ?, pnl = ?,
                 gross_pnl = ?, net_pnl = ?, brokerage = ?, taxes = ?, exchange_charges = ?,
-                other_fees = ?, slippage = ?
+                other_fees = ?, slippage = ?,
+                exit_quote = ?, realized_r = ?, mae = ?, mfe = ?, holding_time_seconds = ?
             WHERE id = ?
         """
         with conn:
@@ -297,6 +368,11 @@ class TradeJournal:
                     exchange_charges,
                     other_fees,
                     slippage,
+                    exit_quote,
+                    realized_r,
+                    mae,
+                    mfe,
+                    holding_time_seconds,
                     trade_id,
                 ),
             )
@@ -315,6 +391,11 @@ class TradeJournal:
         exit_reason: str,
         exit_time: str,
         cost_details: Optional[Dict[str, Any]] = None,
+        exit_quote: Optional[float] = None,
+        realized_r: Optional[float] = None,
+        mae: Optional[float] = None,
+        mfe: Optional[float] = None,
+        holding_time_seconds: Optional[int] = None,
     ):
         """Update an already closed or unreconciled trade with actual execution details."""
         conn = self._get_conn()
@@ -357,7 +438,8 @@ class TradeJournal:
             UPDATE trades
             SET exit_price = ?, exit_time = ?, exit_reason = ?, pnl = ?,
                 gross_pnl = ?, net_pnl = ?, brokerage = ?, taxes = ?, exchange_charges = ?,
-                other_fees = ?, slippage = ?
+                other_fees = ?, slippage = ?,
+                exit_quote = ?, realized_r = ?, mae = ?, mfe = ?, holding_time_seconds = ?
             WHERE id = ?
         """
         with conn:
@@ -375,6 +457,11 @@ class TradeJournal:
                     exchange_charges,
                     other_fees,
                     slippage,
+                    exit_quote,
+                    realized_r,
+                    mae,
+                    mfe,
+                    holding_time_seconds,
                     trade_id,
                 ),
             )

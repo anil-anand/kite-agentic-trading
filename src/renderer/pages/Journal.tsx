@@ -219,12 +219,35 @@ const Journal: React.FC = () => {
                                 </h4>
                                 <div className="bg-surface-800 p-4 rounded-lg border border-surface-700 text-sm text-surface-200 space-y-3">
                                   <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Reasoning</span> {t.reasoning || 'N/A'}</p>
-                                  <div className="grid grid-cols-2 gap-4 pt-2 border-t border-surface-700/50">
-                                    <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Confidence</span> {(t.signal_score ?? (t as any).signalScore) != null ? `${t.signal_score ?? (t as any).signalScore}%` : 'N/A'}</p>
-                                    {(t.estimated_probability != null || (t as any).estimatedProbability != null) && (
-                                      <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Calibrated Prob</span> {((t.estimated_probability ?? (t as any).estimatedProbability) * 100).toFixed(1)}% <span className="text-[10px] text-surface-400 opacity-80">(n={t.calibration_sample_size ?? (t as any).calibrationSampleSize})</span></p>
+                                    <div className="grid grid-cols-2 gap-4 pt-2 border-t border-surface-700/50">
+                                      <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Confidence</span> {(t.signal_score ?? (t as any).signalScore) != null ? `${t.signal_score ?? (t as any).signalScore}%` : 'N/A'}</p>
+                                      {(t.estimated_probability != null || (t as any).estimatedProbability != null) && (
+                                        <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Calibrated Prob</span> {((t.estimated_probability ?? (t as any).estimatedProbability) * 100).toFixed(1)}% <span className="text-[10px] text-surface-400 opacity-80">(n={t.calibration_sample_size ?? (t as any).calibrationSampleSize})</span></p>
+                                      )}
+                                    </div>
+                                    {(t.market_regime || t.strategy_family || t.production_playbook || t.screener_score != null) && (
+                                      <div className="grid grid-cols-2 gap-4 pt-2 border-t border-surface-700/50">
+                                        {t.market_regime && <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Market Regime</span> {t.market_regime}</p>}
+                                        {t.strategy_family && <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Strategy Family</span> {t.strategy_family}</p>}
+                                        {t.production_playbook && <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Playbook</span> {t.production_playbook}</p>}
+                                        {t.screener_score != null && <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Screener Score</span> {t.screener_score.toFixed(2)}</p>}
+                                      </div>
                                     )}
-                                  </div>
+                                    {(t.target_distance != null || t.stop_distance != null || t.initial_r != null) && (
+                                      <div className="grid grid-cols-3 gap-4 pt-2 border-t border-surface-700/50">
+                                        {t.target_distance != null && <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Target Dist</span> {t.target_distance.toFixed(2)}</p>}
+                                        {t.stop_distance != null && <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Stop Dist</span> {t.stop_distance.toFixed(2)}</p>}
+                                        {t.initial_r != null && <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Initial R</span> {t.initial_r.toFixed(2)}</p>}
+                                      </div>
+                                    )}
+                                    {(t.realized_r != null || t.mae != null || t.mfe != null || t.holding_time_seconds != null) && (
+                                      <div className="grid grid-cols-4 gap-2 pt-2 border-t border-surface-700/50">
+                                        {t.realized_r != null && <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Realized R</span> <span className={t.realized_r >= 0 ? 'text-profit-light' : 'text-loss-light'}>{t.realized_r.toFixed(2)}</span></p>}
+                                        {t.mae != null && <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">MAE</span> {t.mae.toFixed(2)}</p>}
+                                        {t.mfe != null && <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">MFE</span> {t.mfe.toFixed(2)}</p>}
+                                        {t.holding_time_seconds != null && <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Hold Time</span> {(t.holding_time_seconds / 60).toFixed(1)}m</p>}
+                                      </div>
+                                    )}
                                   {t.exit_reason && (
                                     <div className="pt-2 border-t border-surface-700/50">
                                       <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Exit Reason</span> {t.exit_reason}</p>
