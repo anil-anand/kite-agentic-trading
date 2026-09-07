@@ -206,7 +206,7 @@ export interface Signal {
   direction: SignalDirection;
   signal_score: number;
   estimated_probability?: number;
-  calibration_sample_size?: number; // 0-100
+  calibration_sample_size?: number; // count of historical trades used for calibration
   entryPrice: number;
   stopLoss: number;
   target: number;

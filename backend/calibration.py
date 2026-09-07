@@ -24,46 +24,48 @@ class ProbabilityCalibrator:
         Success is defined as trade exiting with at least +0.9R profit.
         """
         conn = self._get_conn()
+        try:
+            # We bucket the score in groups of 10 for adequate sample sizes
+            bucket_min = (signal_score // 10) * 10
+            bucket_max = bucket_min + 9
 
-        # We bucket the score in groups of 10 for adequate sample sizes
-        bucket_min = (signal_score // 10) * 10
-        bucket_max = bucket_min + 9
+            query = """
+                SELECT direction, entry_price, target, stop_loss, exit_price
+                FROM trades
+                WHERE status = 'CLOSED'
+                  AND strategy = ?
+                  AND confidence >= ? AND confidence <= ?
+            """
+            rows = conn.execute(query, (strategy, bucket_min, bucket_max)).fetchall()
 
-        query = """
-            SELECT direction, entry_price, target, stop_loss, exit_price
-            FROM trades
-            WHERE status = 'CLOSED'
-              AND strategy = ?
-              AND confidence >= ? AND confidence <= ?
-        """
-        rows = conn.execute(query, (strategy, bucket_min, bucket_max)).fetchall()
+            sample_size = len(rows)
+            if sample_size < 10:
+                return None, sample_size
 
-        sample_size = len(rows)
-        if sample_size < 10:
-            return None, sample_size
+            successes = 0
+            for r in rows:
+                if not r["entry_price"] or not r["stop_loss"] or not r["exit_price"]:
+                    continue
 
-        successes = 0
-        for r in rows:
-            if not r["entry_price"] or not r["stop_loss"] or not r["exit_price"]:
-                continue
+                risk = abs(r["entry_price"] - r["stop_loss"])
+                if risk == 0:
+                    continue
 
-            risk = abs(r["entry_price"] - r["stop_loss"])
-            if risk == 0:
-                continue
+                pnl_per_share = (
+                    (r["exit_price"] - r["entry_price"])
+                    if r["direction"] == "BUY"
+                    else (r["entry_price"] - r["exit_price"])
+                )
+                r_multiple = pnl_per_share / risk
 
-            pnl_per_share = (
-                (r["exit_price"] - r["entry_price"])
-                if r["direction"] == "BUY"
-                else (r["entry_price"] - r["exit_price"])
-            )
-            r_multiple = pnl_per_share / risk
+                # Reached roughly +1R target (allowing for some slippage)
+                if r_multiple >= 0.9:
+                    successes += 1
 
-            # Reached roughly +1R target (allowing for some slippage)
-            if r_multiple >= 0.9:
-                successes += 1
-
-        prob = successes / sample_size
-        return prob, sample_size
+            prob = successes / sample_size
+            return prob, sample_size
+        finally:
+            conn.close()
 
 
 calibrator = ProbabilityCalibrator()
