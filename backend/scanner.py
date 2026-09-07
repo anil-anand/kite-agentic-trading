@@ -173,6 +173,10 @@ class Scanner:
                         s["family"] = self.family_mapping.get(strat_id)
                     raw_signals.extend(signals)
 
+            from .strategies.oscillator_evidence import OscillatorEvidence
+
+            raw_signals = OscillatorEvidence.aggregate(raw_signals)
+
             # 2. Gating and Aggregation
             symbol_aggregated_signals = []
             for playbook in self.playbooks:
@@ -261,10 +265,7 @@ class Scanner:
 
         regime_info = regime_classifier.classify(df)
 
-        buy_signals = 0
-        sell_signals = 0
-        triggered_strategies = []
-
+        raw_signals = []
         for strat_id, strategy in self.strategies.items():
             config = strategy_config.get(strat_id, {})
             if not config.get("enabled", False):
@@ -273,25 +274,37 @@ class Scanner:
             try:
                 signals = strategy.calculate_signals(df, tradingsymbol)
                 for sig in signals:
-                    family = self.family_mapping.get(strat_id, "unknown")
-                    direction = sig.get("direction")
-                    if direction in ("BUY", "SELL"):
-                        if direction == "BUY":
-                            buy_signals += 1
-                        else:
-                            sell_signals += 1
-                        triggered_strategies.append(
-                            {
-                                "strategy": strat_id,
-                                "family": family,
-                                "direction": direction,
-                                "signal_score": sig.get("signal_score", 0),
-                                "timestamp": sig.get("timestamp"),
-                                "indicator_snapshot": sig.get("indicators", {}),
-                            }
-                        )
+                    sig["strategy_id"] = strat_id
+                    sig["family"] = self.family_mapping.get(strat_id, "unknown")
+                raw_signals.extend(signals)
             except Exception:
                 pass  # Skip individual strategy failures silently
+
+        from .strategies.oscillator_evidence import OscillatorEvidence
+
+        aggregated_signals = OscillatorEvidence.aggregate(raw_signals)
+
+        buy_signals = 0
+        sell_signals = 0
+        triggered_strategies = []
+
+        for sig in aggregated_signals:
+            direction = sig.get("direction")
+            if direction in ("BUY", "SELL"):
+                if direction == "BUY":
+                    buy_signals += 1
+                else:
+                    sell_signals += 1
+                triggered_strategies.append(
+                    {
+                        "strategy": sig.get("strategy_id"),
+                        "family": sig.get("family", "unknown"),
+                        "direction": direction,
+                        "signal_score": sig.get("signal_score", 0),
+                        "timestamp": sig.get("timestamp"),
+                        "indicator_snapshot": sig.get("indicators", {}),
+                    }
+                )
 
         return {
             "regime": regime_info["regime"],
