@@ -515,9 +515,13 @@ class TradingEngine:
                     0, available_margin - self._reserved_entry_margin
                 )
 
-                qty = risk_manager.calculate_position_size(
-                    entry_price, signal["stopLoss"], available_margin
-                )
+                llm_qty = signal.get("quantity")
+                if llm_qty is not None and isinstance(llm_qty, int) and llm_qty > 0:
+                    qty = llm_qty
+                else:
+                    qty = risk_manager.calculate_position_size(
+                        entry_price, signal["stopLoss"], available_margin
+                    )
                 if qty <= 0:
                     self._push_log(
                         f"Cannot execute signal {signal['id']}: insufficient available margin",
