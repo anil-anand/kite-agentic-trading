@@ -208,6 +208,33 @@ const AgentControl: React.FC = () => {
                       <span className="text-xs font-mono text-surface-400">Avg {group.avgSignalScore}%</span>
                     </div>
 
+                    {(() => {
+                      const probRaw = bestSignal.estimated_probability ?? (bestSignal as any).estimatedProbability;
+                      const isCalibrated = probRaw !== null && probRaw !== undefined;
+                      const prob = isCalibrated ? probRaw : 0;
+                      const isProbHigh = isCalibrated ? prob >= 0.60 : true; // Uncalibrated is allowed to explore
+                      const willAutoEnter = agentState.mode === 'auto' && isProbHigh;
+                      const autoEnterReason = agentState.mode !== 'auto' 
+                        ? 'Mode is not Auto' 
+                        : !isCalibrated 
+                          ? 'Exploring (Uncalibrated)'
+                          : !isProbHigh 
+                            ? `Prob < 60% (${(prob * 100).toFixed(1)}%)` 
+                            : 'Meets criteria';
+                          
+                      return (
+                        <div className="flex items-center justify-between mt-1 p-2 bg-surface-900 rounded border border-surface-700">
+                          <span className="text-xs text-surface-400">Will Auto-Enter:</span>
+                          <div className="flex items-center gap-1.5">
+                            <span className={`text-xs font-bold ${willAutoEnter ? 'text-profit-light' : 'text-surface-400'}`}>
+                              {willAutoEnter ? 'YES' : 'NO'}
+                            </span>
+                            <span className="text-[10px] text-surface-500">({autoEnterReason})</span>
+                          </div>
+                        </div>
+                      );
+                    })()}
+
                     <div className="flex gap-2 mt-2 pt-3 border-t border-surface-700">
                       <button 
                         onClick={() => {

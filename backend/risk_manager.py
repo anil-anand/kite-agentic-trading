@@ -359,6 +359,8 @@ class RiskManager:
                 add_exposure(sym, val, is_buy)
 
         for order in open_orders:
+            if order.get("status", "").upper() not in ["OPEN", "TRIGGER PENDING"]:
+                continue
             sym = order.get("tradingsymbol")
             q = float(order.get("quantity", 0)) - float(order.get("filled_quantity", 0))
             p = float(order.get("price", 0.0))

@@ -445,10 +445,10 @@ class TradingEngine:
 
             if signal["signal_score"] >= 70:
                 self._push_signal(signal)
+                prob = signal.get("estimated_probability")
                 if (
                     self.mode == "auto"
-                    and signal.get("estimated_probability") is not None
-                    and signal["estimated_probability"] >= 0.60
+                    and (prob is None or prob >= 0.60)
                     and can_trade
                 ):
                     symbol = signal["tradingsymbol"]
