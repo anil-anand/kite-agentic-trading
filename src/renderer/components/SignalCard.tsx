@@ -54,10 +54,10 @@ const SignalCard: React.FC<Props> = ({ signal, onTakeTrade, onDismiss, compact =
       <div className="flex flex-col gap-1 mt-2">
         <div className="flex items-center justify-between">
           <span className="text-xs text-surface-400">Signal Score</span>
-          <span className="text-xs font-mono text-surface-400">{signal.signal_score || (signal as any).signalScore || 0}/100</span>
+          <span className="text-xs font-mono text-surface-400">{signal.signal_score ?? (signal as any).signalScore ?? 0}/100</span>
         </div>
         <div className="h-1 bg-surface-700 rounded-full overflow-hidden mt-1">
-          <div className="h-full bg-surface-500" style={{ width: `${signal.signal_score || (signal as any).signalScore || 0}%` }}></div>
+          <div className="h-full bg-surface-500" style={{ width: `${signal.signal_score ?? (signal as any).signalScore ?? 0}%` }}></div>
         </div>
         
         {(signal.estimated_probability != null || (signal as any).estimatedProbability != null) && (

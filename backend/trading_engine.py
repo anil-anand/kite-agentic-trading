@@ -1501,7 +1501,7 @@ class TradingEngine:
 
         # Sort by time
         matched_trades.sort(
-            key=lambda x: (
+            key=lambda x: str(
                 x[0].get("fillTimestamp") or x[0].get("exchangeTimestamp") or ""
             )
         )

@@ -70,7 +70,7 @@ const AgentControl: React.FC = () => {
     return Object.values(groups)
       .map(group => {
         group.confluenceScore = group.signals.length;
-        const totalScore = group.signals.reduce((acc, s) => acc + (s.signal_score || (s as any).signalScore || 0), 0);
+        const totalScore = group.signals.reduce((acc, s) => acc + (s.signal_score ?? (s as any).signalScore ?? 0), 0);
         group.avgSignalScore = group.confluenceScore > 0 ? Math.round(totalScore / group.confluenceScore) : 0;
         return group;
       })
@@ -161,7 +161,7 @@ const AgentControl: React.FC = () => {
               <div className="text-center text-surface-400 mt-10">No active signals</div>
             ) : (
               groupedSignals.map(group => {
-                const bestSignal = group.signals.reduce((prev, current) => ((prev.signal_score || (prev as any).signalScore || 0) > (current.signal_score || (current as any).signalScore || 0)) ? prev : current);
+                const bestSignal = group.signals.reduce((prev, current) => ((prev.signal_score ?? (prev as any).signalScore ?? 0) > (current.signal_score ?? (current as any).signalScore ?? 0)) ? prev : current);
                 const isBuy = group.direction === 'BUY';
 
                 return (

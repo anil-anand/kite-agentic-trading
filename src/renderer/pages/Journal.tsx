@@ -215,7 +215,7 @@ const Journal: React.FC = () => {
                                 <div className="bg-surface-800 p-4 rounded-lg border border-surface-700 text-sm text-surface-200 space-y-3">
                                   <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Reasoning</span> {t.reasoning || 'N/A'}</p>
                                   <div className="grid grid-cols-2 gap-4 pt-2 border-t border-surface-700/50">
-                                    <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Confidence</span> {(t.signal_score || (t as any).signalScore) ? `${t.signal_score || (t as any).signalScore}%` : 'N/A'}</p>
+                                    <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Confidence</span> {(t.signal_score ?? (t as any).signalScore) != null ? `${t.signal_score ?? (t as any).signalScore}%` : 'N/A'}</p>
                                     {(t.estimated_probability != null || (t as any).estimatedProbability != null) && (
                                       <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Calibrated Prob</span> {((t.estimated_probability ?? (t as any).estimatedProbability) * 100).toFixed(1)}% <span className="text-[10px] text-surface-400 opacity-80">(n={t.calibration_sample_size ?? (t as any).calibrationSampleSize})</span></p>
                                     )}

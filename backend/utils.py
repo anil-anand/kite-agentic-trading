@@ -8,8 +8,6 @@ stdout_lock = threading.Lock()
 
 
 def push_log(message: str, level: str = "info"):
-    from .utils import DateTimeEncoder
-
     event = {
         "event": "log:entry",
         "data": {

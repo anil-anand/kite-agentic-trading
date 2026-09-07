@@ -110,7 +110,7 @@ class RiskManager:
             return False, "Reconciliation with broker failed"
 
         config = config_manager.get_risk_config()
-        now = datetime.datetime.now().time()
+        now = get_ist_now().time()
 
         start_trade_after_str = config.get("startTradeAfter", "09:45")
         try:
