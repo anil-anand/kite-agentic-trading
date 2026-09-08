@@ -422,3 +422,32 @@ def test_llm_post_mortem_returns_analysis_when_cache_write_fails(
     assert "error" not in res
     assert res["analysis"] == "This is a post-mortem analysis."
     assert res["cached"] is False
+
+
+@patch("backend.config.config_manager.get_credentials")
+@patch("backend.config.config_manager.get_llm_settings")
+@patch("backend.analytics.OpenAICompatibleClient.generate")
+def test_llm_post_mortem_empty_response_not_cached(
+    mock_generate, mock_get_llm_settings, mock_get_credentials, temp_db
+):
+    """An empty/whitespace-only LLM response must not be cached, and should retry."""
+    mock_get_credentials.return_value = {"llmApiKey": "fake_key"}
+    mock_get_llm_settings.return_value = {
+        "provider": "Gemini",
+        "baseUrl": "https://example.test/v1",
+        "model": "gemini-2.5-flash",
+    }
+
+    _prepare_trade_events_table(temp_db)
+    analytics = TradeAnalytics(db_path=temp_db)
+
+    mock_generate.return_value = "   "
+    empty = analytics.generate_llm_post_mortem("1")
+    assert "error" in empty
+    assert "cached" not in empty
+
+    mock_generate.return_value = "A real analysis."
+    recovered = analytics.generate_llm_post_mortem("1")
+    assert recovered["analysis"] == "A real analysis."
+    assert recovered["cached"] is False
+    assert mock_generate.call_count == 2

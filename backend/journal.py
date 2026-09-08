@@ -64,6 +64,17 @@ class TradeJournal:
                     details TEXT,
                     FOREIGN KEY(trade_id) REFERENCES trades(id)
                 );
+
+                CREATE TABLE IF NOT EXISTS llm_post_mortems (
+                    trade_id TEXT PRIMARY KEY,
+                    cache_key TEXT,
+                    provider TEXT,
+                    model TEXT,
+                    prompt_version TEXT,
+                    analysis TEXT,
+                    created_at TIMESTAMP,
+                    FOREIGN KEY(trade_id) REFERENCES trades(id)
+                );
             """)
 
     def open_trade(
