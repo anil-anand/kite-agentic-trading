@@ -1,3 +1,5 @@
+import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 from kiteconnect import KiteConnect
@@ -104,12 +106,41 @@ class KiteClient:
     ) -> str:
         from .config import config_manager
 
+        # A short client-side idempotency tag lets the reconciler distinguish
+        # this order from previous orders with the same symbol/side/qty.
+        # Kite's `tag` field is free-form; we use the last 8 chars of a UUID.
+        idempotency_tag = f"ag{uuid.uuid4().hex[-6:]}"
+        placed_at = datetime.now(timezone.utc)
+
         def reconciler():
-            # Check if order was placed despite timeout
+            # Check if order was placed despite timeout.
+            # Narrow by tag first; fall back to attribute match + time window.
             orders = broker_gateway.execute(
                 self.kite.orders, priority=Priority.RECONCILE
             )
             for o in orders:
+                if str(o.get("tag", "")) == idempotency_tag:
+                    return str(o.get("order_id"))
+
+            # Tag may not be echoed by all Kite environments; fall back to
+            # attribute match restricted to orders placed in the last 60 s.
+            cutoff = placed_at
+            for o in orders:
+                ts_str = str(
+                    o.get("order_timestamp") or o.get("exchange_timestamp") or ""
+                )
+                try:
+                    ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                    if ts.tzinfo is None:
+                        # Kite returns IST-naive strings; treat as IST (+05:30)
+                        from datetime import timedelta
+
+                        ts = ts.replace(tzinfo=timezone(timedelta(hours=5, minutes=30)))
+                    if (ts - cutoff).total_seconds() < -60:
+                        continue  # order is too old to be ours
+                except (ValueError, TypeError):
+                    pass  # can't parse timestamp — skip time-window guard
+
                 if (
                     o.get("tradingsymbol") == tradingsymbol
                     and o.get("transaction_type") == transaction_type
@@ -132,6 +163,7 @@ class KiteClient:
             quantity=quantity,
             product=product,
             order_type=order_type,
+            tag=idempotency_tag,
             **kwargs,
         )
         config_manager.add_app_order_id(order_id)

@@ -194,7 +194,35 @@ export interface Margins {
 
 // ─── Trading Signals & Strategy ───────────────────────────────────
 
-export type StrategyName = 'ema_crossover' | 'rsi_reversal' | 'vwap_bounce' | 'supertrend' | 'family_trend' | 'family_mean_reversion' | 'family_breakout';
+export type StrategyName =
+  // Individual scanner strategies (matches Scanner.strategies in scanner.py)
+  | 'ema_crossover'
+  | 'rsi_reversal'
+  | 'vwap_bounce'
+  | 'supertrend'
+  | 'macd_cross'
+  | 'bollinger_breakout'
+  | 'stochastic_reversal'
+  | 'adx_momentum'
+  | 'psar_trend'
+  | 'donchian_breakout'
+  | 'cci_reversal'
+  | 'williams_r'
+  | 'mfi_exhaustion'
+  | 'keltner_breakout'
+  | 'awesome_oscillator'
+  | 'tsi_cross'
+  | 'stoc_rsi'
+  // Playbook aggregates (matches TrendPullbackPlaybook.get_name() etc.)
+  | 'Trend Pullback'
+  | 'Breakout'
+  | 'Mean Reversion'
+  // Family-level aggregated signals
+  | 'family_trend'
+  | 'family_mean_reversion'
+  | 'family_breakout'
+  // LLM agent gateway
+  | 'llm_agent';
 export type SignalDirection = 'BUY' | 'SELL';
 export type AgentMode = 'auto' | 'confirm';
 

@@ -181,7 +181,7 @@ const AgentControl: React.FC = () => {
                     <div className="flex flex-wrap gap-1 mt-1">
                       {group.signals.map(s => (
                         <span key={s.id} className="text-[10px] bg-surface-700 text-surface-300 px-2 py-1 rounded" title={s.reasoning}>
-                          {s.strategy} ({s.signal_score || (s as any).signalScore || 0}%)
+                          {s.strategy} ({s.signal_score ?? (s as any).signalScore ?? 0}%)
                         </span>
                       ))}
                     </div>

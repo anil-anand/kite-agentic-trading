@@ -44,7 +44,15 @@ class SecureStorage {
         if (encrypted.accessToken) creds.accessToken = safeStorage.decryptString(Buffer.from(encrypted.accessToken, 'base64'));
         if (encrypted.llmApiKey) creds.llmApiKey = safeStorage.decryptString(Buffer.from(encrypted.llmApiKey, 'base64'));
       } else {
-        // Fallback: Base64 decoding
+        // Legacy fallback: read credentials written by an older build that used
+        // base64 encoding.  We only support *reading* here so that users can
+        // recover after upgrading; writing in this state is now refused (see
+        // saveCredentials).  Log a prominent warning so it is easy to diagnose.
+        console.warn(
+          '[SecureStorage] safeStorage is not available on this system. '
+          + 'Reading credentials from a legacy base64-encoded file. '
+          + 'Please re-enter your credentials so they can be stored securely.'
+        );
         if (encrypted.apiKey) creds.apiKey = Buffer.from(encrypted.apiKey, 'base64').toString('utf-8');
         if (encrypted.apiSecret) creds.apiSecret = Buffer.from(encrypted.apiSecret, 'base64').toString('utf-8');
         if (encrypted.accessToken) creds.accessToken = Buffer.from(encrypted.accessToken, 'base64').toString('utf-8');
@@ -61,18 +69,21 @@ class SecureStorage {
   public saveCredentials(creds: SecureCredentials): void {
     const toSave: Record<string, string> = {};
 
-    if (this.isAvailable) {
-      if (creds.apiKey) toSave.apiKey = safeStorage.encryptString(creds.apiKey).toString('base64');
-      if (creds.apiSecret) toSave.apiSecret = safeStorage.encryptString(creds.apiSecret).toString('base64');
-      if (creds.accessToken) toSave.accessToken = safeStorage.encryptString(creds.accessToken).toString('base64');
-      if (creds.llmApiKey) toSave.llmApiKey = safeStorage.encryptString(creds.llmApiKey).toString('base64');
-    } else {
-      console.warn('safeStorage is not available. Saving credentials as base64 with restrictive permissions. Consider this a residual risk on unsupported systems.');
-      if (creds.apiKey) toSave.apiKey = Buffer.from(creds.apiKey, 'utf-8').toString('base64');
-      if (creds.apiSecret) toSave.apiSecret = Buffer.from(creds.apiSecret, 'utf-8').toString('base64');
-      if (creds.accessToken) toSave.accessToken = Buffer.from(creds.accessToken, 'utf-8').toString('base64');
-      if (creds.llmApiKey) toSave.llmApiKey = Buffer.from(creds.llmApiKey, 'utf-8').toString('base64');
+    if (!this.isAvailable) {
+      // Refuse to persist credentials when the OS keychain / safeStorage
+      // backend is not available.  Base64 is trivially reversible — storing
+      // Kite and LLM API keys that way is effectively plaintext.
+      throw new Error(
+        'Cannot save credentials: Electron safeStorage encryption is not available on this system. '
+        + 'This can happen when the app is run without a desktop keychain (e.g. in a headless '
+        + 'environment). Please ensure you are running in a supported desktop environment.'
+      );
     }
+
+    if (creds.apiKey) toSave.apiKey = safeStorage.encryptString(creds.apiKey).toString('base64');
+    if (creds.apiSecret) toSave.apiSecret = safeStorage.encryptString(creds.apiSecret).toString('base64');
+    if (creds.accessToken) toSave.accessToken = safeStorage.encryptString(creds.accessToken).toString('base64');
+    if (creds.llmApiKey) toSave.llmApiKey = safeStorage.encryptString(creds.llmApiKey).toString('base64');
 
     // Write with restrictive permissions (0o600).
     // Do NOT catch here: callers must know if the save failed so they never
