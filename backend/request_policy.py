@@ -124,7 +124,11 @@ class BrokerGateway:
             self.consecutive_failures += 1
             if self.circuit_half_open:
                 # Probe failed: reopen with a fresh timestamp so the timer resets.
+                # Also reset consecutive_failures so the elif threshold branch cannot
+                # spuriously trigger on the next call (the probe outcome is independent
+                # of the pre-open failure streak).
                 self.circuit_half_open = False
+                self.consecutive_failures = 0
                 self.circuit_open_time = time.time()
                 push_log(
                     "Circuit breaker probe FAILED — reopened with fresh timer.",

@@ -165,7 +165,11 @@ class SimulatedBroker:
         self.trades.append(trade_record)
 
         gross_pnl = trade_charges["gross_pnl"]
-        self.cash += gross_pnl - trade_charges.get("total_fees", 0)
+        exit_side = "SELL" if direction == "BUY" else "BUY"
+        exit_leg_charges = cost_calculator.calculate_leg_charges(
+            exit_price, quantity, exit_side
+        )
+        self.cash += gross_pnl - exit_leg_charges["total"]
 
         del self.positions[symbol]
 

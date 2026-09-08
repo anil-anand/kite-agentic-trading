@@ -80,14 +80,18 @@ class MetricsEvaluator:
         avg_r = df["empirical_r"].mean()
 
         # MAE / MFE (Max Adverse Excursion / Max Favorable Excursion)
-        # Requires simulated broker to record these.
-        # Wait, SimulatedBroker doesn't currently output MFE/MAE in trades list. Let's assume it might.
-        avg_mfe = (
-            df.get("mfe", pd.Series(dtype=float)).mean() if "mfe" in df.columns else 0.0
-        )
-        avg_mae = (
-            df.get("mae", pd.Series(dtype=float)).mean() if "mae" in df.columns else 0.0
-        )
+        # SimulatedBroker stores mfe/mae as running price extremes, not distances.
+        # Convert to per-share excursion from entry so averages are meaningful.
+        if "mfe" in df.columns and "entry_price" in df.columns:
+            df["mfe_excursion"] = (df["mfe"] - df["entry_price"]).abs()
+            avg_mfe = df["mfe_excursion"].mean()
+        else:
+            avg_mfe = 0.0
+        if "mae" in df.columns and "entry_price" in df.columns:
+            df["mae_excursion"] = (df["mae"] - df["entry_price"]).abs()
+            avg_mae = df["mae_excursion"].mean()
+        else:
+            avg_mae = 0.0
 
         return {
             "trade_count": len(df),
