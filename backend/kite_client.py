@@ -165,4 +165,16 @@ class KiteClient:
         return results
 
 
-kite_client = KiteClient()
+def _make_client():
+    # In development (KITE_DEV_MODE=1) swap in a mock that serves synthetic data
+    # so the app runs with no Zerodha login, credentials, or network.
+    from .dev_mode import is_dev_mode
+
+    if is_dev_mode():
+        from .mock_kite_client import MockKiteClient
+
+        return MockKiteClient()
+    return KiteClient()
+
+
+kite_client = _make_client()
