@@ -59,18 +59,18 @@ export const useKiteAPI = () => {
     if (!window.electronAPI) return;
 
     window.electronAPI.on(IPC.TICKER_TICK, (event: any, data: any) => {
-       if (data && data.tradingsymbol) {
-         store.updateTick(data.tradingsymbol, data);
-       }
+      if (data && data.tradingsymbol) {
+        store.updateTick(data.tradingsymbol, data);
+      }
     });
     window.electronAPI.on(IPC.AGENT_SIGNAL, (event: any, data: any) => {
-       store.addSignal(data);
+      store.addSignal(data);
     });
     window.electronAPI.on(IPC.LOG_ENTRY, (event: any, data: any) => {
-       store.addLogEntry(data);
+      store.addLogEntry(data);
     });
     window.electronAPI.on(IPC.AGENT_STATE_UPDATE, (event: any, data: any) => {
-       store.setAgentState(data);
+      store.setAgentState(data);
     });
 
     const init = async () => {
@@ -84,26 +84,34 @@ export const useKiteAPI = () => {
         if (agentStat) {
           store.setAgentState({ running: agentStat.running, mode: agentStat.mode || 'auto' });
         }
+
+        if (authStat !== true && agentStat?.running) {
+          try {
+            await window.electronAPI?.invoke(IPC.AGENT_STOP);
+            store.setAgentState({ running: false });
+          } catch (_) {
+            // Best-effort — ignore failure to stop
+          }
+        }
+
         const settings = await window.electronAPI?.invoke(IPC.SETTINGS_GET);
         if (settings) {
-           if (settings.strategies) {
-             const enabledStrats = Object.keys(settings.strategies).filter(
-               s => settings.strategies[s].enabled
-             ) as StrategyName[];
-             store.setAgentState({ enabledStrategies: enabledStrats });
-           }
-           if (settings.mode) {
-             store.setAgentState({ mode: settings.mode });
-           } else {
-             store.setAgentState({ mode: 'auto' });
-           }
-           store.setSettings(settings);
+          if (settings.strategies) {
+            const enabledStrats = Object.keys(settings.strategies).filter(
+              s => settings.strategies[s].enabled
+            ) as StrategyName[];
+            store.setAgentState({ enabledStrategies: enabledStrats });
+          }
+          if (settings.mode) {
+            store.setAgentState({ mode: settings.mode });
+          } else {
+            store.setAgentState({ mode: 'auto' });
+          }
+          store.setSettings(settings);
 
-           // Populate the watchlist from the configured symbols and subscribe
-           // to their live ticks so prices update.
-           if (Array.isArray(settings.watchlist) && settings.watchlist.length > 0) {
-             await loadWatchlist(settings.watchlist);
-           }
+          if (Array.isArray(settings.watchlist) && settings.watchlist.length > 0) {
+            await loadWatchlist(settings.watchlist);
+          }
         }
       } catch (e) {
         console.error("Init Error", e);

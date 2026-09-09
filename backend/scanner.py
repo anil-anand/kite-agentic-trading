@@ -1,5 +1,4 @@
 import datetime
-import time
 from typing import Any, Dict, List, Tuple
 
 import pandas as pd
@@ -26,6 +25,7 @@ from .strategies.supertrend import SupertrendStrategy
 from .strategies.tsi_cross import TSICrossStrategy
 from .strategies.vwap_bounce import VWAPBounceStrategy
 from .strategies.williams_r import WilliamsRStrategy
+from .utils import push_log
 
 
 class Scanner:
@@ -110,7 +110,9 @@ class Scanner:
             self.last_cache_time[instrument_token] = now
             return df, False
         except Exception as e:
-            print(f"Error fetching candles for {tradingsymbol}: {e}")
+            push_log(
+                f"Error fetching candles for {tradingsymbol}: {e}", level="warning"
+            )
             return pd.DataFrame(), False
 
     def scan_watchlist(
@@ -191,6 +193,22 @@ class Scanner:
                         playbook.get_name(), decision["signal_score"]
                     )
 
+                    raw = decision.get("raw_signals", raw_signals)
+                    strategy_ids = {
+                        s.get("strategy_id")
+                        for s in raw
+                        if s.get("strategy_id")
+                        and s.get("strategy_id")
+                        not in ("breakout_evidence", "oscillator_evidence")
+                    }
+
+                    for s in raw:
+                        if s.get("strategy_id") in (
+                            "breakout_evidence",
+                            "oscillator_evidence",
+                        ):
+                            strategy_ids.add(s["strategy_id"])
+
                     decision.update(
                         {
                             "estimated_probability": est_prob,
@@ -198,12 +216,10 @@ class Scanner:
                             "indicators": regime_info["features"],
                             "raw_signals": raw_signals,
                             "regime": regime,
+                            "strategy_count": len(strategy_ids),
                         }
                     )
                     symbol_aggregated_signals.append(decision)
-
-            if not was_cached:
-                time.sleep(1.1)
 
             return symbol_aggregated_signals
 

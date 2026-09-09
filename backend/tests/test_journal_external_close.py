@@ -190,6 +190,7 @@ class TestJournalExternalClose:
     def test_monitor_positions_journals_external_closure(self, monkeypatch):
         # End-to-end: a tracked position is no longer in the open book (its
         # broker stop filled) -> monitor_positions must journal the close.
+
         j = FakeJournal()
         kite = FakeKite(
             ltp=95.0,
@@ -210,9 +211,14 @@ class TestJournalExternalClose:
         monkeypatch.setattr(te, "risk_manager", FakeRisk())
 
         eng = TradingEngine()
+        eng._external_close_grace_seconds = 0
         eng.active_trades["RELIANCE"] = _trade(
             quantity=10, entry_time="2026-09-06T10:00:00"
         )
+
+        eng.monitor_positions()
+
+        assert "RELIANCE" in eng.active_trades
 
         eng.monitor_positions()
 

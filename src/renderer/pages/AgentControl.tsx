@@ -2,12 +2,18 @@ import React from 'react';
 import { useTradingStore } from '../stores/trading-store';
 import SignalCard from '../components/SignalCard';
 import { useKiteAPI } from '../hooks/useKiteAPI';
-import { Check, X } from 'lucide-react';
+import { Check, X, Loader2 } from 'lucide-react';
 import { buildStrategySettings, STRATEGY_IDS } from '../utils/strategy-settings';
 
 const AgentControl: React.FC = () => {
   const { agentState, signals, setAgentState } = useTradingStore();
   const { startAgent, stopAgent } = useKiteAPI();
+
+  React.useEffect(() => {
+    if (!agentState.running) {
+      useTradingStore.getState().setSignals([]);
+    }
+  }, []);
 
   const handleToggle = async () => {
     try {
@@ -31,12 +37,12 @@ const AgentControl: React.FC = () => {
 
   const handleStrategyToggle = (strat: any) => {
     const isEnabled = agentState.enabledStrategies.includes(strat);
-    const newStrategies = isEnabled 
+    const newStrategies = isEnabled
       ? agentState.enabledStrategies.filter(s => s !== strat)
       : [...agentState.enabledStrategies, strat];
-      
+
     setAgentState({ enabledStrategies: newStrategies });
-    
+
     window.electronAPI?.invoke('settings:save', {
       strategies: buildStrategySettings(newStrategies),
     });
@@ -49,7 +55,7 @@ const AgentControl: React.FC = () => {
       direction: 'BUY' | 'SELL';
       signals: typeof signals;
       avgSignalScore: number;
-      confluenceScore: number;
+      strategyCount: number;
     }> = {};
 
     signals.forEach(sig => {
@@ -60,26 +66,23 @@ const AgentControl: React.FC = () => {
           direction: sig.direction,
           signals: [],
           avgSignalScore: 0,
-          confluenceScore: 0
+          strategyCount: 0,
         };
       }
       groups[key].signals.push(sig);
+      const cnt = sig.strategy_count ?? 1;
+      groups[key].strategyCount += cnt;
     });
 
-    // Calculate aggregates and sort
     return Object.values(groups)
       .map(group => {
-        group.confluenceScore = group.signals.length;
         const totalScore = group.signals.reduce((acc, s) => acc + (s.signal_score ?? (s as any).signalScore ?? 0), 0);
-        group.avgSignalScore = group.confluenceScore > 0 ? Math.round(totalScore / group.confluenceScore) : 0;
+        group.avgSignalScore = group.signals.length > 0 ? Math.round(totalScore / group.signals.length) : 0;
         return group;
       })
       .sort((a, b) => {
-        // Sort by confluence score first (N strategies)
-        if (b.confluenceScore !== a.confluenceScore) {
-          return b.confluenceScore - a.confluenceScore;
-        }
-        // Then by average confidence
+        // Sort by raw strategy count first, then by average confidence
+        if (b.strategyCount !== a.strategyCount) return b.strategyCount - a.strategyCount;
         return b.avgSignalScore - a.avgSignalScore;
       });
   }, [signals]);
@@ -94,7 +97,7 @@ const AgentControl: React.FC = () => {
             Scanning NIFTY 100 universe + your Custom Watchlist using all active strategies below.
           </p>
         </div>
-        <button 
+        <button
           onClick={handleToggle}
           className={`px-8 py-3 rounded-lg font-bold shadow-lg transition-all ${agentState.running ? 'bg-loss-dark hover:bg-loss text-white' : 'bg-profit-dark hover:bg-profit text-white animate-pulse-slow'}`}
         >
@@ -134,7 +137,7 @@ const AgentControl: React.FC = () => {
                 return (
                   <div key={strat} className="flex items-center justify-between p-3 bg-surface-900 rounded-lg border border-surface-700">
                     <span className="text-white capitalize">{strat.replace(/_/g, ' ')}</span>
-                    <button 
+                    <button
                       onClick={() => handleStrategyToggle(strat)}
                       className={`w-12 h-6 rounded-full relative transition-colors ${isEnabled ? 'bg-accent-light' : 'bg-surface-600'}`}
                     >
@@ -158,7 +161,22 @@ const AgentControl: React.FC = () => {
           </div>
           <div className="space-y-4 p-6 pt-4">
             {groupedSignals.length === 0 ? (
-              <div className="text-center text-surface-400 mt-10">No active signals</div>
+              agentState.running ? (
+                agentState.status === 'scanning' ? (
+                  <div className="flex flex-col items-center justify-center mt-12 gap-3 text-surface-400">
+                    <Loader2 size={28} className="animate-spin text-accent-light" />
+                    <p className="text-sm font-medium">Scanning the market&hellip;</p>
+                    <p className="text-xs text-surface-500">Signals will appear here as they are detected.</p>
+                  </div>
+                ) : (
+                  <div className="flex flex-col items-center justify-center mt-12 gap-3 text-surface-400">
+                    <p className="text-sm font-medium">Monitoring for new opportunities&hellip;</p>
+                    <p className="text-xs text-surface-500">No trade signals matched your criteria right now.</p>
+                  </div>
+                )
+              ) : (
+                <div className="text-center text-surface-400 mt-10 text-sm">No active signals</div>
+              )
             ) : (
               groupedSignals.map(group => {
                 const bestSignal = group.signals.reduce((prev, current) => ((prev.signal_score ?? (prev as any).signalScore ?? 0) > (current.signal_score ?? (current as any).signalScore ?? 0)) ? prev : current);
@@ -174,7 +192,7 @@ const AgentControl: React.FC = () => {
                         <span className="font-bold text-white text-lg">{group.tradingsymbol}</span>
                       </div>
                       <div className="bg-accent-dark text-white px-2 py-1 rounded text-xs font-bold">
-                        {group.confluenceScore} {group.confluenceScore === 1 ? 'Strategy' : 'Strategies'}
+                        {group.strategyCount} {group.strategyCount === 1 ? 'Strategy' : 'Strategies'}
                       </div>
                     </div>
 
@@ -214,14 +232,14 @@ const AgentControl: React.FC = () => {
                       const prob = isCalibrated ? probRaw : 0;
                       const isProbHigh = isCalibrated ? prob >= 0.60 : true; // Uncalibrated is allowed to explore
                       const willAutoEnter = agentState.mode === 'auto' && isProbHigh;
-                      const autoEnterReason = agentState.mode !== 'auto' 
-                        ? 'Mode is not Auto' 
-                        : !isCalibrated 
+                      const autoEnterReason = agentState.mode !== 'auto'
+                        ? 'Mode is not Auto'
+                        : !isCalibrated
                           ? 'Exploring (Uncalibrated)'
-                          : !isProbHigh 
-                            ? `Prob < 60% (${(prob * 100).toFixed(1)}%)` 
+                          : !isProbHigh
+                            ? `Prob < 60% (${(prob * 100).toFixed(1)}%)`
                             : 'Meets criteria';
-                          
+
                       return (
                         <div className="flex items-center justify-between mt-1 p-2 bg-surface-900 rounded border border-surface-700">
                           <span className="text-xs text-surface-400">Will Auto-Enter:</span>
@@ -236,22 +254,22 @@ const AgentControl: React.FC = () => {
                     })()}
 
                     <div className="flex gap-2 mt-2 pt-3 border-t border-surface-700">
-                      <button 
+                      <button
                         onClick={() => {
                           window.electronAPI?.invoke('agent:execute-signal', bestSignal);
                           group.signals.forEach(s => useTradingStore.getState().removeSignal(s.id));
-                        }} 
+                        }}
                         className="flex-1 bg-profit-dark hover:bg-profit flex items-center justify-center gap-2 py-2 rounded transition-colors text-white text-sm font-medium"
                       >
                         <Check size={16} /> Take Trade
                       </button>
-                      <button 
+                      <button
                         onClick={() => {
                           group.signals.forEach(s => useTradingStore.getState().removeSignal(s.id));
-                        }} 
+                        }}
                         className="flex-1 bg-surface-700 hover:bg-surface-600 flex items-center justify-center gap-2 py-2 rounded transition-colors text-white text-sm font-medium"
                       >
-                        <X size={16} /> Dismiss {group.confluenceScore > 1 ? 'All' : ''}
+                        <X size={16} /> Dismiss {group.strategyCount > 1 ? 'All' : ''}
                       </button>
                     </div>
                   </div>

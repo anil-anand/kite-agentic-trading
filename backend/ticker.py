@@ -8,6 +8,7 @@ import time
 from .dev_mode import is_dev_mode
 from .kite_client import kite_client
 from .utils import DateTimeEncoder
+from .utils import stdout_lock as _stdout_lock
 
 # Channels the renderer listens on (src/shared/ipc-channels.ts). The engine's
 # stdout is the transport, so the "event" name IS the renderer channel.
@@ -113,8 +114,9 @@ class TickerManager:
                 "timestamp": datetime.datetime.now().isoformat(),
             },
         }
-        print(json.dumps(event, cls=DateTimeEncoder))
-        sys.stdout.flush()
+        with _stdout_lock:
+            print(json.dumps(event, cls=DateTimeEncoder))
+            sys.stdout.flush()
 
     # -- live callbacks --------------------------------------------------
     def on_ticks(self, ws, ticks):
@@ -128,8 +130,9 @@ class TickerManager:
 
     def on_order_update(self, ws, data):
         event = {"event": _ORDER_UPDATE_CHANNEL, "data": data}
-        print(json.dumps(event, cls=DateTimeEncoder))
-        sys.stdout.flush()
+        with _stdout_lock:
+            print(json.dumps(event, cls=DateTimeEncoder))
+            sys.stdout.flush()
 
     def on_connect(self, ws, response):
         if self.tokens:

@@ -74,18 +74,17 @@ export const useTradingStore = create<TradingState>()(
       setAgentState: (agentState) => set((state) => ({ agentState: { ...state.agentState, ...agentState } })),
       setSignals: (signals) => set({ signals }),
       addSignal: (signal) => set((state) => {
-        // Prevent duplicate signals from same strategy on same symbol
         const existingIdx = state.signals.findIndex(
           s => s.tradingsymbol === signal.tradingsymbol && s.strategy === signal.strategy
         );
-        
+
         let newSignals = [...state.signals];
         if (existingIdx >= 0) {
           newSignals[existingIdx] = signal; // Update existing
         } else {
           newSignals = [signal, ...state.signals]; // Prepend new
         }
-        
+
         // Keep max 50 signals in memory
         return { signals: newSignals.slice(0, 50) };
       }),
@@ -105,7 +104,6 @@ export const useTradingStore = create<TradingState>()(
       partialize: (state) => ({
         auth: state.auth,
         activityLog: state.activityLog,
-        signals: state.signals,
         watchlist: state.watchlist,
         settings: state.settings,
         agentState: {

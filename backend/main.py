@@ -369,7 +369,7 @@ def handle_request(req):
 
 
 def main():
-    from .trading_engine import _stdout_lock
+    from .utils import stdout_lock as _stdout_lock
 
     for line in sys.stdin:
         line = line.strip()

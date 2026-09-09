@@ -13,10 +13,11 @@ from .risk_manager import risk_manager
 from .scanner import scanner
 from .trading_costs import cost_calculator
 from .utils import DateTimeEncoder
+from .utils import stdout_lock as _stdout_lock
 
-# Module-level lock for stdout to prevent interleaved JSON output between
-# the main JSON-RPC thread, the daemon trading loop, and scanner pool threads.
-_stdout_lock = threading.Lock()
+# _stdout_lock is the shared lock from utils so ALL modules (execution_gateway,
+# request_policy, trading_engine) serialize their stdout writes through the same
+# object, preventing interleaved JSON output.
 
 
 class TradingEngine:
@@ -50,6 +51,14 @@ class TradingEngine:
         self.universe_version = 0
         self.last_universe_refresh_time = None
         self.watchlist_rankings = {}
+
+        # Issue 3 — grace-period tracking for external closure detection.
+        # Maps tradingsymbol -> first time it was found missing from open_symbols.
+        # A position is only treated as externally closed if it is still absent
+        # after _external_close_grace_seconds, preventing false drops due to
+        # transient Kite API position-data lag.
+        self._external_close_candidates: dict = {}
+        self._external_close_grace_seconds: float = 10.0
 
     # Kite order statuses that mean an order is still live (protecting / working).
     _OPEN_ORDER_STATUSES = {"OPEN", "TRIGGER PENDING"}
@@ -267,6 +276,8 @@ class TradingEngine:
                 f"Reconcile active trades on start failed: {e}", level="error"
             )
 
+        scanner.last_scanned_candle.clear()
+
         self.running = True
         self.thread = threading.Thread(target=self._run_loop)
         self.thread.daemon = True
@@ -282,13 +293,16 @@ class TradingEngine:
     def status(self) -> dict:
         return {"running": self.running, "mode": self.mode}
 
-    def _push_state_update(self):
+    def _push_state_update(self, status: str = None):
+        if not status:
+            status = "scanning" if self.running else "idle"
+            
         event = {
             "event": "agent:state-update",
             "data": {
                 "running": self.running,
                 "mode": self.mode,
-                "status": "scanning" if self.running else "idle",
+                "status": status,
             },
         }
         with _stdout_lock:
@@ -336,7 +350,9 @@ class TradingEngine:
                 # 3. Slow polling: Scan for new entry signals
                 current_time = time.time()
                 if current_time - last_scan_time >= scan_interval:
+                    self._push_state_update(status="scanning")
                     self.scan_and_trade()
+                    self._push_state_update(status="monitoring")
                     last_scan_time = current_time
 
                 # 4. Reconcile journal trades periodically
@@ -683,6 +699,9 @@ class TradingEngine:
                     "exit_pending": False,
                     "exit_order_id": None,
                     "exchange": position.get("exchange", exchange),
+                    # trailing_sl=True disables the resistance/support smart exit
+                    # (Issue 6) since the dynamic stop already handles exit management.
+                    "trailing_sl": signal.get("trailing_sl", False),
                 }
             self._persist_trades()
             return True
@@ -745,7 +764,7 @@ class TradingEngine:
             # run WITHOUT the lock held, so a slow broker API can't freeze the
             # JSON-RPC thread or the scanner callback (both need this lock).
             with self._trade_lock:
-                symbols_to_remove = [
+                missing_symbols = [
                     s
                     for s in self.active_trades
                     if s not in open_symbols
@@ -754,12 +773,32 @@ class TradingEngine:
                 tracked = set(self.active_trades.keys())
                 pending = set(self._pending_entries)
 
-            # Manual closures: the position is flat but we still track it — it was
-            # closed outside the app-side exit path, most often by the broker-side
-            # protective stop filling (also: a manual close in the Kite app). Book
-            # the close in the journal so the trade doesn't stay OPEN forever and
-            # is included in analytics, then cancel any leftover stop and drop it.
-            for symbol in symbols_to_remove:
+            now_ts = time.time()
+            confirmed_removals = []
+            for symbol in missing_symbols:
+                if symbol not in self._external_close_candidates:
+                    # First time we see it missing — record the timestamp and skip
+                    self._external_close_candidates[symbol] = now_ts
+                    self._push_log(
+                        f"{symbol} not found in open positions. Will confirm closure in "
+                        f"{self._external_close_grace_seconds:.0f}s.",
+                        level="info",
+                    )
+                elif (
+                    now_ts - self._external_close_candidates[symbol]
+                    >= self._external_close_grace_seconds
+                ):
+                    confirmed_removals.append(symbol)
+
+            # Clear candidates that came back to life (position reappeared)
+            for symbol in list(self._external_close_candidates.keys()):
+                if symbol in open_symbols or symbol not in missing_symbols:
+                    if symbol in self._external_close_candidates:
+                        del self._external_close_candidates[symbol]
+
+            # Manual closures — confirmed after grace period:
+            for symbol in confirmed_removals:
+                self._external_close_candidates.pop(symbol, None)
                 self._push_log(
                     f"Detected external closure for {symbol}. Removing from tracking."
                 )
@@ -806,8 +845,20 @@ class TradingEngine:
                     hit_sl = ltp >= sl
                     hit_target = ltp <= target
 
-                if hit_sl or hit_target:
-                    reason = "Stop Loss" if hit_sl else "Target"
+                with self._trade_lock:
+                    trade_snapshot = self.active_trades.get(symbol, {})
+                    is_trailing = trade_snapshot.get("trailing_sl", False)
+
+                hit_resistance = False
+                if not hit_sl and not hit_target and not is_trailing:
+                    hit_resistance = self._check_resistance_exit(symbol, ltp, direction)
+
+                if hit_sl or hit_target or hit_resistance:
+                    reason = (
+                        "Stop Loss"
+                        if hit_sl
+                        else ("Target" if hit_target else "Resistance/Support")
+                    )
                     self._push_log(
                         f"{reason} hit for {symbol} at {ltp}. Exiting position."
                     )
@@ -843,6 +894,77 @@ class TradingEngine:
             if p.get("tradingsymbol") == symbol and p.get("quantity", 0) != 0:
                 return p
         return {}
+
+    def _check_resistance_exit(
+        self, symbol: str, ltp: float, direction: str, lookback: int = 20
+    ) -> bool:
+        try:
+            token = self._ensure_instrument_map().get(symbol)
+            if not token:
+                return False
+
+            # Fetch recent candles (use cache where available)
+            df, _ = scanner._fetch_candles(token, symbol)
+            if df is None or df.empty or len(df) < lookback + 2:
+                return False
+
+            # We calculate resistance/support from the lookback window *prior* to the last completed candle.
+            # Then we check if the last completed candle tested that level but failed to close beyond it.
+            past_candles = df.iloc[-(lookback + 2) : -2]
+            last_candle = df.iloc[-2]
+
+            if len(past_candles) < 5:
+                return False
+
+            if direction == "BUY":
+                # Resistance = highest high over lookback
+                resistance = past_candles["high"].max()
+                # Exit only if the last completed candle TESTED the resistance (high >= resistance)
+                # but CLOSED BELOW it (resistance rejected the price — it won)
+                last_high = last_candle["high"]
+                last_close = last_candle["close"]
+
+                if last_high >= resistance and last_close < resistance:
+                    with self._trade_lock:
+                        trade = self.active_trades.get(symbol, {})
+                        target = trade.get("target", 0)
+                    # Only trigger if resistance is between entry and target
+                    # (don't exit prematurely if resistance is below entry)
+                    entry_price = trade.get("entry_price", 0)
+                    if (
+                        entry_price > 0
+                        and resistance > entry_price
+                        and resistance < target
+                    ):
+                        self._push_log(
+                            f"Resistance exit check for {symbol}: resistance ₹{resistance:.2f}, "
+                            f"last candle tested high ₹{last_high:.2f} but closed ₹{last_close:.2f} — resistance wins. Exiting.",
+                            level="info",
+                        )
+                        return True
+            else:  # SELL
+                # Support = lowest low over lookback
+                support = past_candles["low"].min()
+                last_low = last_candle["low"]
+                last_close = last_candle["close"]
+
+                if last_low <= support and last_close > support:
+                    with self._trade_lock:
+                        trade = self.active_trades.get(symbol, {})
+                        target = trade.get("target", 0)
+                    entry_price = trade.get("entry_price", 0)
+                    if entry_price > 0 and support < entry_price and support > target:
+                        self._push_log(
+                            f"Support exit check for {symbol}: support ₹{support:.2f}, "
+                            f"last candle tested low ₹{last_low:.2f} but closed ₹{last_close:.2f} — support wins. Exiting.",
+                            level="info",
+                        )
+                        return True
+        except Exception as e:
+            self._push_log(
+                f"Resistance exit check failed for {symbol}: {e}", level="warning"
+            )
+        return False
 
     def _adopt_position(self, p: dict):
         """Adopt an untracked open position (auto mode) with a protective stop.

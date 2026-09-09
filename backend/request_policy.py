@@ -48,6 +48,9 @@ class BrokerGateway:
         # until the probe succeeds (→ CLOSED) or fails (→ OPEN with fresh timestamp).
         self.circuit_half_open = False
 
+        self._last_auth_error_log_time: float = 0.0
+        self._auth_error_dedup_seconds: float = 60.0
+
     def _update_tokens(self):
         now = time.time()
         elapsed = now - self._last_update
@@ -233,10 +236,33 @@ class BrokerGateway:
                     classification == ErrorClassification.NON_RETRYABLE
                     or attempt >= self.max_retries
                 ):
-                    push_log(
-                        f"Broker request failed (Priority {priority.name}, Attempt {attempt + 1}/{self.max_retries + 1}): {e}",
-                        level="error",
+                    err_lower = str(e).lower()
+                    is_auth_error = any(
+                        x in err_lower
+                        for x in [
+                            "api_key",
+                            "access_token",
+                            "tokenexception",
+                            "invalid token",
+                        ]
                     )
+                    if is_auth_error:
+                        now = time.time()
+                        with self._lock:
+                            since_last = now - self._last_auth_error_log_time
+                            should_log = since_last >= self._auth_error_dedup_seconds
+                            if should_log:
+                                self._last_auth_error_log_time = now
+                        if should_log:
+                            push_log(
+                                "Kite session has expired. Please log in again to resume trading.",
+                                level="warning",
+                            )
+                    else:
+                        push_log(
+                            f"Broker request failed (Priority {priority.name}, Attempt {attempt + 1}/{self.max_retries + 1}): {e}",
+                            level="error",
+                        )
                     raise e
 
                 attempt += 1
