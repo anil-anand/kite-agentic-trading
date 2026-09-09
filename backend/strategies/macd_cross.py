@@ -35,7 +35,7 @@ class MACDCrossStrategy(BaseStrategy):
             entry = last["close"]
             sl = self.calculate_stop_loss(entry, "BUY")
             target = self.calculate_target(entry, sl)
-            confidence = (
+            signal_score = (
                 75 if last["macd"] < 0 else 65
             )  # Stronger if crossed below zero line
 
@@ -43,7 +43,7 @@ class MACDCrossStrategy(BaseStrategy):
                 self.format_signal(
                     tradingsymbol,
                     "BUY",
-                    confidence,
+                    signal_score,
                     entry,
                     sl,
                     target,
@@ -60,13 +60,13 @@ class MACDCrossStrategy(BaseStrategy):
             entry = last["close"]
             sl = self.calculate_stop_loss(entry, "SELL")
             target = self.calculate_target(entry, sl)
-            confidence = 75 if last["macd"] > 0 else 65
+            signal_score = 75 if last["macd"] > 0 else 65
 
             signals.append(
                 self.format_signal(
                     tradingsymbol,
                     "SELL",
-                    confidence,
+                    signal_score,
                     entry,
                     sl,
                     target,

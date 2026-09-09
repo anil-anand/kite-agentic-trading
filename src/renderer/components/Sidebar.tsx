@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { NavLink } from 'react-router-dom';
-import { LayoutDashboard, Bot, CandlestickChart, ClipboardList, Eye, ScrollText, Settings, Menu, PieChart } from 'lucide-react';
+import { LayoutDashboard, Bot, CandlestickChart, ClipboardList, Eye, ScrollText, Settings, Menu, PieChart, Activity } from 'lucide-react';
 import { useTradingStore } from '../stores/trading-store';
 
 const Sidebar: React.FC = () => {
@@ -11,6 +11,7 @@ const Sidebar: React.FC = () => {
   const links = [
     { to: '/dashboard', icon: <LayoutDashboard size={20} />, label: 'Dashboard' },
     { to: '/journal', icon: <PieChart size={20} />, label: 'Journal' },
+    { to: '/backtesting', icon: <Activity size={20} />, label: 'Backtesting' },
     { to: '/agent', icon: <Bot size={20} />, label: 'Agent Control' },
     { to: '/chart', icon: <CandlestickChart size={20} />, label: 'Chart' },
     { to: '/orders', icon: <ClipboardList size={20} />, label: 'Orders' },

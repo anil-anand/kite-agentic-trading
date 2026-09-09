@@ -6,15 +6,18 @@ import time
 import uuid
 
 from .config import config_manager
+from .execution_gateway import execution_gateway
 from .journal import journal
 from .kite_client import kite_client
 from .risk_manager import risk_manager
 from .scanner import scanner
+from .trading_costs import cost_calculator
 from .utils import DateTimeEncoder
+from .utils import stdout_lock as _stdout_lock
 
-# Module-level lock for stdout to prevent interleaved JSON output between
-# the main JSON-RPC thread, the daemon trading loop, and scanner pool threads.
-_stdout_lock = threading.Lock()
+# _stdout_lock is the shared lock from utils so ALL modules (execution_gateway,
+# request_policy, trading_engine) serialize their stdout writes through the same
+# object, preventing interleaved JSON output.
 
 
 class TradingEngine:
@@ -37,9 +40,25 @@ class TradingEngine:
         # Symbols whose entry orders are in flight but not yet added to
         # active_trades. Prevents monitor_positions from adopting a position
         # that execute_signal is still setting up.
+        # This is kept in TradingEngine because monitor_positions needs it to avoid
+        # premature adoption, while execution_gateway handles duplicate *orders*.
         self._pending_entries: set = set()
         self._tick_size_map = {}
         self._reserved_entry_margin = 0.0
+
+        # Dynamic Watchlist State
+        self.dynamic_watchlist = []
+        self.universe_version = 0
+        self.last_universe_refresh_time = None
+        self.watchlist_rankings = {}
+
+        # Issue 3 — grace-period tracking for external closure detection.
+        # Maps tradingsymbol -> first time it was found missing from open_symbols.
+        # A position is only treated as externally closed if it is still absent
+        # after _external_close_grace_seconds, preventing false drops due to
+        # transient Kite API position-data lag.
+        self._external_close_candidates: dict = {}
+        self._external_close_grace_seconds: float = 10.0
 
     # Kite order statuses that mean an order is still live (protecting / working).
     _OPEN_ORDER_STATUSES = {"OPEN", "TRIGGER PENDING"}
@@ -123,7 +142,7 @@ class TradingEngine:
         stop_id = trade.get("stop_order_id")
         if stop_id and str(stop_id) in open_orders:
             try:
-                kite_client.cancel_order("regular", stop_id)
+                execution_gateway.cancel_order(variety="regular", order_id=stop_id)
             except Exception:
                 pass
 
@@ -169,6 +188,40 @@ class TradingEngine:
                 pos.get("exchange", trade.get("exchange", "NSE")),
                 pos.get("product", "MIS"),
             )
+
+            if not new_stop_id or not self._confirm_protective_stop(new_stop_id):
+                self._push_log(
+                    f"CRITICAL: Failed to confirm replaced protective stop for {symbol} during reconcile. Emergency flattening.",
+                    level="error",
+                )
+                try:
+                    execution_gateway.emergency_flatten_position(
+                        variety="regular",
+                        exchange=pos.get("exchange", trade.get("exchange", "NSE")),
+                        tradingsymbol=symbol,
+                        transaction_type="SELL"
+                        if trade["direction"] == "BUY"
+                        else "BUY",
+                        quantity=abs(pos["quantity"]),
+                        product=pos.get("product", "MIS"),
+                        order_type="MARKET",
+                    )
+                except Exception as e:
+                    self._push_log(
+                        f"Emergency flatten failed for {symbol}: {e}", level="error"
+                    )
+
+                risk_config = config_manager.get_risk_config()
+                if risk_config.get("haltAutoTradesOnStopFailure", True):
+                    self._push_log(
+                        "Halting auto trades due to protective stop failure in reconcile.",
+                        level="error",
+                    )
+                    self.stop()
+
+                trade["stop_order_id"] = None
+                return False
+
             trade["stop_order_id"] = new_stop_id or None
 
         # Keep waiting on an exit that's still working; otherwise clear it.
@@ -206,12 +259,24 @@ class TradingEngine:
             return
 
         self.mode = mode
+        # Reconcile risk manager state from broker
+        try:
+            risk_manager.reconcile_state()
+        except Exception as e:
+            self._push_log(
+                f"Risk manager reconcile on start failed: {e}", level="error"
+            )
+
         # Resume managing any positions that were open when we last ran, before
         # the monitor loop starts. Failures here must not block startup.
         try:
             self.reconcile_active_trades()
         except Exception as e:
-            self._push_log(f"Reconcile on start failed: {e}", level="error")
+            self._push_log(
+                f"Reconcile active trades on start failed: {e}", level="error"
+            )
+
+        scanner.last_scanned_candle.clear()
 
         self.running = True
         self.thread = threading.Thread(target=self._run_loop)
@@ -228,13 +293,16 @@ class TradingEngine:
     def status(self) -> dict:
         return {"running": self.running, "mode": self.mode}
 
-    def _push_state_update(self):
+    def _push_state_update(self, status: str = None):
+        if not status:
+            status = "scanning" if self.running else "idle"
+
         event = {
             "event": "agent:state-update",
             "data": {
                 "running": self.running,
                 "mode": self.mode,
-                "status": "scanning" if self.running else "idle",
+                "status": status,
             },
         }
         with _stdout_lock:
@@ -263,7 +331,9 @@ class TradingEngine:
 
     def _run_loop(self):
         last_scan_time = 0
+        last_reconcile_time = 0
         scan_interval = 30  # Check for new signals every 30 seconds
+        reconcile_interval = 300  # Reconcile executions every 5 minutes
         monitor_interval = 5  # Check open positions every 5 seconds for rapid exits
 
         while self.running:
@@ -280,8 +350,15 @@ class TradingEngine:
                 # 3. Slow polling: Scan for new entry signals
                 current_time = time.time()
                 if current_time - last_scan_time >= scan_interval:
+                    self._push_state_update(status="scanning")
                     self.scan_and_trade()
+                    self._push_state_update(status="monitoring")
                     last_scan_time = current_time
+
+                # 4. Reconcile journal trades periodically
+                if current_time - last_reconcile_time >= reconcile_interval:
+                    self._reconcile_journal_trades()
+                    last_reconcile_time = current_time
 
             except Exception as e:
                 self._push_log(f"Error in trading loop: {e}")
@@ -301,6 +378,21 @@ class TradingEngine:
             }
         return self._instrument_map
 
+    def _get_current_refresh_interval(self) -> int:
+        screener_config = config_manager.get_screener_config()
+        refresh_schedule = screener_config.get("refreshSchedule", {})
+        opening_mins = refresh_schedule.get("openingPeriodMins", 15)
+        normal_mins = refresh_schedule.get("normalSessionMins", 60)
+        late_mins = refresh_schedule.get("lateSessionMins", 30)
+
+        now = datetime.datetime.now().time()
+        if now < datetime.time(10, 0):
+            return opening_mins
+        elif now < datetime.time(14, 0):
+            return normal_mins
+        else:
+            return late_mins
+
     def scan_and_trade(self):
         can_trade, reason = risk_manager.can_trade()
         if not can_trade:
@@ -314,7 +406,18 @@ class TradingEngine:
             self._notified_cannot_trade = False
 
         # Use our AI/Algorithmic screener to dynamically find "In Play" stocks from NIFTY 100 + Custom Watchlist
-        if not hasattr(self, "dynamic_watchlist") or not self.dynamic_watchlist:
+        now = datetime.datetime.now()
+        needs_refresh = False
+        if not self.dynamic_watchlist:
+            needs_refresh = True
+        elif self.last_universe_refresh_time:
+            interval_mins = self._get_current_refresh_interval()
+            if (
+                now - self.last_universe_refresh_time
+            ).total_seconds() / 60.0 >= interval_mins:
+                needs_refresh = True
+
+        if needs_refresh:
             from .nifty_universe import get_nifty100_universe
             from .screener import screener_engine
 
@@ -324,19 +427,43 @@ class TradingEngine:
             self._push_log(
                 f"Running algorithmic screener on NIFTY 100 + {len(custom_watchlist)} custom stocks..."
             )
-            self.dynamic_watchlist = screener_engine.generate_daily_watchlist(
-                universe=full_universe, limit=12
-            )
-            self._push_log(
-                f"Dynamic Watchlist selected: {', '.join(self.dynamic_watchlist)}"
-            )
+            try:
+                new_watchlist = screener_engine.generate_daily_watchlist(
+                    universe=full_universe, limit=12
+                )
+
+                self.watchlist_rankings = {
+                    symbol: i + 1 for i, symbol in enumerate(new_watchlist)
+                }
+
+                with self._trade_lock:
+                    preserved = set(self.active_trades.keys()) | self._pending_entries
+
+                self.dynamic_watchlist = list(set(new_watchlist) | preserved)
+                self.universe_version += 1
+                self.last_universe_refresh_time = now
+
+                self._push_log(
+                    f"Dynamic Watchlist refreshed (Version: {self.universe_version}): {', '.join(self.dynamic_watchlist)}"
+                )
+            except Exception as e:
+                self._push_log(
+                    f"Dynamic Watchlist refresh failed: {e}. Retaining last known good universe.",
+                    level="error",
+                )
 
         def handle_new_signal(signal):
             # NOTE: This callback is invoked from scanner ThreadPoolExecutor
             # threads, so active_trades access must be guarded by the lock.
-            if signal["confidence"] >= 70:
+            signal["universe_version"] = str(self.universe_version)
+            signal["screener_ranking"] = self.watchlist_rankings.get(
+                signal["tradingsymbol"]
+            )
+
+            if signal["signal_score"] >= 70:
                 self._push_signal(signal)
-                if self.mode == "auto" and signal["confidence"] >= 80 and can_trade:
+                prob = signal.get("estimated_probability")
+                if self.mode == "auto" and (prob is None or prob >= 0.60) and can_trade:
                     symbol = signal["tradingsymbol"]
                     with self._trade_lock:
                         already_active = (
@@ -362,37 +489,8 @@ class TradingEngine:
     def execute_signal(self, signal: dict):
         symbol = signal["tradingsymbol"]
 
-        # Overtrading protections
-        risk_config = config_manager.get_risk_config()
-        max_daily_trades = risk_config.get("maxDailyTrades", 10)
-        max_symbol_trades = risk_config.get("maxTradesPerSymbolPerDay", 2)
-        cooldown_mins = risk_config.get("tradeCooldownMins", 15)
-
-        todays_counts = journal.get_todays_trade_counts()
-        if todays_counts["total"] >= max_daily_trades:
-            self._push_log(
-                f"Skipping {symbol}: Max daily trades ({max_daily_trades}) reached.",
-                level="warning",
-            )
-            return False
-
-        if todays_counts["by_symbol"].get(symbol, 0) >= max_symbol_trades:
-            self._push_log(
-                f"Skipping {symbol}: Max trades per symbol ({max_symbol_trades}) reached today.",
-                level="warning",
-            )
-            return False
-
-        last_exit = journal.get_last_exit_time(symbol)
-        if last_exit:
-            mins_since_exit = (datetime.datetime.now() - last_exit).total_seconds() / 60
-            if mins_since_exit < cooldown_mins:
-                self._push_log(
-                    f"Skipping {symbol}: Cooldown period active ({mins_since_exit:.1f}/{cooldown_mins} mins)."
-                )
-                return False
-
-        # Atomically guard against duplicate entry orders for the same symbol.
+        # Atomically guard against duplicate entry orders for the same symbol in trading_engine
+        # (execution_gateway also has its own lock to prevent broker-level duplicate orders).
         with self._trade_lock:
             if symbol in self.active_trades or symbol in self._pending_entries:
                 self._push_log(
@@ -410,11 +508,6 @@ class TradingEngine:
     def _execute_signal_inner(self, signal: dict):
         """Core execution logic. Called with the symbol reserved in _pending_entries."""
         symbol = signal["tradingsymbol"]
-
-        can_trade, reason = risk_manager.can_trade()
-        if not can_trade:
-            self._push_log(f"Cannot execute signal {signal['id']}: {reason}")
-            return False
 
         transaction_type = "BUY" if signal["direction"] == "BUY" else "SELL"
         exchange = signal.get("exchange", "NSE")
@@ -438,9 +531,13 @@ class TradingEngine:
                     0, available_margin - self._reserved_entry_margin
                 )
 
-                qty = risk_manager.calculate_position_size(
-                    entry_price, signal["stopLoss"], available_margin
-                )
+                llm_qty = signal.get("quantity")
+                if llm_qty is not None and isinstance(llm_qty, int) and llm_qty > 0:
+                    qty = llm_qty
+                else:
+                    qty = risk_manager.calculate_position_size(
+                        entry_price, signal["stopLoss"], available_margin
+                    )
                 if qty <= 0:
                     self._push_log(
                         f"Cannot execute signal {signal['id']}: insufficient available margin",
@@ -448,9 +545,26 @@ class TradingEngine:
                     )
                     return False
 
+                open_orders = kite_client.get_orders()
+                can_accept, reject_reason = risk_manager.can_accept_position(
+                    symbol=symbol,
+                    direction=signal["direction"],
+                    qty=qty,
+                    price=entry_price,
+                    active_trades=self.active_trades,
+                    open_orders=open_orders,
+                )
+                if not can_accept:
+                    self._push_log(
+                        f"Portfolio risk limit rejected {symbol}: {reject_reason}",
+                        level="warning",
+                    )
+                    return False
+
                 reserved_margin = qty * entry_price
                 self._reserved_entry_margin += reserved_margin
-                order_id = kite_client.place_order(
+                order_id = execution_gateway.place_order(
+                    is_entry=True,
                     variety="regular",
                     exchange=exchange,
                     tradingsymbol=symbol,
@@ -460,6 +574,7 @@ class TradingEngine:
                     order_type="LIMIT",
                     price=entry_price,
                 )
+
             self._push_log(
                 f"Executed {transaction_type} for {symbol}, qty {qty}, order_id {order_id}"
             )
@@ -475,7 +590,7 @@ class TradingEngine:
                     level="warning",
                 )
                 try:
-                    kite_client.cancel_order("regular", order_id)
+                    execution_gateway.cancel_order(variety="regular", order_id=order_id)
                 except Exception:
                     pass
                 return False
@@ -490,16 +605,36 @@ class TradingEngine:
                 position.get("exchange", signal["exchange"]),
                 position.get("product", "MIS"),
             )
-            if not stop_order_id:
+            if not stop_order_id or not self._confirm_protective_stop(stop_order_id):
                 self._push_log(
-                    f"Failed to place protective stop for {symbol}. Exiting position immediately.",
+                    f"CRITICAL: Failed to confirm protective stop for {symbol}. Emergency flattening.",
                     level="error",
                 )
-                self._exit_position(
-                    position,
-                    symbol,
-                    "Protective stop placement failed",
-                )
+                try:
+                    execution_gateway.emergency_flatten_position(
+                        variety="regular",
+                        exchange=position.get("exchange", signal["exchange"]),
+                        tradingsymbol=symbol,
+                        transaction_type="SELL"
+                        if signal["direction"] == "BUY"
+                        else "BUY",
+                        quantity=abs(position.get("quantity", qty)) or qty,
+                        product=position.get("product", "MIS"),
+                        order_type="MARKET",
+                    )
+                except Exception as e:
+                    self._push_log(
+                        f"Emergency flatten failed for {symbol}: {e}", level="error"
+                    )
+
+                risk_config = config_manager.get_risk_config()
+                if risk_config.get("haltAutoTradesOnStopFailure", True):
+                    self._push_log(
+                        "Halting auto trades due to protective stop failure.",
+                        level="error",
+                    )
+                    self.stop()
+
                 return False
 
             # Get confluence snapshot for journal
@@ -522,15 +657,28 @@ class TradingEngine:
                     direction=signal["direction"],
                     product=position.get("product", "MIS"),
                     strategy=signal.get("strategy", "unknown"),
-                    entry_price=position.get("averagePrice", signal["entryPrice"]),
+                    entry_price=position.get("average_price", signal["entryPrice"]),
                     quantity=abs(position.get("quantity", qty)) or qty,
                     stop_loss=signal["stopLoss"],
                     target=signal["target"],
                     signal_id=signal.get("id"),
                     reasoning=signal.get("reasoning"),
-                    confidence=signal.get("confidence"),
+                    signal_score=signal.get("signal_score"),
+                    estimated_probability=signal.get("estimated_probability"),
+                    calibration_sample_size=signal.get("calibration_sample_size"),
                     confluence_snapshot=evaluation,
-                    indicator_snapshot=signal.get("indicators"),
+                    indicator_snapshot={
+                        "features": signal.get("indicators"),
+                        "raw_signals": signal.get("raw_signals"),
+                        "regime": signal.get("regime"),
+                        "portfolio_state": {
+                            "open_positions": risk_manager.open_positions,
+                            "daily_pnl": risk_manager.daily_pnl,
+                        },
+                    },
+                    universe_version=signal.get("universe_version"),
+                    screener_ranking=signal.get("screener_ranking"),
+                    signal_entry_price=signal["entryPrice"],
                 )
             except Exception as e:
                 self._push_log(
@@ -543,7 +691,7 @@ class TradingEngine:
                     "sl": signal["stopLoss"],
                     "target": signal["target"],
                     "direction": signal["direction"],
-                    "entry_price": position.get("averagePrice", signal["entryPrice"]),
+                    "entry_price": position.get("average_price", signal["entryPrice"]),
                     "entry_time": datetime.datetime.now(),
                     "original_strategy": signal.get("strategy", "unknown"),
                     "entry_order_id": order_id,
@@ -551,6 +699,9 @@ class TradingEngine:
                     "exit_pending": False,
                     "exit_order_id": None,
                     "exchange": position.get("exchange", exchange),
+                    # trailing_sl=True disables the resistance/support smart exit
+                    # (Issue 6) since the dynamic stop already handles exit management.
+                    "trailing_sl": signal.get("trailing_sl", False),
                 }
             self._persist_trades()
             return True
@@ -576,18 +727,20 @@ class TradingEngine:
 
     def monitor_positions(self):
         try:
-            positions = kite_client.get_positions().get("net", [])
-            total_pnl = sum(
-                p.get("realised", 0.0) + p.get("unrealised", 0.0) for p in positions
-            )
-            pnl_delta = total_pnl - risk_manager.daily_pnl
-            if pnl_delta != 0:
-                risk_manager.update_pnl(pnl_delta)
-            open_count = sum(1 for p in positions if p["quantity"] != 0)
+            positions_data = kite_client.get_positions()
+            positions_net = positions_data.get("net", [])
+            positions_day = positions_data.get("day", [])
+
+            # Fast in-memory update using day positions (only today's trades)
+            risk_manager.update_from_positions(positions_day)
+
+            open_count = sum(1 for p in positions_net if p["quantity"] != 0)
             risk_manager.set_open_positions(open_count)
 
             # Get symbols of currently open positions to track manual closures
-            open_symbols = {p["tradingsymbol"] for p in positions if p["quantity"] != 0}
+            open_symbols = {
+                p["tradingsymbol"] for p in positions_net if p["quantity"] != 0
+            }
 
             # 1. Sync pending exits FIRST. If an exit order was filled, the position
             # drops from 'open_symbols'. We must process the pending exit before
@@ -611,7 +764,7 @@ class TradingEngine:
             # run WITHOUT the lock held, so a slow broker API can't freeze the
             # JSON-RPC thread or the scanner callback (both need this lock).
             with self._trade_lock:
-                symbols_to_remove = [
+                missing_symbols = [
                     s
                     for s in self.active_trades
                     if s not in open_symbols
@@ -620,12 +773,32 @@ class TradingEngine:
                 tracked = set(self.active_trades.keys())
                 pending = set(self._pending_entries)
 
-            # Manual closures: the position is flat but we still track it — it was
-            # closed outside the app-side exit path, most often by the broker-side
-            # protective stop filling (also: a manual close in the Kite app). Book
-            # the close in the journal so the trade doesn't stay OPEN forever and
-            # is included in analytics, then cancel any leftover stop and drop it.
-            for symbol in symbols_to_remove:
+            now_ts = time.time()
+            confirmed_removals = []
+            for symbol in missing_symbols:
+                if symbol not in self._external_close_candidates:
+                    # First time we see it missing — record the timestamp and skip
+                    self._external_close_candidates[symbol] = now_ts
+                    self._push_log(
+                        f"{symbol} not found in open positions. Will confirm closure in "
+                        f"{self._external_close_grace_seconds:.0f}s.",
+                        level="info",
+                    )
+                elif (
+                    now_ts - self._external_close_candidates[symbol]
+                    >= self._external_close_grace_seconds
+                ):
+                    confirmed_removals.append(symbol)
+
+            # Clear candidates that came back to life (position reappeared)
+            for symbol in list(self._external_close_candidates.keys()):
+                if symbol in open_symbols or symbol not in missing_symbols:
+                    if symbol in self._external_close_candidates:
+                        del self._external_close_candidates[symbol]
+
+            # Manual closures — confirmed after grace period:
+            for symbol in confirmed_removals:
+                self._external_close_candidates.pop(symbol, None)
                 self._push_log(
                     f"Detected external closure for {symbol}. Removing from tracking."
                 )
@@ -636,7 +809,7 @@ class TradingEngine:
 
             # Evaluate each open position. Trade state is re-read under a short
             # lock immediately before each decision.
-            for p in positions:
+            for p in positions_net:
                 if p["quantity"] == 0:
                     continue
                 symbol = p["tradingsymbol"]
@@ -672,8 +845,20 @@ class TradingEngine:
                     hit_sl = ltp >= sl
                     hit_target = ltp <= target
 
-                if hit_sl or hit_target:
-                    reason = "Stop Loss" if hit_sl else "Target"
+                with self._trade_lock:
+                    trade_snapshot = self.active_trades.get(symbol, {})
+                    is_trailing = trade_snapshot.get("trailing_sl", False)
+
+                hit_resistance = False
+                if not hit_sl and not hit_target and not is_trailing:
+                    hit_resistance = self._check_resistance_exit(symbol, ltp, direction)
+
+                if hit_sl or hit_target or hit_resistance:
+                    reason = (
+                        "Stop Loss"
+                        if hit_sl
+                        else ("Target" if hit_target else "Resistance/Support")
+                    )
                     self._push_log(
                         f"{reason} hit for {symbol} at {ltp}. Exiting position."
                     )
@@ -710,6 +895,77 @@ class TradingEngine:
                 return p
         return {}
 
+    def _check_resistance_exit(
+        self, symbol: str, ltp: float, direction: str, lookback: int = 20
+    ) -> bool:
+        try:
+            token = self._ensure_instrument_map().get(symbol)
+            if not token:
+                return False
+
+            # Fetch recent candles (use cache where available)
+            df, _ = scanner._fetch_candles(token, symbol)
+            if df is None or df.empty or len(df) < lookback + 2:
+                return False
+
+            # We calculate resistance/support from the lookback window *prior* to the last completed candle.
+            # Then we check if the last completed candle tested that level but failed to close beyond it.
+            past_candles = df.iloc[-(lookback + 2) : -2]
+            last_candle = df.iloc[-2]
+
+            if len(past_candles) < 5:
+                return False
+
+            if direction == "BUY":
+                # Resistance = highest high over lookback
+                resistance = past_candles["high"].max()
+                # Exit only if the last completed candle TESTED the resistance (high >= resistance)
+                # but CLOSED BELOW it (resistance rejected the price — it won)
+                last_high = last_candle["high"]
+                last_close = last_candle["close"]
+
+                if last_high >= resistance and last_close < resistance:
+                    with self._trade_lock:
+                        trade = self.active_trades.get(symbol, {})
+                        target = trade.get("target", 0)
+                    # Only trigger if resistance is between entry and target
+                    # (don't exit prematurely if resistance is below entry)
+                    entry_price = trade.get("entry_price", 0)
+                    if (
+                        entry_price > 0
+                        and resistance > entry_price
+                        and resistance < target
+                    ):
+                        self._push_log(
+                            f"Resistance exit check for {symbol}: resistance ₹{resistance:.2f}, "
+                            f"last candle tested high ₹{last_high:.2f} but closed ₹{last_close:.2f} — resistance wins. Exiting.",
+                            level="info",
+                        )
+                        return True
+            else:  # SELL
+                # Support = lowest low over lookback
+                support = past_candles["low"].min()
+                last_low = last_candle["low"]
+                last_close = last_candle["close"]
+
+                if last_low <= support and last_close > support:
+                    with self._trade_lock:
+                        trade = self.active_trades.get(symbol, {})
+                        target = trade.get("target", 0)
+                    entry_price = trade.get("entry_price", 0)
+                    if entry_price > 0 and support < entry_price and support > target:
+                        self._push_log(
+                            f"Support exit check for {symbol}: support ₹{support:.2f}, "
+                            f"last candle tested low ₹{last_low:.2f} but closed ₹{last_close:.2f} — support wins. Exiting.",
+                            level="info",
+                        )
+                        return True
+        except Exception as e:
+            self._push_log(
+                f"Resistance exit check failed for {symbol}: {e}", level="warning"
+            )
+        return False
+
     def _adopt_position(self, p: dict):
         """Adopt an untracked open position (auto mode) with a protective stop.
 
@@ -718,7 +974,7 @@ class TradingEngine:
         cancels the just-placed stop to avoid an orphaned broker order.
         """
         symbol = p["tradingsymbol"]
-        avg_price = p.get("averagePrice", 0)
+        avg_price = p.get("average_price", 0)
         if avg_price <= 0:
             return
 
@@ -787,7 +1043,9 @@ class TradingEngine:
         if lost_race:
             if stop_order_id:
                 try:
-                    kite_client.cancel_order("regular", stop_order_id)
+                    execution_gateway.cancel_order(
+                        variety="regular", order_id=stop_order_id
+                    )
                 except Exception:
                     pass
             return
@@ -848,7 +1106,7 @@ class TradingEngine:
                 continue  # Position already closed
 
             if entry_price == 0:
-                entry_price = pos.get("averagePrice", 0)
+                entry_price = pos.get("average_price", 0)
 
             # Evaluate current strategy signals for this symbol.
             # This is network I/O — intentionally NOT under the lock.
@@ -955,7 +1213,7 @@ class TradingEngine:
             limit_price = self._round_to_tick(limit_price, tick_size)
 
             try:
-                kite_client.modify_order(
+                execution_gateway.modify_order(
                     variety="regular",
                     order_id=stop_order_id,
                     trigger_price=trigger_price,
@@ -1037,7 +1295,7 @@ class TradingEngine:
             time.sleep(self._entry_fill_poll_seconds)
 
         try:
-            kite_client.cancel_order("regular", order_id)
+            execution_gateway.cancel_order(variety="regular", order_id=order_id)
         except Exception:
             pass
         position = self._find_live_position(symbol, direction)
@@ -1082,32 +1340,51 @@ class TradingEngine:
     ) -> str:
         try:
             symbol = signal["tradingsymbol"]
+
+            if quantity <= 0:
+                raise ValueError("Protective stop quantity must be > 0")
+            if signal.get("stopLoss", 0) <= 0:
+                raise ValueError("Protective stop trigger price must be > 0")
+            if exchange not in ["NSE", "NFO", "BSE", "MCX", "CDS"]:
+                raise ValueError(f"Invalid exchange {exchange}")
+            if product not in ["MIS", "NRML", "CNC"]:
+                raise ValueError(f"Invalid product {product}")
+
             direction = signal["direction"]
             stop_tx = "SELL" if direction == "BUY" else "BUY"
             tick_size = self._get_tick_size(symbol, exchange)
             trigger_price = self._round_to_tick(signal["stopLoss"], tick_size)
 
-            buffer_pct = 0.01
-            if stop_tx == "SELL":
-                limit_price = trigger_price * (1 - buffer_pct)
-            else:
-                limit_price = trigger_price * (1 + buffer_pct)
-            limit_price = self._round_to_tick(limit_price, tick_size)
+            risk_config = config_manager.get_risk_config()
+            stop_order_type = risk_config.get("stopOrderType", "SL")
 
-            order_id = kite_client.place_order(
-                variety="regular",
-                exchange=exchange,
-                tradingsymbol=symbol,
-                transaction_type=stop_tx,
-                quantity=quantity,
-                product=product,
-                order_type="SL",
-                price=limit_price,
-                trigger_price=trigger_price,
-            )
+            order_args = {
+                "is_entry": False,
+                "variety": "regular",
+                "exchange": exchange,
+                "tradingsymbol": symbol,
+                "transaction_type": stop_tx,
+                "quantity": quantity,
+                "product": product,
+                "order_type": stop_order_type,
+                "trigger_price": trigger_price,
+            }
+
+            limit_price = 0
+            if stop_order_type == "SL":
+                buffer_pct = 0.01
+                if stop_tx == "SELL":
+                    limit_price = trigger_price * (1 - buffer_pct)
+                else:
+                    limit_price = trigger_price * (1 + buffer_pct)
+                limit_price = self._round_to_tick(limit_price, tick_size)
+                order_args["price"] = limit_price
+
+            order_id = execution_gateway.place_order(**order_args)
             self._push_log(
-                f"Placed protective stop for {symbol} at trigger ₹{trigger_price}, limit ₹{limit_price}, order_id {order_id}"
+                f"Placed protective stop ({stop_order_type}) for {symbol} at trigger ₹{trigger_price}, limit ₹{limit_price}, order_id {order_id}"
             )
+
             with self._trade_lock:
                 trade = self.active_trades.get(symbol, {})
                 trade_id = trade.get("trade_id")
@@ -1133,6 +1410,31 @@ class TradingEngine:
             )
             return ""
 
+    def _confirm_protective_stop(self, order_id: str, timeout_seconds: int = 3) -> bool:
+        """Polls the broker to confirm the protective stop is OPEN or TRIGGER PENDING."""
+        if not order_id:
+            return False
+
+        deadline = time.time() + timeout_seconds
+        while time.time() <= deadline:
+            order = self._find_order(order_id)
+            if order:
+                status = str(order.get("status", "")).upper()
+                if status in {"OPEN", "TRIGGER PENDING"}:
+                    return True
+                elif status in {"REJECTED", "CANCELLED"}:
+                    self._push_log(
+                        f"Protective stop {order_id} failed with status {status}",
+                        level="error",
+                    )
+                    return False
+            time.sleep(0.5)
+
+        self._push_log(
+            f"Timed out confirming protective stop {order_id}", level="error"
+        )
+        return False
+
     def _cancel_protective_stop(self, symbol: str):
         with self._trade_lock:
             trade = self.active_trades.get(symbol)
@@ -1143,7 +1445,7 @@ class TradingEngine:
                 return
             trade["stop_order_id"] = None
         try:
-            kite_client.cancel_order("regular", stop_order_id)
+            execution_gateway.cancel_order(variety="regular", order_id=stop_order_id)
         except Exception:
             pass
 
@@ -1185,7 +1487,7 @@ class TradingEngine:
             order_kwargs["price"] = price
 
         try:
-            order_id = kite_client.place_order(**order_kwargs)
+            order_id = execution_gateway.place_order(**order_kwargs)
         except Exception as e:
             if order_type == "LIMIT":
                 self._push_log(
@@ -1196,7 +1498,7 @@ class TradingEngine:
                 if "price" in order_kwargs:
                     del order_kwargs["price"]
                 try:
-                    order_id = kite_client.place_order(**order_kwargs)
+                    order_id = execution_gateway.place_order(**order_kwargs)
                 except Exception as e2:
                     with self._trade_lock:
                         if symbol in self.active_trades:
@@ -1245,10 +1547,12 @@ class TradingEngine:
                     exit_reason = self.active_trades[symbol].get(
                         "exit_reason", "unknown"
                     )
-                    avg_price = float(order.get("averagePrice") or 0)
+                    avg_price = float(order.get("average_price") or 0)
 
                     if trade_id:
                         try:
+                            # Try to compute cost if possible, though _sync_exit_pending_status might not have all trades.
+                            # Reconcile job will fix if needed. For now, pass no cost_details or try a quick calculate.
                             journal.close_trade(trade_id, avg_price, exit_reason)
                         except Exception as e:
                             self._push_log(
@@ -1262,47 +1566,241 @@ class TradingEngine:
                     del self.active_trades[symbol]
             break
 
+    def _reconcile_execution(self, symbol: str, trade_record: dict) -> tuple:
+        """
+        Query Kite trades to find the actual execution VWAP, reason, and time.
+        Returns (exit_price, exit_reason, exit_time, cost_details). If not found, returns (0.0, "UNRECONCILED", None, None).
+        """
+        try:
+            trades = kite_client.get_trades()
+        except Exception as e:
+            self._push_log(
+                f"Failed to fetch trades for reconciliation: {e}", level="warning"
+            )
+            return 0.0, "UNRECONCILED", None, None
+
+        stop_order_id = str(trade_record.get("stop_order_id", ""))
+        exit_order_id = str(trade_record.get("exit_order_id", ""))
+        entry_time_val = trade_record.get("entry_time")
+        if isinstance(entry_time_val, str):
+            try:
+                entry_time = datetime.datetime.fromisoformat(entry_time_val)
+            except ValueError:
+                entry_time = datetime.datetime.now()
+        elif isinstance(entry_time_val, datetime.datetime):
+            entry_time = entry_time_val
+        else:
+            entry_time = datetime.datetime.now()
+
+        entry_direction = trade_record.get("direction", "BUY")
+        exit_transaction_type = "SELL" if entry_direction == "BUY" else "BUY"
+
+        matched_trades = []
+        for t in trades:
+            if t.get("tradingsymbol") != symbol:
+                continue
+            t_order_id = str(t.get("orderId", ""))
+            t_time_str = t.get("fillTimestamp") or t.get("exchangeTimestamp")
+            try:
+                if isinstance(t_time_str, datetime.datetime):
+                    t_time = t_time_str
+                else:
+                    t_time = (
+                        datetime.datetime.strptime(t_time_str, "%Y-%m-%d %H:%M:%S")
+                        if t_time_str
+                        else datetime.datetime.now()
+                    )
+            except (ValueError, TypeError):
+                t_time = datetime.datetime.now()
+
+            # Must be after entry
+            if t_time < entry_time:
+                continue
+
+            # Exact order match
+            if stop_order_id and t_order_id == stop_order_id:
+                matched_trades.append((t, "stop_loss"))
+            elif exit_order_id and t_order_id == exit_order_id:
+                matched_trades.append((t, "target"))
+            # Fallback for manual/broker exits: match by opposite direction
+            elif t.get("transaction_type") == exit_transaction_type:
+                matched_trades.append((t, "manual_broker_exit"))
+
+        if not matched_trades:
+            return 0.0, "UNRECONCILED", None, None
+
+        # Sort by time
+        matched_trades.sort(
+            key=lambda x: str(
+                x[0].get("fillTimestamp") or x[0].get("exchangeTimestamp") or ""
+            )
+        )
+
+        target_qty = abs(trade_record.get("quantity", 0))
+        if target_qty == 0:
+            # If not provided, take all matched trades for this symbol
+            accumulated_qty = sum(int(t[0].get("quantity", 0)) for t in matched_trades)
+            target_qty = accumulated_qty or 1
+
+        total_value = 0.0
+        total_qty = 0
+        reasons = set()
+        last_time = None
+
+        for t, reason in matched_trades:
+            qty = int(t.get("quantity", 0))
+            if total_qty + qty > target_qty:
+                qty = target_qty - total_qty
+
+            if qty <= 0:
+                break
+
+            price = float(t.get("average_price") or 0.0)
+            total_value += price * qty
+            total_qty += qty
+            reasons.add(reason)
+            last_time = t.get("fillTimestamp") or t.get("exchangeTimestamp")
+
+            if total_qty >= target_qty:
+                break
+
+        if total_qty == 0:
+            return 0.0, "UNRECONCILED", None, None
+
+        vwap = round(total_value / total_qty, 2)
+
+        # Determine main reason
+        if "stop_loss" in reasons:
+            final_reason = "stop_loss"
+        elif "target" in reasons:
+            final_reason = "target"
+        else:
+            final_reason = "manual_broker_exit"
+
+        if last_time:
+            if isinstance(last_time, datetime.datetime):
+                last_time = last_time.isoformat()
+            else:
+                try:
+                    dt = datetime.datetime.strptime(last_time, "%Y-%m-%d %H:%M:%S")
+                    last_time = dt.isoformat()
+                except (ValueError, TypeError):
+                    pass
+
+        cost_details = None
+        if final_reason != "UNRECONCILED":
+            # Determine slippage limits if available
+            entry_price = float(trade_record.get("entry_price", 0.0))
+            direction = trade_record.get("direction", "BUY")
+            signal_entry_price = trade_record.get("signal_entry_price")
+
+            signal_exit_price = None
+            if final_reason == "stop_loss":
+                signal_exit_price = trade_record.get("sl")
+            elif final_reason == "target":
+                signal_exit_price = trade_record.get("target")
+
+            cost_details = cost_calculator.calculate_trade_charges(
+                direction=direction,
+                entry_price=entry_price,
+                exit_price=vwap,
+                quantity=total_qty,
+                signal_entry_price=signal_entry_price,
+                signal_exit_price=signal_exit_price,
+            )
+
+        return vwap, final_reason, last_time, cost_details
+
     def _journal_external_close(self, symbol: str):
         """Book a journal close for a position closed outside the app-side exit
-        path (broker-stop fill or a manual close in Kite). Uses the current LTP
-        as the exit price and infers the reason from the protective stop's
-        status."""
+        path (broker-stop fill or a manual close in Kite)."""
         with self._trade_lock:
             trade = self.active_trades.get(symbol)
             if not trade:
                 return
             trade_id = trade.get("trade_id")
-            stop_order_id = trade.get("stop_order_id")
-            exchange = trade.get("exchange", "NSE")
+            trade_record = dict(trade)
+
         if not trade_id:
             return
 
-        # Exit price: best available post-hoc estimate is the current LTP.
-        exit_price = 0.0
-        try:
-            data = kite_client.get_ltp([f"{exchange}:{symbol}"])
-            exit_price = (data.get(f"{exchange}:{symbol}") or {}).get("last_price", 0.0)
-        except Exception:
-            pass
+        exit_price, reason, exit_time, cost_details = self._reconcile_execution(
+            symbol, trade_record
+        )
 
-        # If the protective stop shows COMPLETE, the stop closed it.
-        reason = "closed_externally"
-        if stop_order_id:
-            try:
-                for o in kite_client.get_orders():
-                    if str(o.get("orderId")) == str(stop_order_id):
-                        if str(o.get("status", "")).upper() == "COMPLETE":
-                            reason = "stop_loss"
-                        break
-            except Exception:
-                pass
+        if reason == "UNRECONCILED":
+            self._push_log(
+                f"Execution exact details not found for {symbol}. Marking as UNRECONCILED.",
+                level="warning",
+            )
 
         try:
-            journal.close_trade(trade_id, exit_price, reason)
+            journal.close_trade(
+                trade_id, exit_price, reason, exit_time, cost_details=cost_details
+            )
         except Exception as e:
             self._push_log(
                 f"Error closing trade in journal for {symbol}: {e}", level="error"
             )
+
+    def _reconcile_journal_trades(self):
+        """Periodically check journal OPEN or UNRECONCILED trades and fix them using broker executions."""
+        try:
+            open_positions = {
+                p["tradingsymbol"]: p
+                for p in kite_client.get_positions().get("net", [])
+                if p.get("quantity", 0) != 0
+            }
+        except Exception as e:
+            self._push_log(
+                f"Reconcile job: failed to fetch positions: {e}", level="warning"
+            )
+            return
+
+        try:
+            journal_trades = journal.get_trades()
+        except Exception:
+            return
+
+        for t in journal_trades:
+            if t["status"] == "OPEN" and t["tradingsymbol"] not in open_positions:
+                # Ghost open position in journal
+                self._push_log(
+                    f"Reconcile job: Found ghost OPEN trade for {t['tradingsymbol']}. Attempting to reconcile."
+                )
+                exit_price, reason, exit_time, cost_details = self._reconcile_execution(
+                    t["tradingsymbol"], dict(t)
+                )
+                if reason != "UNRECONCILED":
+                    journal.close_trade(
+                        t["id"],
+                        exit_price,
+                        reason,
+                        exit_time,
+                        cost_details=cost_details,
+                    )
+                    self._push_log(
+                        f"Reconcile job: Closed {t['tradingsymbol']} at {exit_price} ({reason})"
+                    )
+                else:
+                    journal.close_trade(t["id"], 0.0, "UNRECONCILED", None)
+
+            elif t["status"] == "CLOSED" and t["exit_reason"] == "UNRECONCILED":
+                # Try to find fills now
+                exit_price, reason, exit_time, cost_details = self._reconcile_execution(
+                    t["tradingsymbol"], dict(t)
+                )
+                if reason != "UNRECONCILED":
+                    journal.update_trade_exit(
+                        t["id"],
+                        exit_price,
+                        reason,
+                        exit_time,
+                        cost_details=cost_details,
+                    )
+                    self._push_log(
+                        f"Reconcile job: Reconciled {t['tradingsymbol']} at {exit_price} ({reason})"
+                    )
 
 
 trading_engine = TradingEngine()

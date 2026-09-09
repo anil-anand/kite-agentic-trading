@@ -2,7 +2,8 @@ from typing import Any, Dict, List
 
 import pandas as pd
 from ta.momentum import RSIIndicator
-from ta.volume import VolumeWeightedAveragePrice
+
+from backend.indicators import SessionVWAP
 
 from .base import BaseStrategy
 
@@ -24,9 +25,7 @@ class RSIReversalStrategy(BaseStrategy):
         df = df.copy()
 
         rsi = RSIIndicator(close=df["close"], window=14).rsi()
-        vwap = VolumeWeightedAveragePrice(
-            high=df["high"], low=df["low"], close=df["close"], volume=df["volume"]
-        ).volume_weighted_average_price()
+        vwap = SessionVWAP(df).vwap()
 
         df["rsi"] = rsi
         df["vwap"] = vwap
@@ -40,14 +39,14 @@ class RSIReversalStrategy(BaseStrategy):
             sl = self.calculate_stop_loss(entry, "BUY")
             target = self.calculate_target(entry, sl)
 
-            confidence = int(70 + (30 - prev["rsi"]))
-            confidence = min(100, max(50, confidence))
+            signal_score = int(70 + (30 - prev["rsi"]))
+            signal_score = min(100, max(50, signal_score))
 
             signals.append(
                 self.format_signal(
                     tradingsymbol,
                     "BUY",
-                    confidence,
+                    signal_score,
                     entry,
                     sl,
                     target,
@@ -65,14 +64,14 @@ class RSIReversalStrategy(BaseStrategy):
             sl = self.calculate_stop_loss(entry, "SELL")
             target = self.calculate_target(entry, sl)
 
-            confidence = int(70 + (prev["rsi"] - 70))
-            confidence = min(100, max(50, confidence))
+            signal_score = int(70 + (prev["rsi"] - 70))
+            signal_score = min(100, max(50, signal_score))
 
             signals.append(
                 self.format_signal(
                     tradingsymbol,
                     "SELL",
-                    confidence,
+                    signal_score,
                     entry,
                     sl,
                     target,

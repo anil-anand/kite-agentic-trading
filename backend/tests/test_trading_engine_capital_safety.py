@@ -18,7 +18,45 @@ class FakeKiteClient:
         self.place_calls.append(kwargs)
         order_id = f"OID{self._next_id}"
         self._next_id += 1
+        status = (
+            "COMPLETE" if kwargs.get("order_type") in ["LIMIT", "MARKET"] else "OPEN"
+        )
+        qty = kwargs.get("quantity", 0) if status == "COMPLETE" else 0
+        self.orders.append(
+            {
+                "orderId": order_id,
+                "order_id": order_id,
+                "status": status,
+                "filledQuantity": qty,
+            }
+        )
+
+        if status == "COMPLETE":
+            sym = kwargs.get("tradingsymbol")
+            delta_qty = qty if kwargs.get("transaction_type") == "BUY" else -qty
+            net_pos = self.positions.get("net", [])
+            found = False
+            for p in net_pos:
+                if p.get("tradingsymbol") == sym:
+                    p["quantity"] = p.get("quantity", 0) + delta_qty
+                    found = True
+                    break
+            if not found:
+                net_pos.append(
+                    {
+                        "tradingsymbol": sym,
+                        "quantity": delta_qty,
+                        "exchange": kwargs.get("exchange", "NSE"),
+                        "product": kwargs.get("product", "MIS"),
+                        "lastPrice": kwargs.get("price", 0),
+                    }
+                )
+            self.positions["net"] = net_pos
+
         return order_id
+
+    def emergency_flatten_position(self, **kwargs):
+        return self.place_order(**kwargs)
 
     def cancel_order(self, variety, order_id, parent_order_id=None):
         self.cancel_calls.append(
@@ -33,6 +71,9 @@ class FakeKiteClient:
         self.modify_calls.append(kwargs)
 
     def get_positions(self):
+        # Return net positions as day positions as well for test simplicity
+        if "day" not in self.positions:
+            self.positions["day"] = self.positions.get("net", [])
         return self.positions
 
     def get_margins(self):
@@ -83,9 +124,25 @@ class FakeRiskManager:
     def set_open_positions(self, count):
         self.open_positions = count
 
+    def can_accept_position(
+        self, symbol, direction, qty, price, active_trades, open_orders
+    ):
+        return True, "OK"
+
     def update_pnl(self, pnl):
         self.daily_pnl += pnl
         self.pnl_updates.append(pnl)
+
+    def update_from_positions(self, positions):
+        realized_gross = sum(p.get("realised", 0.0) for p in positions)
+        unrealized = sum(p.get("unrealised", 0.0) for p in positions)
+        pnl = realized_gross + unrealized
+        # To make old tests pass, append the delta, wait, old tests look for absolute `daily_pnl` and specific `pnl_updates`
+        # old `update_pnl` took a delta. `update_from_positions` calculates absolute.
+        delta = pnl - self.daily_pnl
+        self.daily_pnl = pnl
+        if delta != 0:
+            self.pnl_updates.append(delta)
 
 
 def _sample_signal():
@@ -117,6 +174,7 @@ def test_execute_signal_places_protective_stop_and_tracks_trade(monkeypatch):
         ]
     }
     fake_risk = FakeRiskManager()
+    monkeypatch.setattr(te, "execution_gateway", fake_client)
     monkeypatch.setattr(te, "kite_client", fake_client)
     monkeypatch.setattr(te, "risk_manager", fake_risk)
 
@@ -141,6 +199,7 @@ def test_execute_signal_does_not_submit_when_margin_cannot_fund_entry(monkeypatc
     fake_client.margins = {"equity": {"available": {"live_balance": 99}}}
     fake_risk = FakeRiskManager()
     fake_risk.calculate_position_size = lambda price, stop_loss, available_margin: 0
+    monkeypatch.setattr(te, "execution_gateway", fake_client)
     monkeypatch.setattr(te, "kite_client", fake_client)
     monkeypatch.setattr(te, "risk_manager", fake_risk)
 
@@ -159,6 +218,7 @@ def test_execute_signal_treats_explicit_zero_live_balance_as_unavailable_margin(
     fake_client.margins = {"equity": {"available": {"live_balance": 0}, "net": 10_000}}
     fake_risk = FakeRiskManager()
     fake_risk.calculate_position_size = lambda price, stop_loss, available_margin: 0
+    monkeypatch.setattr(te, "execution_gateway", fake_client)
     monkeypatch.setattr(te, "kite_client", fake_client)
     monkeypatch.setattr(te, "risk_manager", fake_risk)
 
@@ -200,6 +260,7 @@ def test_concurrent_entries_do_not_reuse_reserved_margin(monkeypatch):
     fake_risk.calculate_position_size = lambda price, stop_loss, available_margin: (
         10 if available_margin >= 1_000 else 0
     )
+    monkeypatch.setattr(te, "execution_gateway", fake_client)
     monkeypatch.setattr(te, "kite_client", fake_client)
     monkeypatch.setattr(te, "risk_manager", fake_risk)
 
@@ -214,6 +275,9 @@ def test_concurrent_entries_do_not_reuse_reserved_margin(monkeypatch):
         target=lambda: second_result.append(engine.execute_signal(second_signal))
     )
     second.start()
+    import time
+
+    time.sleep(0.1)
     fake_client.release.set()
     first.join(timeout=1)
     second.join(timeout=1)
@@ -232,6 +296,7 @@ def test_execute_signal_does_not_track_unfilled_order(monkeypatch):
         {"orderId": "OID1", "status": "REJECTED", "filledQuantity": 0},
     ]
     fake_risk = FakeRiskManager()
+    monkeypatch.setattr(te, "execution_gateway", fake_client)
     monkeypatch.setattr(te, "kite_client", fake_client)
     monkeypatch.setattr(te, "risk_manager", fake_risk)
 
@@ -259,12 +324,13 @@ def test_monitor_positions_updates_pnl_and_prevents_double_exit(monkeypatch):
                 "lastPrice": 94.0,
                 "realised": -50.0,
                 "unrealised": -25.0,
-                "averagePrice": 100.0,
+                "average_price": 100.0,
             }
         ]
     }
     fake_client.orders = [{"orderId": "OID1", "status": "OPEN", "filledQuantity": 0}]
     fake_risk = FakeRiskManager()
+    monkeypatch.setattr(te, "execution_gateway", fake_client)
     monkeypatch.setattr(te, "kite_client", fake_client)
     monkeypatch.setattr(te, "risk_manager", fake_risk)
 
@@ -298,6 +364,7 @@ def test_tighten_to_breakeven_modifies_broker_side_stop(monkeypatch):
     import backend.trading_engine as te
 
     fake_client = FakeKiteClient()
+    monkeypatch.setattr(te, "execution_gateway", fake_client)
     monkeypatch.setattr(te, "kite_client", fake_client)
 
     engine = TradingEngine()
@@ -337,13 +404,14 @@ def test_adopted_position_gets_protective_stop(monkeypatch):
                 "exchange": "NSE",
                 "product": "MIS",
                 "lastPrice": 200.0,
-                "averagePrice": 200.0,
+                "average_price": 200.0,
                 "realised": 0.0,
                 "unrealised": 0.0,
             }
         ]
     }
     fake_risk = FakeRiskManager()
+    monkeypatch.setattr(te, "execution_gateway", fake_client)
     monkeypatch.setattr(te, "kite_client", fake_client)
     monkeypatch.setattr(te, "risk_manager", fake_risk)
 
@@ -374,6 +442,7 @@ def test_exit_order_uses_market_when_ltp_zero(monkeypatch):
     import backend.trading_engine as te
 
     fake_client = FakeKiteClient()
+    monkeypatch.setattr(te, "execution_gateway", fake_client)
     monkeypatch.setattr(te, "kite_client", fake_client)
 
     engine = TradingEngine()
@@ -399,6 +468,7 @@ def test_exit_order_uses_limit_when_ltp_available(monkeypatch):
     import backend.trading_engine as te
 
     fake_client = FakeKiteClient()
+    monkeypatch.setattr(te, "execution_gateway", fake_client)
     monkeypatch.setattr(te, "kite_client", fake_client)
 
     engine = TradingEngine()
@@ -427,6 +497,7 @@ def test_sync_exit_pending_removes_trade_on_complete(monkeypatch):
     fake_client.orders = [
         {"orderId": "EXIT1", "status": "COMPLETE", "filledQuantity": 10}
     ]
+    monkeypatch.setattr(te, "execution_gateway", fake_client)
     monkeypatch.setattr(te, "kite_client", fake_client)
 
     engine = TradingEngine()
@@ -467,6 +538,7 @@ def test_duplicate_execute_signal_is_blocked(monkeypatch):
         ]
     }
     fake_risk = FakeRiskManager()
+    monkeypatch.setattr(te, "execution_gateway", fake_client)
     monkeypatch.setattr(te, "kite_client", fake_client)
     monkeypatch.setattr(te, "risk_manager", fake_risk)
 
@@ -503,6 +575,7 @@ def test_concurrent_place_exit_order_only_fires_once(monkeypatch):
     import backend.trading_engine as te
 
     fake_client = FakeKiteClient()
+    monkeypatch.setattr(te, "execution_gateway", fake_client)
     monkeypatch.setattr(te, "kite_client", fake_client)
 
     engine = TradingEngine()
@@ -559,13 +632,14 @@ def test_pending_entries_prevents_adoption(monkeypatch):
                 "exchange": "NSE",
                 "product": "MIS",
                 "lastPrice": 100.0,
-                "averagePrice": 100.0,
+                "average_price": 100.0,
                 "realised": 0.0,
                 "unrealised": 0.0,
             }
         ]
     }
     fake_risk = FakeRiskManager()
+    monkeypatch.setattr(te, "execution_gateway", fake_client)
     monkeypatch.setattr(te, "kite_client", fake_client)
     monkeypatch.setattr(te, "risk_manager", fake_risk)
 
@@ -595,6 +669,7 @@ def test_exit_pending_resets_on_place_order_failure(monkeypatch):
 
     fake_client = FakeKiteClient()
     fake_client.place_order = failing_place_order
+    monkeypatch.setattr(te, "execution_gateway", fake_client)
     monkeypatch.setattr(te, "kite_client", fake_client)
 
     engine = TradingEngine()
@@ -660,12 +735,13 @@ def test_monitor_skips_exit_when_broker_stop_already_closed(monkeypatch):
             "lastPrice": 94.0,  # <= sl of 95 -> stop hit
             "realised": 0.0,
             "unrealised": -60.0,
-            "averagePrice": 100.0,
+            "average_price": 100.0,
         }
     ]
     # 1st get_positions (snapshot) = open; 2nd (pre-exit re-read) = flat.
     fake_client = SequencedKiteClient([open_pos, []])
     fake_risk = FakeRiskManager()
+    monkeypatch.setattr(te, "execution_gateway", fake_client)
     monkeypatch.setattr(te, "kite_client", fake_client)
     monkeypatch.setattr(te, "risk_manager", fake_risk)
 
@@ -727,11 +803,12 @@ def test_trade_lock_not_held_during_order_io(monkeypatch):
                 "lastPrice": 111.0,  # >= target of 110 -> target hit
                 "realised": 0.0,
                 "unrealised": 0.0,
-                "averagePrice": 100.0,
+                "average_price": 100.0,
             }
         ]
     }
     fake_risk = FakeRiskManager()
+    monkeypatch.setattr(te, "execution_gateway", fake_client)
     monkeypatch.setattr(te, "kite_client", fake_client)
     monkeypatch.setattr(te, "risk_manager", fake_risk)
 

@@ -25,6 +25,7 @@ const Dashboard: React.FC = () => {
 
   React.useEffect(() => {
     const fetchData = async () => {
+      if (!useTradingStore.getState().auth.isLoggedIn) return;
       try {
         const summary = await window.electronAPI?.dashboard.summary();
         if (summary) setDashboard(summary);
@@ -53,9 +54,10 @@ const Dashboard: React.FC = () => {
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
         <PnLDisplay 
           amount={dashboard?.totalPnl || 0} 
+          netAmount={dashboard?.netPnl}
           percentage={
             ((dashboard?.availableMargin || 0) + (dashboard?.usedMargin || 0)) > 0 
-              ? ((dashboard?.totalPnl || 0) / ((dashboard?.availableMargin || 0) + (dashboard?.usedMargin || 0))) * 100 
+              ? ((dashboard?.netPnl ?? dashboard?.totalPnl ?? 0) / ((dashboard?.availableMargin || 0) + (dashboard?.usedMargin || 0))) * 100 
               : undefined
           } 
         />

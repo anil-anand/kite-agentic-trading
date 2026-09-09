@@ -33,8 +33,18 @@ class ConfigManager:
                 "positionRevalIntervalMins": 30,
                 "positionRevalWeakExitMins": 60,
                 "positionRevalBreakevenMins": 45,
+                "stopOrderType": "SL",
+                "haltAutoTradesOnStopFailure": True,
+                "maxGrossExposure": 200000,
+                "maxNetExposure": 100000,
+                "maxSingleSymbolExposure": 50000,
+                "maxSectorExposure": 75000,
+                "maxCorrelatedExposure": 75000,
+                "correlationThreshold": 0.70,
+                "correlationLookbackDays": 30,
             },
             "strategies": {
+                "evaluateOnIncompleteCandle": False,
                 "ema_crossover": {"enabled": True},
                 "rsi_reversal": {"enabled": True},
                 "vwap_bounce": {"enabled": True},
@@ -52,6 +62,11 @@ class ConfigManager:
                 "awesome_oscillator": {"enabled": True},
                 "tsi_cross": {"enabled": True},
                 "stoc_rsi": {"enabled": True},
+            },
+            "families": {
+                "trend": {"weight": 1.0, "enabled": True},
+                "mean_reversion": {"weight": 1.0, "enabled": True},
+                "breakout": {"weight": 1.0, "enabled": True},
             },
             "watchlist": [
                 "RELIANCE",
@@ -75,6 +90,25 @@ class ConfigManager:
                 "ULTRACEMCO",
                 "NESTLEIND",
             ],
+            "screener": {
+                "weights": {
+                    "baseline": 1.0,
+                    "gap": 1.0,
+                    "volatility": 1.0,
+                    "trend": 1.0,
+                    "volume": 1.0,
+                    "liquidity": 1.0,
+                },
+                "filters": {
+                    "min_volume": 100000,
+                    "min_value_traded": 10000000,
+                },
+                "refreshSchedule": {
+                    "openingPeriodMins": 15,
+                    "normalSessionMins": 60,
+                    "lateSessionMins": 30,
+                },
+            },
             "credentials": {"apiKey": "", "apiSecret": ""},
             "llm": {
                 "provider": "Gemini",
@@ -88,8 +122,9 @@ class ConfigManager:
             "mode": "auto",
         }
 
+        self.in_memory_credentials = {}
+
         self._init_dir()
-        self._init_key()
         self.load()
 
     def _init_dir(self):
@@ -136,27 +171,26 @@ class ConfigManager:
             self.config = deepcopy(self.default_config)
             self.save()
 
-        self._migrate_legacy_llm_key()
-
-    def _migrate_legacy_llm_key(self):
-        legacy_key = self.config.get("credentials", {}).get("llmApiKey", "")
-        llm = self.config.setdefault("llm", deepcopy(self.default_config["llm"]))
-        if llm.get("openCodePlan") not in {"zen", "go"}:
-            llm["openCodePlan"] = "zen"
-        if llm.get("baseUrl", "").endswith("/openai"):
-            llm["baseUrl"] = llm["baseUrl"][:-6]
-            self.save()
-        if legacy_key and not llm.get("apiKey"):
-            decrypted_key = self._decrypt(legacy_key)
-            if decrypted_key:
-                llm["apiKey"] = self._encrypt(decrypted_key)
-                self.save()
+    def clear_legacy_credentials(self):
+        """Called after successful migration to OS native storage."""
+        if "credentials" in self.config:
+            del self.config["credentials"]
+        if "llm" in self.config and "apiKey" in self.config["llm"]:
+            self.config["llm"]["apiKey"] = ""
+        self.save()
+        if self.key_file.exists():
+            try:
+                self.key_file.unlink()
+            except Exception:
+                pass
 
     def save(self):
         with open(self.config_file, "w") as f:
             json.dump(self.config, f, indent=4)
 
-    def get_credentials(self):
+    def get_legacy_credentials(self):
+        """Extract credentials from legacy encrypted config.json."""
+        self._init_key()
         creds = self.config.get("credentials", {})
         llm = self.config.get("llm", {})
         encrypted_llm_key = llm.get("apiKey") or creds.get("llmApiKey", "")
@@ -167,6 +201,17 @@ class ConfigManager:
             "llmApiKey": self._decrypt(encrypted_llm_key),
         }
 
+    def set_credentials(self, creds: dict):
+        self.in_memory_credentials.update(creds)
+
+    def get_credentials(self):
+        return {
+            "apiKey": self.in_memory_credentials.get("apiKey", ""),
+            "apiSecret": self.in_memory_credentials.get("apiSecret", ""),
+            "accessToken": self.in_memory_credentials.get("accessToken", ""),
+            "llmApiKey": self.in_memory_credentials.get("llmApiKey", ""),
+        }
+
     def get_llm_settings(self):
         return deepcopy(self.config.get("llm", self.default_config["llm"]))
 
@@ -175,8 +220,7 @@ class ConfigManager:
         settings.setdefault("llm", deepcopy(self.default_config["llm"]))
         settings["llm"]["apiKey"] = ""
         settings["llm"]["apiKeyConfigured"] = bool(
-            self.config["llm"].get("apiKey")
-            or self.config.get("credentials", {}).get("llmApiKey")
+            self.in_memory_credentials.get("llmApiKey")
         )
         settings["credentials"] = {key: "" for key in settings.get("credentials", {})}
         return settings
@@ -192,11 +236,11 @@ class ConfigManager:
                 self.config[key] = value
 
         if incoming_credentials is not None:
-            credentials = self.config.setdefault("credentials", {})
+            # Update in-memory, but do not write to disk
             for key in ("apiKey", "apiSecret", "accessToken"):
                 value = incoming_credentials.get(key, "")
                 if value and value != "********":
-                    credentials[key] = self._encrypt(value)
+                    self.in_memory_credentials[key] = value
 
         if incoming_llm is not None:
             current_llm = self.config.setdefault(
@@ -214,34 +258,32 @@ class ConfigManager:
                     "baseUrl"
                 ]
             if api_key and api_key != "********":
-                current_llm["apiKey"] = self._encrypt(api_key)
+                self.in_memory_credentials["llmApiKey"] = api_key
         self.save()
 
     def save_credentials(self, api_key: str, api_secret: str, access_token: str = ""):
-        if "credentials" not in self.config:
-            self.config["credentials"] = {}
-
-        self.config["credentials"]["apiKey"] = self._encrypt(api_key)
-        self.config["credentials"]["apiSecret"] = self._encrypt(api_secret)
+        self.in_memory_credentials["apiKey"] = api_key
+        self.in_memory_credentials["apiSecret"] = api_secret
         if access_token:
-            self.config["credentials"]["accessToken"] = self._encrypt(access_token)
-        self.save()
+            self.in_memory_credentials["accessToken"] = access_token
 
     def clear_access_token(self):
-        if "credentials" in self.config:
-            self.config["credentials"]["accessToken"] = ""
-            self.save()
+        self.in_memory_credentials["accessToken"] = ""
 
     def save_llm_api_key(self, llm_api_key: str):
-        self.config.setdefault("llm", deepcopy(self.default_config["llm"]))
-        self.config["llm"]["apiKey"] = self._encrypt(llm_api_key)
-        self.save()
+        self.in_memory_credentials["llmApiKey"] = llm_api_key
 
     def get_risk_config(self):
         return self.config.get("risk", self.default_config["risk"])
 
     def get_strategy_config(self):
         return self.config.get("strategies", self.default_config["strategies"])
+
+    def get_families_config(self):
+        return self.config.get("families", self.default_config.get("families", {}))
+
+    def get_screener_config(self):
+        return self.config.get("screener", self.default_config.get("screener", {}))
 
     def get_watchlist(self):
         return self.config.get("watchlist", self.default_config["watchlist"])
@@ -356,6 +398,22 @@ class ConfigManager:
                 except ValueError:
                     trade["last_reeval_time"] = trade["entry_time"]
         return trades
+
+    def save_daily_risk_state(self, state: dict):
+        """Persist the daily risk state to disk."""
+        path = self.config_dir / "daily_risk_state.json"
+        self._atomic_write_json(path, state)
+
+    def load_daily_risk_state(self) -> dict:
+        """Load persisted daily risk state."""
+        path = self.config_dir / "daily_risk_state.json"
+        if not path.exists():
+            return {}
+        try:
+            with open(path, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
 
 
 config_manager = ConfigManager()

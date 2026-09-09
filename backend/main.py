@@ -5,9 +5,11 @@ import traceback
 from .analytics import analytics
 from .config import config_manager
 from .dev_mode import is_dev_mode
+from .execution_gateway import execution_gateway
 from .journal import journal
 from .kite_client import kite_client
 from .llm_client import OPENCODE_PLANS, OpenAICompatibleClient
+from .risk_manager import risk_manager
 from .scanner import scanner
 from .ticker import ticker_manager
 from .trading_engine import trading_engine
@@ -30,7 +32,18 @@ def handle_request(req):
         }
 
     try:
-        if method == "login":
+        if method == "set_credentials":
+            config_manager.set_credentials(params.get("credentials", {}))
+            return success({"status": "credentials_set"})
+
+        elif method == "migrate_credentials":
+            return success(config_manager.get_legacy_credentials())
+
+        elif method == "clear_legacy_credentials":
+            config_manager.clear_legacy_credentials()
+            return success({"status": "legacy_credentials_cleared"})
+
+        elif method == "login":
             creds = config_manager.get_credentials()
             api_key = params.get("api_key", creds.get("apiKey"))
             api_secret = params.get("api_secret", creds.get("apiSecret"))
@@ -107,15 +120,16 @@ def handle_request(req):
             return success(kite_client.get_margins())
 
         elif method == "place_order":
-            order_id = kite_client.place_order(**params)
+            params["is_entry"] = True  # Assume UI orders are entries unless specified
+            order_id = execution_gateway.place_order(**params)
             return success({"order_id": order_id})
 
         elif method == "cancel_order":
-            res = kite_client.cancel_order(**params)
+            res = execution_gateway.cancel_order(**params)
             return success(res)
 
         elif method == "modify_order":
-            res = kite_client.modify_order(**params)
+            res = execution_gateway.modify_order(**params)
             return success(res)
 
         elif method == "get_historical":
@@ -214,6 +228,16 @@ def handle_request(req):
             if not available_margin:
                 available_margin = equity_margin.get("net", 0)
 
+            if risk_manager.reconciliation_status == "RECONCILIATION_PENDING":
+                try:
+                    risk_manager.reconcile_state()
+                except Exception as e:
+                    from .utils import push_log
+
+                    push_log(
+                        f"Auto-reconcile on dashboard failed: {e}", level="warning"
+                    )
+
             positions = kite_client.get_positions().get("net", [])
             total_pnl = sum(p.get("pnl", p.get("m2m", 0)) for p in positions)
 
@@ -221,12 +245,12 @@ def handle_request(req):
             for p in positions:
                 if p.get("quantity", 0) != 0:
                     multiplier = 0.2 if p.get("product") == "MIS" else 1.0
-                    avg_price = p.get("averagePrice", 0)
+                    avg_price = p.get("average_price", 0)
                     if avg_price == 0:
                         avg_price = (
-                            p.get("buyPrice", 0)
+                            p.get("buy_price", 0)
                             if p.get("quantity", 0) > 0
-                            else p.get("sellPrice", 0)
+                            else p.get("sell_price", 0)
                         )
                     calculated_used_margin += (
                         abs(p.get("quantity", 0)) * avg_price * multiplier
@@ -243,10 +267,13 @@ def handle_request(req):
 
             summary = {
                 "totalPnl": round(total_pnl, 2),
+                "netPnl": round(risk_manager.daily_pnl, 2),
                 "tradesToday": trades_today,
                 "winRate": round(win_rate, 2),
                 "availableMargin": available_margin,
                 "usedMargin": used_margin,
+                "killSwitchActive": risk_manager.kill_switch_active,
+                "reconciliationStatus": risk_manager.reconciliation_status,
             }
             return success(summary)
 
@@ -266,8 +293,8 @@ def handle_request(req):
         elif method == "analytics_confluence_validation":
             return success(analytics.get_confluence_validation())
 
-        elif method == "analytics_confidence_calibration":
-            return success(analytics.get_confidence_calibration())
+        elif method == "analytics_signal_score_calibration":
+            return success(analytics.get_signal_score_calibration())
 
         elif method == "analytics_exit_reason_effectiveness":
             return success(analytics.get_exit_reason_effectiveness())
@@ -281,6 +308,59 @@ def handle_request(req):
         elif method == "analytics_llm_post_mortem":
             return success(analytics.generate_llm_post_mortem(params.get("trade_id")))
 
+        elif method == "run_backtest":
+            strategy_id = params.get("strategy_id")
+            symbol = params.get("symbol")
+            days = params.get("days", 30)
+            initial_capital = params.get("initial_capital", 100000.0)
+
+            # Look up the strategy from scanner
+            strategy = scanner.strategies.get(strategy_id)
+            if not strategy:
+                return error(-32602, f"Strategy {strategy_id} not found")
+
+            import datetime
+
+            import pandas as pd
+
+            from .backtesting.backtest_engine import BacktestEngine
+            from .backtesting.metrics_evaluator import MetricsEvaluator
+
+            # Fetch data (mocking the date range based on days parameter)
+            now = datetime.datetime.now()
+            from_date = now - datetime.timedelta(days=days)
+
+            instruments = kite_client.get_instruments("NSE")
+            instrument_map = {
+                i["tradingsymbol"]: i["instrument_token"] for i in instruments
+            }
+            token = instrument_map.get(symbol)
+
+            if not token:
+                return error(-32602, f"Symbol {symbol} not found in instruments")
+
+            records = kite_client.get_historical_data(
+                instrument_token=token,
+                from_date=from_date,
+                to_date=now,
+                interval="5minute",
+            )
+
+            if not records:
+                return error(-32000, "No historical data found for backtest")
+
+            df = pd.DataFrame(records)
+            for col in ["open", "high", "low", "close"]:
+                if col in df.columns:
+                    df[col] = df[col].astype(float)
+
+            engine = BacktestEngine(strategy, initial_capital=initial_capital)
+            engine.load_data(symbol, df)
+            engine.run()
+
+            metrics = MetricsEvaluator.evaluate(engine.broker.trades, initial_capital)
+            return success({"metrics": metrics, "trades": engine.broker.trades})
+
         else:
             return error(-32601, f"Method '{method}' not found")
 
@@ -289,7 +369,7 @@ def handle_request(req):
 
 
 def main():
-    from .trading_engine import _stdout_lock
+    from .utils import stdout_lock as _stdout_lock
 
     for line in sys.stdin:
         line = line.strip()

@@ -107,6 +107,63 @@ NIFTY_100 = [
     "WIPRO",
     "ZYDUSLIFE",
 ]
+SECTOR_MAPPING = {
+    "RELIANCE": "Energy",
+    "ONGC": "Energy",
+    "BPCL": "Energy",
+    "COALINDIA": "Energy",
+    "IOC": "Energy",
+    "TCS": "IT",
+    "INFY": "IT",
+    "HCLTECH": "IT",
+    "WIPRO": "IT",
+    "TECHM": "IT",
+    "LTM": "IT",
+    "HDFCBANK": "Financial Services",
+    "ICICIBANK": "Financial Services",
+    "SBIN": "Financial Services",
+    "KOTAKBANK": "Financial Services",
+    "AXISBANK": "Financial Services",
+    "BAJFINANCE": "Financial Services",
+    "BAJAJFINSV": "Financial Services",
+    "CHOLAFIN": "Financial Services",
+    "SHRIRAMFIN": "Financial Services",
+    "ITC": "FMCG",
+    "HINDUNILVR": "FMCG",
+    "NESTLEIND": "FMCG",
+    "BRITANNIA": "FMCG",
+    "TATACONSUM": "FMCG",
+    "LT": "Construction",
+    "M&M": "Automobile",
+    "MARUTI": "Automobile",
+    "TATAMOTORS": "Automobile",
+    "BAJAJ-AUTO": "Automobile",
+    "EICHERMOT": "Automobile",
+    "HEROMOTOCO": "Automobile",
+    "SUNPHARMA": "Pharma",
+    "DRREDDY": "Pharma",
+    "CIPLA": "Pharma",
+    "DIVISLAB": "Pharma",
+    "APOLLOHOSP": "Healthcare",
+    "TATASTEEL": "Metals",
+    "HINDALCO": "Metals",
+    "JSWSTEEL": "Metals",
+    "ASIANPAINT": "Consumer Durables",
+    "TITAN": "Consumer Durables",
+    "NTPC": "Power",
+    "POWERGRID": "Power",
+    "TATAPOWER": "Power",
+    "ULTRACEMCO": "Cement",
+    "GRASIM": "Cement",
+    "AMBUJACEM": "Cement",
+    "SHREECEM": "Cement",
+    "BHARTIARTL": "Telecom",
+}
+
+
+def get_sector(symbol: str) -> str:
+    return SECTOR_MAPPING.get(symbol, "Unknown")
+
 
 _cached_nifty100 = None
 _cached_on = None

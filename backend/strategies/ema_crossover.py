@@ -47,13 +47,13 @@ class EMACrossoverStrategy(BaseStrategy):
             target = self.calculate_target(entry, sl)
 
             vol_ratio = last["volume"] / last["vol_sma"] if last["vol_sma"] > 0 else 1
-            confidence = min(100, int(60 + (vol_ratio * 10)))
+            signal_score = min(100, int(60 + (vol_ratio * 10)))
 
             signals.append(
                 self.format_signal(
                     tradingsymbol,
                     "BUY",
-                    confidence,
+                    signal_score,
                     entry,
                     sl,
                     target,
@@ -80,13 +80,13 @@ class EMACrossoverStrategy(BaseStrategy):
             target = self.calculate_target(entry, sl)
 
             vol_ratio = last["volume"] / last["vol_sma"] if last["vol_sma"] > 0 else 1
-            confidence = min(100, int(60 + (vol_ratio * 10)))
+            signal_score = min(100, int(60 + (vol_ratio * 10)))
 
             signals.append(
                 self.format_signal(
                     tradingsymbol,
                     "SELL",
-                    confidence,
+                    signal_score,
                     entry,
                     sl,
                     target,

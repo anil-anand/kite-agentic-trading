@@ -1,10 +1,10 @@
 import React, { useState, useEffect } from 'react';
-import { 
-  JournalTrade, 
-  TradeEvent, 
-  StrategyExpectancy, 
-  ConfluenceValidation, 
-  ConfidenceCalibration, 
+import {
+  JournalTrade,
+  TradeEvent,
+  StrategyExpectancy,
+  ConfluenceValidation,
+  SignalScoreCalibration,
   ExitReasonEffectiveness,
   TradeReplayData,
   WhatIfAnalysis,
@@ -24,17 +24,18 @@ const Journal: React.FC = () => {
   const [trades, setTrades] = useState<JournalTrade[]>([]);
   const [expandedTradeId, setExpandedTradeId] = useState<string | null>(null);
   const [activeTradeTab, setActiveTradeTab] = useState<'overview' | 'replay' | 'whatif' | 'ai'>('overview');
-  
+
   // Per-trade data
   const [tradeEvents, setTradeEvents] = useState<Record<string, TradeEvent[]>>({});
   const [tradeReplays, setTradeReplays] = useState<Record<string, TradeReplayData>>({});
   const [whatIfs, setWhatIfs] = useState<Record<string, WhatIfAnalysis>>({});
   const [llmPostMortems, setLlmPostMortems] = useState<Record<string, LLMPostMortem>>({});
-  
+
+
   // Analytics State
   const [expectancy, setExpectancy] = useState<StrategyExpectancy[]>([]);
   const [confluence, setConfluence] = useState<ConfluenceValidation[]>([]);
-  const [calibration, setCalibration] = useState<ConfidenceCalibration[]>([]);
+  const [calibration, setCalibration] = useState<SignalScoreCalibration[]>([]);
   const [exitReasons, setExitReasons] = useState<ExitReasonEffectiveness[]>([]);
 
   const [loading, setLoading] = useState(false);
@@ -52,7 +53,7 @@ const Journal: React.FC = () => {
 
       const exp = await window.electronAPI.analytics.getStrategyExpectancy();
       const conf = await window.electronAPI.analytics.getConfluenceValidation();
-      const calib = await window.electronAPI.analytics.getConfidenceCalibration();
+      const calib = await window.electronAPI.analytics.getSignalScoreCalibration();
       const exitR = await window.electronAPI.analytics.getExitReasonEffectiveness();
 
       setExpectancy(exp || []);
@@ -73,7 +74,7 @@ const Journal: React.FC = () => {
     }
     setExpandedTradeId(tradeId);
     setActiveTradeTab('overview');
-    
+
     if (window.electronAPI) {
       try {
         if (!tradeEvents[tradeId]) {
@@ -116,13 +117,14 @@ const Journal: React.FC = () => {
               <th className="p-4 font-medium">Entry Time</th>
               <th className="p-4 font-medium">Entry Price</th>
               <th className="p-4 font-medium">Exit Price</th>
-              <th className="p-4 font-medium text-right">P&L</th>
+              <th className="p-4 font-medium text-right">Gross P&L</th>
+              <th className="p-4 font-medium text-right">Net P&L</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-surface-700/50">
             {trades.map(t => (
               <React.Fragment key={t.id}>
-                <tr 
+                <tr
                   className="hover:bg-surface-750 cursor-pointer transition-colors"
                   onClick={() => toggleTrade(t.id)}
                 >
@@ -139,44 +141,47 @@ const Journal: React.FC = () => {
                   <td className="p-4 text-surface-300">{new Date(t.entry_time).toLocaleString()}</td>
                   <td className="p-4 text-surface-200">₹{t.entry_price?.toFixed(2)}</td>
                   <td className="p-4 text-surface-200">{t.exit_price ? `₹${t.exit_price.toFixed(2)}` : '-'}</td>
-                  <td className={`p-4 text-right font-medium ${t.pnl && t.pnl > 0 ? 'text-profit-light' : t.pnl && t.pnl < 0 ? 'text-loss-light' : 'text-surface-300'}`}>
-                    {t.pnl ? `${t.pnl > 0 ? '+' : ''}₹${t.pnl.toFixed(2)}` : '-'}
+                  <td className={`p-4 text-right font-medium ${t.gross_pnl && t.gross_pnl > 0 ? 'text-profit-light' : t.gross_pnl && t.gross_pnl < 0 ? 'text-loss-light' : 'text-surface-300'}`}>
+                    {t.gross_pnl != null ? `${t.gross_pnl > 0 ? '+' : ''}₹${t.gross_pnl.toFixed(2)}` : '-'}
+                  </td>
+                  <td className={`p-4 text-right font-medium ${t.net_pnl && t.net_pnl > 0 ? 'text-profit-light' : t.net_pnl && t.net_pnl < 0 ? 'text-loss-light' : 'text-surface-300'}`}>
+                    {t.net_pnl != null ? `${t.net_pnl > 0 ? '+' : ''}₹${t.net_pnl.toFixed(2)}` : '-'}
                   </td>
                 </tr>
-                
+
                 {/* Expanded Details */}
                 {expandedTradeId === t.id && (
                   <tr className="bg-surface-900 border-b border-surface-700 shadow-inner">
-                    <td colSpan={7} className="p-0">
-                      
+                    <td colSpan={8} className="p-0">
+
                       {/* Sub-tabs */}
                       <div className="flex border-b border-surface-700 bg-surface-800/50 px-6 pt-4">
-                        <button 
+                        <button
                           onClick={() => setActiveTradeTab('overview')}
                           className={`pb-3 mr-6 text-sm font-semibold transition-all relative ${activeTradeTab === 'overview' ? 'text-accent-light' : 'text-surface-400 hover:text-white'}`}
                         >
                           Overview
                           {activeTradeTab === 'overview' && <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-accent-light" />}
                         </button>
-                        <button 
+                        <button
                           onClick={() => setActiveTradeTab('replay')}
                           className={`pb-3 mr-6 text-sm font-semibold transition-all relative ${activeTradeTab === 'replay' ? 'text-accent-light' : 'text-surface-400 hover:text-white'}`}
                         >
-                          <div className="flex items-center"><LineChart size={14} className="mr-1"/> Replay</div>
+                          <div className="flex items-center"><LineChart size={14} className="mr-1" /> Replay</div>
                           {activeTradeTab === 'replay' && <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-accent-light" />}
                         </button>
-                        <button 
+                        <button
                           onClick={() => setActiveTradeTab('whatif')}
                           className={`pb-3 mr-6 text-sm font-semibold transition-all relative ${activeTradeTab === 'whatif' ? 'text-accent-light' : 'text-surface-400 hover:text-white'}`}
                         >
-                          <div className="flex items-center"><Lightbulb size={14} className="mr-1"/> What-If</div>
+                          <div className="flex items-center"><Lightbulb size={14} className="mr-1" /> What-If</div>
                           {activeTradeTab === 'whatif' && <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-accent-light" />}
                         </button>
-                        <button 
+                        <button
                           onClick={() => setActiveTradeTab('ai')}
                           className={`pb-3 mr-6 text-sm font-semibold transition-all relative ${activeTradeTab === 'ai' ? 'text-accent-light' : 'text-surface-400 hover:text-white'}`}
                         >
-                          <div className="flex items-center"><Cpu size={14} className="mr-1"/> AI Post-Mortem</div>
+                          <div className="flex items-center"><Cpu size={14} className="mr-1" /> AI Post-Mortem</div>
                           {activeTradeTab === 'ai' && <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-accent-light" />}
                         </button>
                       </div>
@@ -214,13 +219,56 @@ const Journal: React.FC = () => {
                                 </h4>
                                 <div className="bg-surface-800 p-4 rounded-lg border border-surface-700 text-sm text-surface-200 space-y-3">
                                   <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Reasoning</span> {t.reasoning || 'N/A'}</p>
-                                  <div className="grid grid-cols-2 gap-4 pt-2 border-t border-surface-700/50">
-                                    <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Confidence</span> {t.confidence ? `${t.confidence}%` : 'N/A'}</p>
-                                    <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Status</span> {t.status}</p>
-                                  </div>
+                                    <div className="grid grid-cols-2 gap-4 pt-2 border-t border-surface-700/50">
+                                      <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Confidence</span> {(t.signal_score ?? (t as any).signalScore) != null ? `${t.signal_score ?? (t as any).signalScore}%` : 'N/A'}</p>
+                                      {(t.estimated_probability != null || (t as any).estimatedProbability != null) && (
+                                        <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Calibrated Prob</span> {((t.estimated_probability ?? (t as any).estimatedProbability) * 100).toFixed(1)}% <span className="text-[10px] text-surface-400 opacity-80">(n={t.calibration_sample_size ?? (t as any).calibrationSampleSize})</span></p>
+                                      )}
+                                    </div>
+                                    {(t.market_regime || t.strategy_family || t.production_playbook || t.screener_score != null) && (
+                                      <div className="grid grid-cols-2 gap-4 pt-2 border-t border-surface-700/50">
+                                        {t.market_regime && <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Market Regime</span> {t.market_regime}</p>}
+                                        {t.strategy_family && <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Strategy Family</span> {t.strategy_family}</p>}
+                                        {t.production_playbook && <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Playbook</span> {t.production_playbook}</p>}
+                                        {t.screener_score != null && <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Screener Score</span> {t.screener_score.toFixed(2)}</p>}
+                                      </div>
+                                    )}
+                                    {(t.target_distance != null || t.stop_distance != null || t.initial_r != null) && (
+                                      <div className="grid grid-cols-3 gap-4 pt-2 border-t border-surface-700/50">
+                                        {t.target_distance != null && <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Target Dist</span> {t.target_distance.toFixed(2)}</p>}
+                                        {t.stop_distance != null && <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Stop Dist</span> {t.stop_distance.toFixed(2)}</p>}
+                                        {t.initial_r != null && <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Initial R</span> {t.initial_r.toFixed(2)}</p>}
+                                      </div>
+                                    )}
+                                    {(t.realized_r != null || t.mae != null || t.mfe != null || t.holding_time_seconds != null) && (
+                                      <div className="grid grid-cols-4 gap-2 pt-2 border-t border-surface-700/50">
+                                        {t.realized_r != null && <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Realized R</span> <span className={t.realized_r >= 0 ? 'text-profit-light' : 'text-loss-light'}>{t.realized_r.toFixed(2)}</span></p>}
+                                        {t.mae != null && <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">MAE</span> {t.mae.toFixed(2)}</p>}
+                                        {t.mfe != null && <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">MFE</span> {t.mfe.toFixed(2)}</p>}
+                                        {t.holding_time_seconds != null && <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Hold Time</span> {(t.holding_time_seconds / 60).toFixed(1)}m</p>}
+                                      </div>
+                                    )}
                                   {t.exit_reason && (
                                     <div className="pt-2 border-t border-surface-700/50">
                                       <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Exit Reason</span> {t.exit_reason}</p>
+                                    </div>
+                                  )}
+                                  {t.gross_pnl != null ? (
+                                    <div className="pt-2 border-t border-surface-700/50">
+                                      <h5 className="text-surface-400 block text-xs mb-2 uppercase tracking-wider">Execution & Costs</h5>
+                                      <div className="grid grid-cols-2 gap-2 text-xs">
+                                        <p className="flex justify-between"><span>Slippage:</span> <span className={t.slippage && t.slippage < 0 ? 'text-loss-light' : 'text-profit-light'}>₹{t.slippage?.toFixed(2) || '0.00'}</span></p>
+                                        <p className="flex justify-between"><span>Brokerage:</span> <span>₹{t.brokerage?.toFixed(2) || '0.00'}</span></p>
+                                        <p className="flex justify-between"><span>Taxes (STT/GST):</span> <span>₹{t.taxes?.toFixed(2) || '0.00'}</span></p>
+                                        <p className="flex justify-between"><span>Exchange Txn:</span> <span>₹{t.exchange_charges?.toFixed(2) || '0.00'}</span></p>
+                                        <p className="flex justify-between"><span>Other Fees:</span> <span>₹{t.other_fees?.toFixed(2) || '0.00'}</span></p>
+                                        <p className="flex justify-between font-semibold"><span>Total Fees:</span> <span>₹{((t.brokerage || 0) + (t.taxes || 0) + (t.exchange_charges || 0) + (t.other_fees || 0)).toFixed(2)}</span></p>
+                                      </div>
+                                    </div>
+                                  ) : (
+                                    <div className="pt-2 border-t border-surface-700/50">
+                                      <h5 className="text-surface-400 block text-xs mb-2 uppercase tracking-wider">Execution & Costs</h5>
+                                      <div className="text-xs text-surface-500">N/A (Legacy Trade)</div>
                                     </div>
                                   )}
                                 </div>
@@ -410,16 +458,16 @@ const Journal: React.FC = () => {
           </div>
         </div>
 
-        {/* Confidence Calibration */}
+        {/* Signal Score Calibration */}
         <div className="bg-surface-800 rounded-xl p-6 border border-surface-700 shadow-lg transition-transform hover:-translate-y-1 duration-300">
           <h3 className="text-lg font-semibold text-white mb-6 flex items-center">
-            <Activity className="mr-2 text-accent-light" size={20} /> Confidence Calibration
+            <Activity className="mr-2 text-accent-light" size={20} /> Signal Score Calibration
           </h3>
           <div className="space-y-5">
             {calibration.map((c, idx) => (
-              <div key={c.confidence_bucket} className="flex flex-col space-y-2">
+              <div key={c.signal_score_bucket} className="flex flex-col space-y-2">
                 <div className="flex justify-between text-sm">
-                  <span className="text-surface-300 font-medium">Predicted: {c.confidence_bucket}%</span>
+                  <span className="text-surface-300 font-medium">Predicted: {c.signal_score_bucket}%</span>
                   <span className="font-semibold text-white">Actual: {c.actual_win_rate_pct}% <span className="text-surface-400 font-normal">({c.total_trades} trades)</span></span>
                 </div>
                 <div className="h-3 w-full bg-surface-900 rounded-full overflow-hidden shadow-inner">
@@ -430,7 +478,7 @@ const Journal: React.FC = () => {
           </div>
         </div>
       </div>
-      
+
       {/* Exit Reasons */}
       <div className="bg-surface-800 rounded-xl p-6 border border-surface-700 shadow-lg">
         <h3 className="text-lg font-semibold text-white mb-6">Exit Reason Effectiveness</h3>
@@ -470,8 +518,8 @@ const Journal: React.FC = () => {
           </h1>
           <p className="text-surface-400 mt-2 text-sm">Review past trades, audit performance, and validate strategy edge.</p>
         </div>
-        <button 
-          onClick={loadData} 
+        <button
+          onClick={loadData}
           disabled={loading}
           className="px-5 py-2.5 bg-accent-dark hover:bg-accent-light text-white rounded-lg transition-all duration-300 shadow-lg hover:shadow-accent-dark/50 text-sm font-medium border border-accent-light/20 flex items-center"
         >
@@ -482,7 +530,7 @@ const Journal: React.FC = () => {
       </div>
 
       <div className="flex border-b border-surface-800 mb-8 space-x-8">
-        <button 
+        <button
           onClick={() => setActiveTab('trades')}
           className={`pb-4 text-sm font-semibold transition-all relative outline-none ${activeTab === 'trades' ? 'text-accent-light' : 'text-surface-400 hover:text-white'}`}
         >
@@ -491,7 +539,7 @@ const Journal: React.FC = () => {
           </div>
           {activeTab === 'trades' && <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-accent-light rounded-t-full shadow-[0_0_8px_rgba(var(--color-accent-light),0.8)]" />}
         </button>
-        <button 
+        <button
           onClick={() => setActiveTab('analytics')}
           className={`pb-4 text-sm font-semibold transition-all relative outline-none ${activeTab === 'analytics' ? 'text-accent-light' : 'text-surface-400 hover:text-white'}`}
         >
@@ -508,7 +556,7 @@ const Journal: React.FC = () => {
             <div className="animate-spin rounded-full h-10 w-10 border-4 border-surface-700 border-t-accent-light shadow-lg"></div>
           </div>
         ) : null}
-        
+
         {activeTab === 'trades' ? renderTrades() : renderAnalytics()}
       </div>
     </div>

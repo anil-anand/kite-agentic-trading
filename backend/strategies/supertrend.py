@@ -15,6 +15,8 @@ class SupertrendStrategy(BaseStrategy):
         return "Supertrend(10,3) crossover with ADX confirmation"
 
     def calculate_supertrend(self, df: pd.DataFrame, period=10, multiplier=3):
+        df = df.reset_index(drop=True)
+
         atr = AverageTrueRange(
             high=df["high"], low=df["low"], close=df["close"], window=period
         ).average_true_range()
@@ -28,20 +30,23 @@ class SupertrendStrategy(BaseStrategy):
         for i in range(1, len(df)):
             curr, prev = i, i - 1
 
-            if df["close"][curr] > final_upperband[prev]:
+            if df["close"].iat[curr] > final_upperband.iat[prev]:
                 supertrend[curr] = True
-            elif df["close"][curr] < final_lowerband[prev]:
+            elif df["close"].iat[curr] < final_lowerband.iat[prev]:
                 supertrend[curr] = False
             else:
                 supertrend[curr] = supertrend[prev]
 
-                if supertrend[curr] and final_lowerband[curr] < final_lowerband[prev]:
-                    final_lowerband[curr] = final_lowerband[prev]
+                if (
+                    supertrend[curr]
+                    and final_lowerband.iat[curr] < final_lowerband.iat[prev]
+                ):
+                    final_lowerband.iat[curr] = final_lowerband.iat[prev]
                 if (
                     not supertrend[curr]
-                    and final_upperband[curr] > final_upperband[prev]
+                    and final_upperband.iat[curr] > final_upperband.iat[prev]
                 ):
-                    final_upperband[curr] = final_upperband[prev]
+                    final_upperband.iat[curr] = final_upperband.iat[prev]
 
         return supertrend, final_lowerband, final_upperband
 
@@ -74,13 +79,13 @@ class SupertrendStrategy(BaseStrategy):
                 sl = last["lowerband"]
                 target = self.calculate_target(entry, sl)
 
-                confidence = min(100, int(70 + (last["adx"] - 25)))
+                signal_score = min(100, int(70 + (last["adx"] - 25)))
 
                 signals.append(
                     self.format_signal(
                         tradingsymbol,
                         "BUY",
-                        confidence,
+                        signal_score,
                         entry,
                         sl,
                         target,
@@ -98,13 +103,13 @@ class SupertrendStrategy(BaseStrategy):
                 sl = last["upperband"]
                 target = self.calculate_target(entry, sl)
 
-                confidence = min(100, int(70 + (last["adx"] - 25)))
+                signal_score = min(100, int(70 + (last["adx"] - 25)))
 
                 signals.append(
                     self.format_signal(
                         tradingsymbol,
                         "SELL",
-                        confidence,
+                        signal_score,
                         entry,
                         sl,
                         target,

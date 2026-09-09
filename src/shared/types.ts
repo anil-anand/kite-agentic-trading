@@ -194,7 +194,35 @@ export interface Margins {
 
 // ─── Trading Signals & Strategy ───────────────────────────────────
 
-export type StrategyName = 'ema_crossover' | 'rsi_reversal' | 'vwap_bounce' | 'supertrend';
+export type StrategyName =
+  // Individual scanner strategies (matches Scanner.strategies in scanner.py)
+  | 'ema_crossover'
+  | 'rsi_reversal'
+  | 'vwap_bounce'
+  | 'supertrend'
+  | 'macd_cross'
+  | 'bollinger_breakout'
+  | 'stochastic_reversal'
+  | 'adx_momentum'
+  | 'psar_trend'
+  | 'donchian_breakout'
+  | 'cci_reversal'
+  | 'williams_r'
+  | 'mfi_exhaustion'
+  | 'keltner_breakout'
+  | 'awesome_oscillator'
+  | 'tsi_cross'
+  | 'stoc_rsi'
+  // Playbook aggregates (matches TrendPullbackPlaybook.get_name() etc.)
+  | 'Trend Pullback'
+  | 'Breakout'
+  | 'Mean Reversion'
+  // Family-level aggregated signals
+  | 'family_trend'
+  | 'family_mean_reversion'
+  | 'family_breakout'
+  // LLM agent gateway
+  | 'llm_agent';
 export type SignalDirection = 'BUY' | 'SELL';
 export type AgentMode = 'auto' | 'confirm';
 
@@ -204,7 +232,10 @@ export interface Signal {
   exchange: string;
   strategy: StrategyName;
   direction: SignalDirection;
-  confidence: number; // 0-100
+  signal_score: number;
+  estimated_probability?: number;
+  calibration_sample_size?: number; // count of historical trades used for calibration
+  strategy_count?: number;
   entryPrice: number;
   stopLoss: number;
   target: number;
@@ -351,6 +382,7 @@ export interface RPCEvent {
 
 export interface DashboardSummary {
   totalPnl: number;
+  netPnl: number;
   realisedPnl: number;
   unrealisedPnl: number;
   tradesToday: number;
@@ -374,7 +406,9 @@ export interface JournalTrade {
   strategy: string;
   signal_id: string | null;
   reasoning: string | null;
-  confidence: number | null;
+  signal_score: number | null;
+  estimated_probability?: number | null;
+  calibration_sample_size?: number | null;
   entry_price: number;
   quantity: number;
   stop_loss: number;
@@ -384,9 +418,35 @@ export interface JournalTrade {
   exit_time: string | null;
   exit_reason: string | null;
   pnl: number | null;
+  gross_pnl: number | null;
+  net_pnl: number | null;
+  brokerage: number | null;
+  taxes: number | null;
+  exchange_charges: number | null;
+  other_fees: number | null;
+  slippage: number | null;
+  signal_entry_price: number | null;
   status: 'OPEN' | 'CLOSED';
   confluence_snapshot: string | null;
   indicator_snapshot: string | null;
+  market_regime?: string | null;
+  strategy_family?: string | null;
+  production_playbook?: string | null;
+  raw_evidence?: string | null;
+  feature_values?: string | null;
+  signal_time?: string | null;
+  candle_time?: string | null;
+  entry_quote?: number | null;
+  exit_quote?: number | null;
+  stop_distance?: number | null;
+  target_distance?: number | null;
+  initial_r?: number | null;
+  realized_r?: number | null;
+  mae?: number | null;
+  mfe?: number | null;
+  holding_time_seconds?: number | null;
+  screener_score?: number | null;
+  strategy_version?: string | null;
 }
 
 export interface TradeEvent {
@@ -413,8 +473,8 @@ export interface ConfluenceValidation {
   total_pnl: number;
 }
 
-export interface ConfidenceCalibration {
-  confidence_bucket: string;
+export interface SignalScoreCalibration {
+  signal_score_bucket: string;
   total_trades: number;
   actual_win_rate_pct: number;
 }

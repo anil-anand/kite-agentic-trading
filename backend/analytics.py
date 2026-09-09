@@ -42,7 +42,13 @@ class TradeAnalytics:
                 }
 
             strategies[strat]["trades"] += 1
-            pnl = r["pnl"] or 0.0
+
+            pnl = (
+                r["net_pnl"]
+                if "net_pnl" in r.keys() and r["net_pnl"] is not None
+                else (r["pnl"] or 0.0)
+            )
+
             if pnl > 0:
                 strategies[strat]["wins"] += 1
                 strategies[strat]["gross_profit"] += pnl
@@ -121,26 +127,59 @@ class TradeAnalytics:
         confluence_stats = {}
         for r in rows:
             snapshot_str = r["confluence_snapshot"]
+            direction = r["direction"]
             count = 1
             if snapshot_str:
                 try:
                     snapshot = json.loads(snapshot_str)
-                    if isinstance(snapshot, dict):
+                    if not isinstance(snapshot, dict):
+                        raise ValueError("Snapshot is not a dict")
+
+                    if "strategies" in snapshot:
+                        if not isinstance(snapshot["strategies"], list):
+                            raise ValueError("strategies is not a list")
+                        # Explicitly count strategies matching trade direction
+                        count = max(
+                            1,
+                            sum(
+                                1
+                                for s in snapshot["strategies"]
+                                if s.get("direction") == direction
+                            ),
+                        )
+                    else:
+                        metadata_keys = {
+                            "regime",
+                            "regime_features",
+                            "buy_signals",
+                            "sell_signals",
+                        }
+                        if set(snapshot.keys()).intersection(metadata_keys):
+                            raise ValueError("Malformed snapshot")
                         count = max(1, len(snapshot))
                 except Exception:
-                    pass
+                    count = "invalid"
 
             if count not in confluence_stats:
                 confluence_stats[count] = {"trades": 0, "wins": 0, "pnl": 0.0}
 
             confluence_stats[count]["trades"] += 1
-            pnl = r["pnl"] or 0.0
+            pnl = (
+                r["net_pnl"]
+                if "net_pnl" in r.keys() and r["net_pnl"] is not None
+                else (r["pnl"] or 0.0)
+            )
             if pnl > 0:
                 confluence_stats[count]["wins"] += 1
             confluence_stats[count]["pnl"] += pnl
 
         results = []
-        for count, stats in sorted(confluence_stats.items()):
+
+        def sort_key(item):
+            k = item[0]
+            return (1, k) if k == "invalid" else (0, k)
+
+        for count, stats in sorted(confluence_stats.items(), key=sort_key):
             win_rate = (
                 (stats["wins"] / stats["trades"]) * 100 if stats["trades"] > 0 else 0
             )
@@ -155,9 +194,9 @@ class TradeAnalytics:
 
         return results
 
-    def get_confidence_calibration(self) -> List[Dict[str, Any]]:
+    def get_signal_score_calibration(self) -> List[Dict[str, Any]]:
         """
-        Bucket signals by confidence (e.g., 0-10, 10-20...) and compare with actual win rate.
+        Bucket signals by signal score (e.g., 0-10, 10-20...) and compare with actual win rate (R-multiple >= 0.9).
         """
         conn = self._get_conn()
         query = (
@@ -173,8 +212,24 @@ class TradeAnalytics:
             if bucket not in buckets:
                 buckets[bucket] = {"trades": 0, "wins": 0}
 
+            # Only count valid trades
+            if not r["entry_price"] or not r["stop_loss"] or not r["exit_price"]:
+                continue
+
+            risk = abs(r["entry_price"] - r["stop_loss"])
+            if risk == 0:
+                continue
+
             buckets[bucket]["trades"] += 1
-            if (r["pnl"] or 0.0) > 0:
+
+            pnl_per_share = (
+                (r["exit_price"] - r["entry_price"])
+                if r["direction"] == "BUY"
+                else (r["entry_price"] - r["exit_price"])
+            )
+            r_multiple = pnl_per_share / risk
+
+            if r_multiple >= 0.9:
                 buckets[bucket]["wins"] += 1
 
         results = []
@@ -184,7 +239,7 @@ class TradeAnalytics:
             )
             results.append(
                 {
-                    "confidence_bucket": f"{b}-{b + 9}",
+                    "signal_score_bucket": f"{b}-{b + 9}",
                     "total_trades": stats["trades"],
                     "actual_win_rate_pct": round(win_rate, 2),
                 }
@@ -302,7 +357,28 @@ class TradeAnalytics:
         except Exception as e:
             return {"error": f"Failed to fetch historical data: {str(e)}"}
 
-        return {"trade": dict(trade), "candles": candles}
+        formatted_candles = []
+        for c in candles:
+            # kiteconnect returns 'date' as a datetime object or string
+            dt = c["date"]
+            if isinstance(dt, str):
+                # Preserve the ISO offset — stripping it would produce a naive
+                # datetime that timestamp() interprets in the host timezone,
+                # shifting all candles by 5.5 h on a UTC server.
+                dt = datetime.fromisoformat(dt)
+
+            formatted_candles.append(
+                {
+                    "time": int(dt.timestamp()),
+                    "open": c["open"],
+                    "high": c["high"],
+                    "low": c["low"],
+                    "close": c["close"],
+                    "volume": c.get("volume", 0),
+                }
+            )
+
+        return {"trade": dict(trade), "candles": formatted_candles}
 
     def get_what_if_analysis(self, trade_id: str) -> Dict[str, Any]:
         """
@@ -332,13 +408,8 @@ class TradeAnalytics:
         # Filter candles to only those after entry
         post_entry_candles = []
         for c in candles:
-            # c["date"] is usually a datetime object from kiteconnect
-            candle_time = (
-                c["date"]
-                if isinstance(c["date"], datetime)
-                else datetime.fromisoformat(str(c["date"]).replace("+05:30", ""))
-            )
-            if candle_time.timestamp() >= entry_time.timestamp():
+            # c["time"] is an integer timestamp (unix epoch)
+            if c["time"] >= entry_time.timestamp():
                 post_entry_candles.append(c)
 
         # 1. Hold to EOD (last candle of the day)
@@ -357,11 +428,11 @@ class TradeAnalytics:
         for c in post_entry_candles:
             if direction == "BUY" and c["high"] >= target:
                 target_hit = True
-                target_hit_time = str(c["date"])
+                target_hit_time = str(datetime.fromtimestamp(c["time"]))
                 break
             elif direction == "SELL" and c["low"] <= target:
                 target_hit = True
-                target_hit_time = str(c["date"])
+                target_hit_time = str(datetime.fromtimestamp(c["time"]))
                 break
 
         # 3. Wider Stop (1.5x)

@@ -284,11 +284,16 @@ class TestCoversScanUniverse:
             assert len(candles) >= 35
 
     def test_screener_and_scan_produce_signals_end_to_end(self, monkeypatch):
-        # The exact user-visible failure: scan_now returned [] because the
-        # screener fell back to real NIFTY 100 names the mock didn't know.
+        # Regression: scan_now returned [] because the screener fell back to
+        # real NIFTY 100 names the mock didn't know about.
+        # This test exercises the full screener → scanner → playbook pipeline.
+        import numpy as np
+
         import backend.kite_client as kc
         import backend.scanner as sc
         import backend.screener as scr
+        from backend.config import config_manager
+        from backend.tests.conftest import build_candles
 
         monkeypatch.setattr(kc, "kite_client", self.mock)
         monkeypatch.setattr(sc, "kite_client", self.mock)
@@ -302,5 +307,64 @@ class TestCoversScanUniverse:
         assert len(watchlist) == 12
         assert set(watchlist) <= set(NIFTY_100)
 
+        # The scanner is a module-level singleton whose last_scanned_candle dict
+        # persists across tests.  Sibling tests (test_scanner_aggregation_*)
+        # populate it, and because the mock produces deterministic candles with
+        # identical timestamps, the per-symbol dedup check would silently return
+        # [] for every symbol.  Clear it so this test is not order-dependent.
+        sc.scanner.last_scanned_candle.clear()
+
+        # Enable all strategies and turn off the incomplete-candle gate so the
+        # dedup guard cannot suppress a second scan in the same test run.
+        strat_cfg = {k: {"enabled": True} for k in sc.scanner.strategies.keys()}
+        strat_cfg["evaluateOnIncompleteCandle"] = True
+        monkeypatch.setattr(config_manager, "get_strategy_config", lambda: strat_cfg)
+
+        # For the first watchlist symbol, inject a known uptrend DataFrame
+        # (regime → TRENDING) and a high-confidence EMA Crossover BUY signal so
+        # the Trend Pullback playbook fires deterministically, independent of
+        # what the random-walk mock candles happen to produce.
+        first_sym = watchlist[0]
+        uptrend_df = build_candles(np.linspace(100, 140, 60))
+
+        _original_fetch = sc.scanner._fetch_candles
+
+        def _patched_fetch(token, symbol):
+            if symbol == first_sym:
+                return uptrend_df, False
+            return _original_fetch(token, symbol)
+
+        monkeypatch.setattr(sc.scanner, "_fetch_candles", _patched_fetch)
+
+        _original_calc = sc.scanner.strategies["ema_crossover"].calculate_signals
+
+        def _inject_signal(df, symbol):
+            if symbol == first_sym:
+                return [
+                    {
+                        "strategy": "EMA Crossover",
+                        "direction": "BUY",
+                        "signal_score": 85,
+                        "entryPrice": 130.0,
+                        "stopLoss": 120.0,
+                        "target": 150.0,
+                        "riskReward": 2.0,
+                        "reasoning": "mock uptrend signal for integration test",
+                        "family": "trend",
+                        "timestamp": "2026-09-01T09:15:00+05:30",
+                        "indicators": {},
+                        "tradingsymbol": symbol,
+                        "exchange": "NSE",
+                    }
+                ]
+            return _original_calc(df, symbol)
+
+        monkeypatch.setattr(
+            sc.scanner.strategies["ema_crossover"],
+            "calculate_signals",
+            _inject_signal,
+        )
+
         signals = sc.scanner.scan_watchlist(watchlist)
-        assert len(signals) > 0  # real signals off synthetic candles
+        assert len(signals) > 0  # pipeline produced at least one playbook decision
+        assert any(sig["tradingsymbol"] == first_sym for sig in signals)

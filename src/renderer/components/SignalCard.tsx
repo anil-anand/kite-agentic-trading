@@ -51,11 +51,21 @@ const SignalCard: React.FC<Props> = ({ signal, onTakeTrade, onDismiss, compact =
         {signal.reasoning}
       </div>
       
-      <div className="flex items-center gap-2 mt-2">
-        <div className="flex-1 bg-surface-700 h-2 rounded-full overflow-hidden">
-          <div className="h-full bg-accent-light" style={{ width: `${signal.confidence}%` }}></div>
+      <div className="flex flex-col gap-1 mt-2">
+        <div className="flex items-center justify-between">
+          <span className="text-xs text-surface-400">Signal Score</span>
+          <span className="text-xs font-mono text-surface-400">{signal.signal_score ?? (signal as any).signalScore ?? 0}/100</span>
         </div>
-        <span className="text-xs font-mono text-surface-400">{signal.confidence}%</span>
+        <div className="h-1 bg-surface-700 rounded-full overflow-hidden mt-1">
+          <div className="h-full bg-surface-500" style={{ width: `${signal.signal_score ?? (signal as any).signalScore ?? 0}%` }}></div>
+        </div>
+        
+        {(signal.estimated_probability != null || (signal as any).estimatedProbability != null) && (
+          <div className="flex items-center justify-between mt-1 p-1.5 bg-accent-dark/20 rounded border border-accent-dark/30">
+            <span className="text-xs text-accent-light font-medium">Calibrated Prob</span>
+            <span className="text-xs font-mono text-accent-light">{((signal.estimated_probability ?? (signal as any).estimatedProbability) * 100).toFixed(1)}% <span className="text-[10px] text-surface-400 opacity-80">(n={signal.calibration_sample_size ?? (signal as any).calibrationSampleSize})</span></span>
+          </div>
+        )}
       </div>
 
       <div className="flex gap-2 mt-2 pt-3 border-t border-surface-700">

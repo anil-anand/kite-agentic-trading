@@ -27,10 +27,26 @@ class FakeKiteClient:
         self.orders = []
         self.place_calls = []
         self.cancel_calls = []
+        self.flatten_calls = []
         self._next_id = 1
 
     def place_order(self, **kwargs):
         self.place_calls.append(kwargs)
+        oid = f"OID{self._next_id}"
+        self._next_id += 1
+        status = (
+            "COMPLETE" if kwargs.get("order_type") in ["LIMIT", "MARKET"] else "OPEN"
+        )
+        qty = kwargs.get("quantity", 0) if status == "COMPLETE" else 0
+        self.orders.append(
+            {"orderId": oid, "order_id": oid, "status": status, "filledQuantity": qty}
+        )
+        return oid
+
+    def emergency_flatten_position(self, **kwargs):
+        self.place_calls.append(kwargs)
+        if "tradingsymbol" in kwargs:
+            self.flatten_calls.append(kwargs["tradingsymbol"])
         oid = f"OID{self._next_id}"
         self._next_id += 1
         return oid
@@ -54,10 +70,18 @@ class FakeRiskManager:
     def can_trade(self):
         return True, "OK"
 
+    def can_accept_position(
+        self, symbol, direction, qty, price, active_trades, open_orders
+    ):
+        return True, "OK"
+
     def set_open_positions(self, count):
         pass
 
     def update_pnl(self, pnl):
+        pass
+
+    def update_from_positions(self, positions):
         pass
 
 
@@ -86,7 +110,7 @@ def _open_position(qty=10):
         "exchange": "NSE",
         "product": "MIS",
         "lastPrice": 100.0,
-        "averagePrice": 100.0,
+        "average_price": 100.0,
     }
 
 
@@ -178,6 +202,7 @@ def _setup_reconcile(monkeypatch, persisted, positions_net, orders):
     fake_client = FakeKiteClient()
     fake_client.positions = {"net": positions_net}
     fake_client.orders = orders
+    monkeypatch.setattr(te, "execution_gateway", fake_client)
     monkeypatch.setattr(te, "kite_client", fake_client)
     monkeypatch.setattr(te, "risk_manager", FakeRiskManager())
 
@@ -370,14 +395,13 @@ def test_reconcile_isolates_a_malformed_record(monkeypatch):
         orders=[{"orderId": "GOODSTOP", "status": "TRIGGER PENDING"}],
     )
     engine.reconcile_active_trades()
-
     assert "GOOD" in engine.active_trades
     assert "BAD" not in engine.active_trades
 
 
-def test_reconcile_keeps_trade_when_stop_replace_fails(monkeypatch):
-    # If re-placing the protective stop fails, the position is still tracked
-    # (with no broker stop) so the app-side monitor keeps watching it.
+def test_reconcile_flattens_trade_when_stop_replace_fails(monkeypatch):
+    # If re-placing the protective stop fails, it triggers emergency flatten
+    # and removes the trade from active_trades.
     engine, fake_client, _ = _setup_reconcile(
         monkeypatch,
         persisted={"RELIANCE": _trade(stop_order_id=None)},
@@ -388,11 +412,11 @@ def test_reconcile_keeps_trade_when_stop_replace_fails(monkeypatch):
     def boom(**kwargs):
         raise RuntimeError("order rejected")
 
-    fake_client.place_order = boom  # _place_protective_stop swallows -> ""
+    fake_client.place_order = boom
     engine.reconcile_active_trades()
 
-    assert "RELIANCE" in engine.active_trades
-    assert engine.active_trades["RELIANCE"]["stop_order_id"] is None
+    assert "RELIANCE" not in engine.active_trades
+    assert fake_client.flatten_calls == ["RELIANCE"]
 
 
 # ---------------------------------------------------------------------------
@@ -401,7 +425,7 @@ def test_reconcile_keeps_trade_when_stop_replace_fails(monkeypatch):
 
 
 def test_start_invokes_reconcile(monkeypatch):
-    monkeypatch.setattr(te, "kite_client", FakeKiteClient())
+    monkeypatch.setattr(te, "execution_gateway", FakeKiteClient())
     monkeypatch.setattr(te, "risk_manager", FakeRiskManager())
 
     engine = TradingEngine()
@@ -420,7 +444,7 @@ def test_start_invokes_reconcile(monkeypatch):
 
 
 def test_start_reconcile_failure_does_not_block(monkeypatch):
-    monkeypatch.setattr(te, "kite_client", FakeKiteClient())
+    monkeypatch.setattr(te, "execution_gateway", FakeKiteClient())
     monkeypatch.setattr(te, "risk_manager", FakeRiskManager())
 
     engine = TradingEngine()
@@ -441,6 +465,7 @@ def test_start_reconcile_failure_does_not_block(monkeypatch):
 def test_monitor_positions_persists(monkeypatch):
     fake_client = FakeKiteClient()
     fake_client.positions = {"net": [_open_position(10)]}
+    monkeypatch.setattr(te, "execution_gateway", fake_client)
     monkeypatch.setattr(te, "kite_client", fake_client)
     monkeypatch.setattr(te, "risk_manager", FakeRiskManager())
 

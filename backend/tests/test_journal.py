@@ -31,7 +31,7 @@ def test_journal_open_close_trade(temp_journal):
         target=2540.00,
         signal_id="sig_456",
         reasoning="MACD crossed above signal line",
-        confidence=85,
+        signal_score=85,
         confluence_snapshot={"MACD_Crossover": "BUY"},
         indicator_snapshot={"RSI": 60},
     )
@@ -55,7 +55,7 @@ def test_journal_open_close_trade(temp_journal):
     assert len(trades_after) == 1
     assert trades_after[0]["status"] == "CLOSED"
     assert trades_after[0]["exit_price"] == 2520.00
-    assert trades_after[0]["pnl"] == (2520.00 - 2500.50) * 10
+    assert trades_after[0]["gross_pnl"] == (2520.00 - 2500.50) * 10
 
     # Check events
     events = temp_journal.get_trade_events(trade_id)
