@@ -296,7 +296,7 @@ class TradingEngine:
     def _push_state_update(self, status: str = None):
         if not status:
             status = "scanning" if self.running else "idle"
-            
+
         event = {
             "event": "agent:state-update",
             "data": {
