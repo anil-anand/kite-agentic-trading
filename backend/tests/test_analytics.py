@@ -221,4 +221,253 @@ def test_llm_post_mortem(
     res = analytics.generate_llm_post_mortem("1")
     assert "error" not in res
     assert res["analysis"] == "This is a post-mortem analysis."
+    assert res["cached"] is False
     mock_generate.assert_called_once()
+
+
+def _prepare_trade_events_table(temp_db):
+    conn = sqlite3.connect(temp_db)
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS trade_events (
+            id TEXT PRIMARY KEY,
+            trade_id TEXT,
+            timestamp TIMESTAMP,
+            event_type TEXT,
+            details TEXT
+        );
+    """)
+    conn.close()
+
+
+@patch("backend.config.config_manager.get_credentials")
+@patch("backend.config.config_manager.get_llm_settings")
+@patch("backend.analytics.OpenAICompatibleClient.generate")
+def test_llm_post_mortem_cache_hit(
+    mock_generate, mock_get_llm_settings, mock_get_credentials, temp_db
+):
+    """A second call for the same trade/provider/model should not re-call the LLM."""
+    mock_get_credentials.return_value = {"llmApiKey": "fake_key"}
+    mock_get_llm_settings.return_value = {
+        "provider": "Gemini",
+        "baseUrl": "https://example.test/v1",
+        "model": "gemini-2.5-flash",
+    }
+    mock_generate.return_value = "This is a post-mortem analysis."
+
+    _prepare_trade_events_table(temp_db)
+    analytics = TradeAnalytics(db_path=temp_db)
+
+    first = analytics.generate_llm_post_mortem("1")
+    assert first["analysis"] == "This is a post-mortem analysis."
+    assert first["cached"] is False
+
+    second = analytics.generate_llm_post_mortem("1")
+    assert second["analysis"] == "This is a post-mortem analysis."
+    assert second["cached"] is True
+
+    mock_generate.assert_called_once()
+
+
+@patch("backend.config.config_manager.get_credentials")
+@patch("backend.config.config_manager.get_llm_settings")
+@patch("backend.analytics.OpenAICompatibleClient.generate")
+def test_llm_post_mortem_cache_survives_new_instance(
+    mock_generate, mock_get_llm_settings, mock_get_credentials, temp_db
+):
+    """The cache must persist to disk, not just in-process memory."""
+    mock_get_credentials.return_value = {"llmApiKey": "fake_key"}
+    mock_get_llm_settings.return_value = {
+        "provider": "Gemini",
+        "baseUrl": "https://example.test/v1",
+        "model": "gemini-2.5-flash",
+    }
+    mock_generate.return_value = "This is a post-mortem analysis."
+
+    _prepare_trade_events_table(temp_db)
+    analytics = TradeAnalytics(db_path=temp_db)
+    analytics.generate_llm_post_mortem("1")
+
+    # Simulate a fresh process/renderer reload by using a brand new instance.
+    other_analytics = TradeAnalytics(db_path=temp_db)
+    res = other_analytics.generate_llm_post_mortem("1")
+    assert res["cached"] is True
+    mock_generate.assert_called_once()
+
+
+@patch("backend.config.config_manager.get_credentials")
+@patch("backend.config.config_manager.get_llm_settings")
+@patch("backend.analytics.OpenAICompatibleClient.generate")
+def test_llm_post_mortem_invalidates_on_model_change(
+    mock_generate, mock_get_llm_settings, mock_get_credentials, temp_db
+):
+    """Changing the configured model should regenerate instead of using the cache."""
+    mock_get_credentials.return_value = {"llmApiKey": "fake_key"}
+    mock_get_llm_settings.return_value = {
+        "provider": "Gemini",
+        "baseUrl": "https://example.test/v1",
+        "model": "gemini-2.5-flash",
+    }
+    mock_generate.return_value = "First analysis."
+
+    _prepare_trade_events_table(temp_db)
+    analytics = TradeAnalytics(db_path=temp_db)
+    first = analytics.generate_llm_post_mortem("1")
+    assert first["analysis"] == "First analysis."
+    assert first["cached"] is False
+
+    mock_get_llm_settings.return_value = {
+        "provider": "Gemini",
+        "baseUrl": "https://example.test/v1",
+        "model": "gemini-2.5-pro",
+    }
+    mock_generate.return_value = "Second analysis with new model."
+
+    second = analytics.generate_llm_post_mortem("1")
+    assert second["analysis"] == "Second analysis with new model."
+    assert second["cached"] is False
+    assert mock_generate.call_count == 2
+
+
+@patch("backend.config.config_manager.get_credentials")
+@patch("backend.config.config_manager.get_llm_settings")
+@patch("backend.analytics.OpenAICompatibleClient.generate")
+def test_llm_post_mortem_invalidates_on_trade_change(
+    mock_generate, mock_get_llm_settings, mock_get_credentials, temp_db
+):
+    """Changed trade inputs (e.g. new timeline events) should regenerate."""
+    mock_get_credentials.return_value = {"llmApiKey": "fake_key"}
+    mock_get_llm_settings.return_value = {
+        "provider": "Gemini",
+        "baseUrl": "https://example.test/v1",
+        "model": "gemini-2.5-flash",
+    }
+    mock_generate.return_value = "First analysis."
+
+    _prepare_trade_events_table(temp_db)
+    analytics = TradeAnalytics(db_path=temp_db)
+    first = analytics.generate_llm_post_mortem("1")
+    assert first["cached"] is False
+
+    # Simulate the trade data changing (e.g. a new event was logged).
+    conn = sqlite3.connect(temp_db)
+    conn.execute(
+        "INSERT INTO trade_events (id, trade_id, timestamp, event_type, details) "
+        "VALUES ('evt-1', '1', '2024-01-01T00:00:00', 'note', 'late fill info')"
+    )
+    conn.commit()
+    conn.close()
+
+    mock_generate.return_value = "Updated analysis."
+    second = analytics.generate_llm_post_mortem("1")
+    assert second["analysis"] == "Updated analysis."
+    assert second["cached"] is False
+    assert mock_generate.call_count == 2
+
+
+@patch("backend.config.config_manager.get_credentials")
+@patch("backend.config.config_manager.get_llm_settings")
+@patch("backend.analytics.OpenAICompatibleClient.generate")
+def test_llm_post_mortem_failure_not_cached(
+    mock_generate, mock_get_llm_settings, mock_get_credentials, temp_db
+):
+    """Transient LLM failures must not be persisted, so retries can succeed."""
+    mock_get_credentials.return_value = {"llmApiKey": "fake_key"}
+    mock_get_llm_settings.return_value = {
+        "provider": "Gemini",
+        "baseUrl": "https://example.test/v1",
+        "model": "gemini-2.5-flash",
+    }
+
+    _prepare_trade_events_table(temp_db)
+    analytics = TradeAnalytics(db_path=temp_db)
+
+    mock_generate.side_effect = RuntimeError("upstream timeout")
+    failed = analytics.generate_llm_post_mortem("1")
+    assert "error" in failed
+    assert "cached" not in failed
+
+    mock_generate.side_effect = None
+    mock_generate.return_value = "Recovered analysis."
+    recovered = analytics.generate_llm_post_mortem("1")
+    assert recovered["analysis"] == "Recovered analysis."
+    assert recovered["cached"] is False
+    assert mock_generate.call_count == 2
+
+
+@patch("backend.config.config_manager.get_credentials")
+@patch("backend.config.config_manager.get_llm_settings")
+@patch("backend.analytics.OpenAICompatibleClient.generate")
+def test_llm_post_mortem_returns_analysis_when_cache_write_fails(
+    mock_generate, mock_get_llm_settings, mock_get_credentials, temp_db
+):
+    """A successful analysis must still be returned even if persisting it fails."""
+    mock_get_credentials.return_value = {"llmApiKey": "fake_key"}
+    mock_get_llm_settings.return_value = {
+        "provider": "Gemini",
+        "baseUrl": "https://example.test/v1",
+        "model": "gemini-2.5-flash",
+    }
+    mock_generate.return_value = "This is a post-mortem analysis."
+
+    _prepare_trade_events_table(temp_db)
+    analytics = TradeAnalytics(db_path=temp_db)
+    real_get_conn = analytics._get_conn
+
+    class _FailingInsertConn:
+        """Wraps a real sqlite3 connection, failing only INSERTs into the cache table."""
+
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, *args, **kwargs):
+            if "INSERT INTO llm_post_mortems" in sql:
+                raise sqlite3.OperationalError("database is locked")
+            return self._conn.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+        def __enter__(self):
+            return self._conn.__enter__()
+
+        def __exit__(self, *exc_info):
+            return self._conn.__exit__(*exc_info)
+
+    def _wrapped_get_conn():
+        return _FailingInsertConn(real_get_conn())
+
+    with patch.object(analytics, "_get_conn", _wrapped_get_conn):
+        res = analytics.generate_llm_post_mortem("1")
+
+    assert "error" not in res
+    assert res["analysis"] == "This is a post-mortem analysis."
+    assert res["cached"] is False
+
+
+@patch("backend.config.config_manager.get_credentials")
+@patch("backend.config.config_manager.get_llm_settings")
+@patch("backend.analytics.OpenAICompatibleClient.generate")
+def test_llm_post_mortem_empty_response_not_cached(
+    mock_generate, mock_get_llm_settings, mock_get_credentials, temp_db
+):
+    """An empty/whitespace-only LLM response must not be cached, and should retry."""
+    mock_get_credentials.return_value = {"llmApiKey": "fake_key"}
+    mock_get_llm_settings.return_value = {
+        "provider": "Gemini",
+        "baseUrl": "https://example.test/v1",
+        "model": "gemini-2.5-flash",
+    }
+
+    _prepare_trade_events_table(temp_db)
+    analytics = TradeAnalytics(db_path=temp_db)
+
+    mock_generate.return_value = "   "
+    empty = analytics.generate_llm_post_mortem("1")
+    assert "error" in empty
+    assert "cached" not in empty
+
+    mock_generate.return_value = "A real analysis."
+    recovered = analytics.generate_llm_post_mortem("1")
+    assert recovered["analysis"] == "A real analysis."
+    assert recovered["cached"] is False
+    assert mock_generate.call_count == 2
