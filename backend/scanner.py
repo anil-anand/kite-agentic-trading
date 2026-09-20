@@ -1,5 +1,8 @@
 import datetime
+import hashlib
+import json
 import threading
+from copy import deepcopy
 from typing import Any, Dict, List, Tuple
 
 import pandas as pd
@@ -243,7 +246,10 @@ class Scanner:
         import concurrent.futures
 
         all_signals = []
-        strategy_config = config_manager.get_strategy_config()
+        # Confirmation may occur after Settings are edited.  Keep the actual
+        # selection inputs detached before any symbol starts calculating.
+        strategy_config = deepcopy(config_manager.get_strategy_config())
+        entry_family_mapping = dict(self.family_mapping)
 
         instruments = kite_client.get_instruments("NSE")
         instrument_map = {
@@ -306,7 +312,7 @@ class Scanner:
                     signals = strategy.calculate_signals(df.copy(deep=True), symbol)
                     for s in signals:
                         s["strategy_id"] = strat_id
-                        s["family"] = self.family_mapping.get(strat_id)
+                        s["family"] = entry_family_mapping.get(strat_id)
                     raw_signals.extend(signals)
 
             from .strategies.breakout_evidence import BreakoutEvidence
@@ -352,6 +358,31 @@ class Scanner:
                             "regime": regime,
                             "strategy_count": len(strategy_ids),
                             "market_context": context.summary(),
+                            "entry_selection_config": {
+                                "strategies": deepcopy(strategy_config),
+                                "family_mapping": dict(entry_family_mapping),
+                                "context_policy": context.summary().get("policy"),
+                                "entry_policy_version": "playbooks-v1",
+                            },
+                            "entry_input": {
+                                "mode": "INCOMPLETE_CANDLE"
+                                if evaluate_on_incomplete
+                                else "COMPLETED_CANDLES",
+                                "last_input_bar": json.loads(
+                                    df.tail(1).to_json(
+                                        orient="records", date_format="iso"
+                                    )
+                                )[0],
+                                "frame_hash": hashlib.sha256(
+                                    df.to_json(
+                                        orient="split",
+                                        date_format="iso",
+                                        double_precision=15,
+                                    ).encode()
+                                ).hexdigest(),
+                                "hash_format": "pandas-split-iso-v1",
+                                "decision_at": context.decision_event_time.isoformat(),
+                            },
                         }
                     )
                     symbol_aggregated_signals.append(decision)

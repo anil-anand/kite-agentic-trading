@@ -1,10 +1,14 @@
 import uuid
+from copy import deepcopy
 from typing import Any, Dict, List, Optional
 
 from .base import BasePlaybook
 
 
 class MeanReversionPlaybook(BasePlaybook):
+    def management_profile(self) -> str:
+        return "range_convergence"
+
     def get_name(self) -> str:
         return "Mean Reversion"
 
@@ -64,6 +68,11 @@ class MeanReversionPlaybook(BasePlaybook):
             "riskReward": base_sig.get("riskReward", 0),
             "reasoning": reasoning,
             "playbook": self.get_name(),
+            "playbook_version": "playbooks-v1",
+            "management_profile": self.management_profile(),
+            "setup_variant": "mean_reversion_multi_signal",
+            "selected_evidence": deepcopy(dir_signals),
+            "selection_inputs": deepcopy(mr_signals),
         }
 
     def evaluate_invalidation(

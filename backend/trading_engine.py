@@ -7,6 +7,7 @@ import threading
 import time
 import uuid
 from dataclasses import replace
+from functools import wraps
 from typing import Optional
 
 from .accounting import accounting_service
@@ -24,6 +25,20 @@ from .broker_models import (
 )
 from .config import config_manager
 from .execution_gateway import execution_gateway
+from .exit_management.models import (
+    LifecycleEvent,
+    PositionCheckpoint,
+    PositionState,
+    ProtectionState,
+    ThesisHealth,
+    reduce_lifecycle,
+)
+from .exit_management.thesis import (
+    EntryThesis,
+    bind_terminal_fill,
+    calculate_provisional_risk,
+    capture_entry_thesis,
+)
 from .journal import journal
 from .kite_client import kite_client
 from .order_lifecycle import AttemptState, IntentType, OrderLifecycleCoordinator
@@ -45,6 +60,41 @@ from .utils import stdout_lock as _stdout_lock
 # _stdout_lock is the shared lock from utils so ALL modules (execution_gateway,
 # request_policy, trading_engine) serialize their stdout writes through the same
 # object, preventing interleaved JSON output.
+
+
+def _serialized_exit_state(method):
+    """Serialize read/reduce/commit without holding a broker or trade lock."""
+
+    @wraps(method)
+    def wrapped(self, position_key, *args, **kwargs):
+        with self._trade_lock:
+            lock = self._exit_state_locks.setdefault(position_key, threading.RLock())
+        with lock:
+            return method(self, position_key, *args, **kwargs)
+
+    return wrapped
+
+
+def _best_effort_exit_observation(method):
+    """An observational checkpoint must never interrupt fill protection."""
+
+    @wraps(method)
+    def wrapped(self, position_key, *args, **kwargs):
+        try:
+            return method(self, position_key, *args, **kwargs)
+        except Exception as exc:
+            self._reconciliation_pending = True
+            with self._trade_lock:
+                for trade in self.active_trades.values():
+                    if trade.get("exit_management_position_key") == position_key:
+                        trade["exit_state_recovery_required"] = True
+            self._push_log(
+                f"Exit observation requires recovery for {position_key}: {exc}",
+                level="error",
+            )
+            return None
+
+    return wrapped
 
 
 class TradingEngine:
@@ -125,6 +175,14 @@ class TradingEngine:
         self._order_lifecycle = OrderLifecycleCoordinator(journal)
         self._lifecycle_attempts_by_order: dict[str, tuple[str, str, str]] = {}
 
+        # Phase 5's SQLite state is authoritative for thesis provenance and
+        # ordered checkpoints.  These small in-memory indexes only avoid a
+        # database read on the synchronous entry path; restart restores from
+        # the journal rather than trusting this cache.
+        self._entry_theses: dict[str, EntryThesis] = {}
+        self._managed_position_states: dict[str, PositionState] = {}
+        self._exit_state_locks: dict[str, threading.RLock] = {}
+
     # Kite order statuses that mean an order is still live (protecting / working).
     _TERMINAL_ORDER_STATUSES = {
         "COMPLETE",
@@ -200,9 +258,863 @@ class TradingEngine:
         try:
             with self._trade_lock:
                 snapshot = {s: dict(t) for s, t in self.active_trades.items()}
+            for symbol, trade in snapshot.items():
+                key = trade.get("exit_management_position_key")
+                if not key:
+                    continue
+                try:
+                    self._record_phase5_broker_observation(key, trade=trade)
+                except Exception as exc:
+                    # Bookkeeping failure cannot suppress the existing hard
+                    # supervisor. Keep a visible recovery requirement instead.
+                    self._reconciliation_pending = True
+                    with self._trade_lock:
+                        current = self.active_trades.get(symbol)
+                        if current:
+                            current["exit_state_recovery_required"] = True
+                    self._push_log(
+                        f"Exit checkpoint failed for {symbol}: {exc}", level="error"
+                    )
             config_manager.save_active_trades(snapshot)
         except Exception as e:
             self._push_log(f"Failed to persist active trades: {e}", level="warning")
+
+    def _register_entry_thesis(
+        self,
+        *,
+        signal: dict,
+        position_key: str,
+        trade_id: str,
+        position_epoch: str,
+        instrument_id: str,
+        quantity: int,
+        transaction_type: str,
+        order_kwargs: dict,
+        recovery_trade: dict,
+    ) -> tuple[EntryThesis, str]:
+        """Commit a frozen premise and entry obligation before submission.
+
+        A storage failure stops the new entry before the broker mutation.  It
+        does not alter hard-risk supervision of any existing position.
+        """
+
+        thesis = capture_entry_thesis(
+            signal,
+            position_key=position_key,
+            trade_id=trade_id,
+            position_epoch=position_epoch,
+            instrument_id=str(instrument_id),
+            effective_config=config_manager.get_effective_exit_management_config(),
+            created_at=now_utc(),
+        )
+        intent_id = str(uuid.uuid4())
+        initial_state = PositionState(
+            position_key=position_key,
+            thesis_health=(
+                ThesisHealth.UNKNOWN
+                if thesis.management_profile.name == "unknown_legacy_bounded"
+                else ThesisHealth.VALID
+            ),
+            protection=ProtectionState.UNCONFIRMED,
+        )
+        state = reduce_lifecycle(
+            initial_state,
+            LifecycleEvent.ENTRY_INTENT_COMMITTED,
+            event_id=f"entry-intent:{intent_id}",
+            occurred_at=now_utc(),
+            known_quantity=None,
+        )
+        checkpoint = PositionCheckpoint(
+            position_key=position_key,
+            state_version=state.version,
+            sequence=0,
+            state=state,
+            counters={"eligible_completed_bars": 0},
+            extrema={"observed_mfe": None, "observed_mae": None},
+            intents={"entry_intent_id": intent_id},
+            protection={
+                "requested_initial_stop": thesis.initial_stop,
+                "confirmed_stop": None,
+            },
+            input_references={"entry": thesis.input_reference.to_dict()},
+        )
+        journal.create_managed_position(
+            thesis,
+            checkpoint,
+            entry_intent={
+                "intent_id": intent_id,
+                "position_key": position_key,
+                "trade_id": trade_id,
+                "intent_type": IntentType.ENTER.value,
+                "role": OrderRole.ENTRY.value,
+                "side": transaction_type,
+                "quantity": quantity,
+                "reason": "ENTRY_THESIS_CAPTURED",
+                "payload": {
+                    "order": dict(order_kwargs),
+                    # Phase-2 recovery reconstructs an owner from this
+                    # durable payload when a process dies after broker
+                    # acknowledgement but before the compatibility JSON
+                    # checkpoint is written.
+                    "recovery_trade": {
+                        **recovery_trade,
+                        "exit_management_position_key": position_key,
+                        "thesis_id": thesis.thesis_id,
+                        "thesis_revision": thesis.revision,
+                        "management_profile": thesis.management_profile.name,
+                    },
+                    "thesis_id": thesis.thesis_id,
+                    "policy_version": thesis.policy_snapshot.policy_version,
+                },
+            },
+        )
+        self._entry_theses[position_key] = thesis
+        self._managed_position_states[position_key] = state
+        return thesis, intent_id
+
+    def _phase5_state_for(self, position_key: str) -> Optional[PositionState]:
+        record = journal.get_managed_position(position_key)
+        if (record or {}).get("state_corrupt"):
+            raise ValueError("managed position state is corrupt")
+        payload = (record or {}).get("state")
+        if not isinstance(payload, dict):
+            return None
+        try:
+            state = PositionState.from_dict(payload.get("state", payload))
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("managed position state is invalid") from None
+        self._managed_position_states[position_key] = state
+        return state
+
+    @staticmethod
+    def _phase5_event_applied(
+        position_key: str, event_id: str, event_type: str, details: dict
+    ) -> bool:
+        event = journal.get_position_lifecycle_event(event_id)
+        if event is None:
+            return False
+        if (
+            event["position_key"] != position_key
+            or event["event_type"] != event_type
+            or event["details"] != details
+        ):
+            raise ValueError("conflicting previously applied lifecycle event")
+        return True
+
+    def _commit_phase5_checkpoint(
+        self,
+        *,
+        position_key: str,
+        state: PositionState,
+        event_id: str,
+        event_type: str,
+        details: dict,
+        counters: Optional[dict] = None,
+        extrema: Optional[dict] = None,
+        intents: Optional[dict] = None,
+        protection: Optional[dict] = None,
+        input_references: Optional[dict] = None,
+        bound_thesis: Optional[EntryThesis] = None,
+    ) -> None:
+        """Advance one ordered replay checkpoint without changing exit policy."""
+
+        current = journal.get_managed_position(position_key)
+        if current is None or current.get("state_corrupt"):
+            raise ValueError("managed position checkpoint is unavailable")
+        sequence = int(current["checkpoint_sequence"]) + 1
+        previous = current.get("state") or {}
+        checkpoint = PositionCheckpoint(
+            position_key=position_key,
+            state_version=state.version,
+            sequence=sequence,
+            state=state,
+            counters={**previous.get("counters", {}), **(counters or {})},
+            extrema={**previous.get("extrema", {}), **(extrema or {})},
+            intents={**previous.get("intents", {}), **(intents or {})},
+            protection={**previous.get("protection", {}), **(protection or {})},
+            input_references={
+                **previous.get("input_references", {}),
+                **(input_references or {}),
+            },
+        )
+        journal.commit_position_checkpoint(
+            checkpoint,
+            event_id=event_id,
+            event_type=event_type,
+            details=details,
+            expected_state_version=state.version - 1,
+            bound_thesis=bound_thesis,
+        )
+        self._managed_position_states[position_key] = state
+
+    @_best_effort_exit_observation
+    @_serialized_exit_state
+    def _record_phase5_entry_recovery(
+        self, position_key: str, *, event_id: str, detail: str
+    ) -> None:
+        state = self._phase5_state_for(position_key)
+        if state is None:
+            raise ValueError("managed position state is unavailable")
+        if state.exposure.value in {"CLOSED", "ENTRY_ABORTED"}:
+            return
+        if state.last_event_id == event_id:
+            return
+        if self._phase5_event_applied(
+            position_key, event_id, "ENTRY_RECONCILIATION_REQUIRED", {"detail": detail}
+        ):
+            return
+        next_state = reduce_lifecycle(
+            state,
+            LifecycleEvent.RECONCILIATION_REQUIRED,
+            event_id=event_id,
+            occurred_at=now_utc(),
+        )
+        self._commit_phase5_checkpoint(
+            position_key=position_key,
+            state=next_state,
+            event_id=event_id,
+            event_type="ENTRY_RECONCILIATION_REQUIRED",
+            details={"detail": detail},
+        )
+
+    @_serialized_exit_state
+    def _record_phase5_entry_abort(self, position_key: str, *, event_id: str) -> None:
+        state = self._phase5_state_for(position_key)
+        if state is None or state.exposure.value not in {
+            "ENTRY_PENDING",
+            "RECOVERY_REQUIRED",
+            "NEW",
+        }:
+            return
+        next_state = reduce_lifecycle(
+            state,
+            LifecycleEvent.ENTRY_ABORTED,
+            event_id=event_id,
+            occurred_at=now_utc(),
+            protection=ProtectionState.NONE_FLAT,
+            known_quantity=0,
+        )
+        self._commit_phase5_checkpoint(
+            position_key=position_key,
+            state=next_state,
+            event_id=event_id,
+            event_type="ENTRY_ABORTED",
+            details={"quantity": 0},
+            protection={"confirmed_stop": None},
+        )
+
+    @_best_effort_exit_observation
+    @_serialized_exit_state
+    def _record_phase5_provisional_risk(
+        self,
+        position_key: str,
+        *,
+        fill_price: Optional[float],
+        quantity: int,
+        event_id: str,
+        residual_quantity: Optional[int] = None,
+    ) -> None:
+        thesis = self._phase5_thesis_for(position_key)
+        state = self._phase5_state_for(position_key)
+        if thesis is None or state is None or fill_price is None:
+            return
+        if state.exposure.value not in {"ENTRY_PENDING", "RECOVERY_REQUIRED"}:
+            return
+        if state.last_event_id == event_id:
+            return
+        provisional = calculate_provisional_risk(
+            thesis, fill_price=float(fill_price), filled_quantity=quantity
+        )
+        if self._phase5_event_applied(
+            position_key,
+            event_id,
+            "ENTRY_PARTIAL_FILL_OBSERVED",
+            {"provisional_risk": provisional.to_dict()},
+        ):
+            return
+        next_state = reduce_lifecycle(
+            state,
+            LifecycleEvent.STATE_OBSERVED,
+            event_id=event_id,
+            occurred_at=now_utc(),
+            known_quantity=quantity if residual_quantity is None else residual_quantity,
+        )
+        self._commit_phase5_checkpoint(
+            position_key=position_key,
+            state=next_state,
+            event_id=event_id,
+            event_type="ENTRY_PARTIAL_FILL_OBSERVED",
+            details={"provisional_risk": provisional.to_dict()},
+            counters={
+                "provisional_fill_quantity": quantity,
+                "provisional_risk": provisional.to_dict(),
+            },
+        )
+
+    def _phase5_thesis_for(self, position_key: str) -> Optional[EntryThesis]:
+        record = journal.get_position_thesis(position_key)
+        if record is None:
+            return None
+        if record.get("payload_corrupt"):
+            raise ValueError("managed entry thesis is corrupt")
+        thesis = EntryThesis.from_dict(record["payload"])
+        self._entry_theses[position_key] = thesis
+        return thesis
+
+    @_serialized_exit_state
+    def _bind_phase5_terminal_entry(
+        self,
+        position_key: str,
+        *,
+        entry_vwap: float,
+        quantity: int,
+        entry_time,
+        entry_order_id: str,
+        stop_order_id: Optional[str],
+        fill_ids: tuple[str, ...],
+        residual_quantity: Optional[int] = None,
+        protected: bool = True,
+        terminal_at=None,
+        confirmed_stop: Optional[dict] = None,
+    ) -> bool:
+        """Freeze the full entry allocation separately from remaining exposure."""
+        thesis = self._phase5_thesis_for(position_key)
+        state = self._phase5_state_for(position_key)
+        if thesis is None or state is None:
+            raise ValueError("original entry thesis/state is unavailable")
+        residual = quantity if residual_quantity is None else residual_quantity
+        bound = bind_terminal_fill(
+            thesis,
+            entry_vwap=entry_vwap,
+            filled_quantity=quantity,
+            terminal_at=terminal_at,
+            source_fill_ids=fill_ids,
+        )
+        protection = state.protection
+        if residual == 0:
+            event = (
+                LifecycleEvent.RECONCILED_FLAT
+                if state.exposure.value == "RECOVERY_REQUIRED"
+                else LifecycleEvent.FLAT_OBSERVED
+            )
+            if state.exposure.value == "FLAT_PENDING_RECONCILIATION":
+                event = LifecycleEvent.STATE_OBSERVED
+        elif state.latched_exit_intent_id or state.exposure.value == "EXIT_PENDING":
+            event = LifecycleEvent.STATE_OBSERVED
+        elif protected and stop_order_id:
+            event = (
+                LifecycleEvent.RECONCILED_OPEN
+                if state.exposure.value == "RECOVERY_REQUIRED"
+                else LifecycleEvent.ENTRY_TERMINAL_PROTECTED
+            )
+            if state.exposure.value == "OPEN":
+                event = LifecycleEvent.STATE_OBSERVED
+            protection = ProtectionState.ACTIVE
+        else:
+            event = LifecycleEvent.RECONCILIATION_REQUIRED
+            protection = ProtectionState.FAILED_OR_UNKNOWN
+        if (
+            bound == thesis
+            and event == LifecycleEvent.STATE_OBSERVED
+            and state.known_quantity == residual
+            and state.protection == protection
+        ):
+            return True
+        event_id = f"entry-bound:{entry_order_id}:{quantity}:{state.version}"
+        if (
+            protection is ProtectionState.ACTIVE
+            and not state.latched_exit_intent_id
+            and not (
+                confirmed_stop
+                and confirmed_stop.get("status") == "TRIGGER PENDING"
+                and confirmed_stop.get("order_id") == stop_order_id
+                and confirmed_stop.get("pending_quantity") == residual
+                and self._is_valid_management_price(confirmed_stop.get("trigger_price"))
+            )
+        ):
+            protection = ProtectionState.FAILED_OR_UNKNOWN
+            event = LifecycleEvent.RECONCILIATION_REQUIRED
+        next_state = reduce_lifecycle(
+            state,
+            event,
+            event_id=event_id,
+            occurred_at=now_utc(),
+            known_quantity=residual,
+            protection=protection,
+        )
+        protection_payload = {}
+        if (
+            protected
+            and stop_order_id
+            and residual > 0
+            and not state.latched_exit_intent_id
+        ):
+            # Broker rounding or earlier tightening can differ from planned S0.
+            stop = confirmed_stop
+            if stop and self._is_valid_management_price(stop.get("trigger_price")):
+                protection_payload = {
+                    "confirmed_stop_order_id": stop_order_id,
+                    "confirmed_stop": stop["trigger_price"],
+                    "protected_quantity": residual,
+                    "coverage": ProtectionState.ACTIVE.value,
+                }
+        self._commit_phase5_checkpoint(
+            position_key=position_key,
+            state=next_state,
+            event_id=event_id,
+            event_type="ENTRY_TERMINAL_FILL_BOUND",
+            details={
+                "entry_order_id": entry_order_id,
+                "thesis_revision": bound.revision,
+                "original_entry_quantity": quantity,
+                "residual_quantity": residual,
+                "first_fill_at": entry_time,
+                "entry_terminal_at": terminal_at,
+            },
+            intents={"entry_order_id": entry_order_id},
+            protection=protection_payload,
+            input_references={
+                "entry": bound.input_reference.to_dict(),
+                "first_fill_at": entry_time,
+                "entry_terminal_at": terminal_at,
+            },
+            bound_thesis=bound,
+        )
+        self._entry_theses[position_key] = bound
+        return event is not LifecycleEvent.RECONCILIATION_REQUIRED
+
+    @_serialized_exit_state
+    def _record_phase5_broker_observation(
+        self,
+        position_key: str,
+        *,
+        trade: dict,
+        stop: Optional[dict] = None,
+        residual_quantity: Optional[int] = None,
+        protection_failed: bool = False,
+    ) -> None:
+        """Checkpoint execution facts without running a discretionary exit rule."""
+        state = self._phase5_state_for(position_key)
+        if state is None:
+            raise ValueError("managed position state is unavailable")
+        if state.exposure.value in {"CLOSED", "ENTRY_ABORTED"}:
+            return
+        record = journal.get_managed_position(position_key)
+        previous = record["state"]
+        # A broker read can finish after another worker completed handoff or
+        # tightening. Discard that old owner snapshot, not the newer linkage.
+        live_owner = self.active_trades.get(trade.get("tradingsymbol"), {})
+        if any(
+            live_owner.get(field) is not None
+            and live_owner.get(field) != trade.get(field)
+            for field in (
+                "position_epoch",
+                "stop_order_id",
+                "protection_intent_id",
+                "exit_intent_id",
+            )
+        ):
+            return
+        links = {
+            key: value
+            for key, value in trade.items()
+            if value is not None
+            and key.endswith(("_intent_id", "_attempt_id", "_attempt_tag", "_order_id"))
+        }
+        links.update(
+            {
+                key: trade[key]
+                for key in ("exit_reason", "exit_market_required")
+                if key in trade
+            }
+        )
+        confirmed = bool(
+            not state.latched_exit_intent_id
+            and stop
+            and residual_quantity
+            and str(stop.get("order_id")) == str(trade.get("stop_order_id"))
+            and self._valid_protection_order(stop, trade)
+            and stop.get("status") == "TRIGGER PENDING"
+            and stop.get("pending_quantity") == residual_quantity
+        )
+        protection = dict(previous.get("protection", {}))
+        coverage = state.protection
+        old_stop = protection.get("confirmed_stop")
+        if confirmed and self._is_valid_management_price(old_stop):
+            if (
+                stop["trigger_price"] < old_stop
+                if trade.get("direction") == "BUY"
+                else stop["trigger_price"] > old_stop
+            ):
+                # Confirmed protection is monotone even if an earlier broker
+                # snapshot is delivered late. Its old value is not a new ack.
+                return
+        if confirmed:
+            coverage = ProtectionState.ACTIVE
+            protection.update(
+                confirmed_stop_order_id=stop["order_id"],
+                confirmed_stop=stop["trigger_price"],
+                confirmed_order_type=stop.get("order_type"),
+                confirmed_limit=stop.get("price"),
+                protected_quantity=residual_quantity,
+            )
+        if trade.get("requested_stop_trigger") is not None:
+            protection["requested_stop"] = trade["requested_stop_trigger"]
+            if coverage is ProtectionState.ACTIVE:
+                coverage = ProtectionState.UPDATE_PENDING
+        elif confirmed:
+            protection["requested_stop"] = None
+        if protection_failed:
+            coverage = ProtectionState.FAILED_OR_UNKNOWN
+        protection["coverage"] = coverage.value
+        event = LifecycleEvent.STATE_OBSERVED
+        if (
+            coverage is ProtectionState.FAILED_OR_UNKNOWN
+            and state.exposure.value == "OPEN"
+        ):
+            event = LifecycleEvent.RECONCILIATION_REQUIRED
+        elif (
+            confirmed
+            and state.exposure.value == "RECOVERY_REQUIRED"
+            and not state.latched_exit_intent_id
+            and trade.get("entry_state") == "OPEN"
+        ):
+            event = LifecycleEvent.RECONCILED_OPEN
+        quantity = residual_quantity if confirmed else state.known_quantity
+        merged_links = {**previous.get("intents", {}), **links}
+        if state.latched_exit_intent_id:
+            links["exit_intent_id"] = state.latched_exit_intent_id
+            merged_links["exit_intent_id"] = state.latched_exit_intent_id
+        counters = {
+            **previous.get("counters", {}),
+            **{
+                key: as_utc(trade[key]).isoformat() if as_utc(trade[key]) else None
+                for key in ("last_reeval_time", "entry_observed_at")
+                if key in trade
+            },
+        }
+        if (
+            coverage == state.protection
+            and quantity == state.known_quantity
+            and event == LifecycleEvent.STATE_OBSERVED
+            and protection == previous.get("protection", {})
+            and merged_links == previous.get("intents", {})
+            and counters == previous.get("counters", {})
+        ):
+            return
+        event_id = f"broker-observation:{position_key}:{state.version}"
+        next_state = reduce_lifecycle(
+            state,
+            event,
+            event_id=event_id,
+            occurred_at=now_utc(),
+            known_quantity=quantity,
+            protection=coverage,
+        )
+        self._commit_phase5_checkpoint(
+            position_key=position_key,
+            state=next_state,
+            event_id=event_id,
+            event_type="BROKER_MANAGEMENT_OBSERVED",
+            details={"recovery_state": trade.get("recovery_state")},
+            intents=links,
+            protection=protection,
+            counters=counters,
+        )
+
+    @_serialized_exit_state
+    def _record_phase5_exit_pending(
+        self,
+        position_key: str,
+        *,
+        intent_id: str,
+        reason: str,
+        quantity: int,
+    ) -> None:
+        """Latch the existing reduction intent in the phase-5 state record."""
+
+        state = self._phase5_state_for(position_key)
+        if state is None or state.exposure.value == "EXIT_PENDING":
+            return
+        if state.exposure.value == "RECOVERY_REQUIRED":
+            event = LifecycleEvent.RECONCILED_EXIT_PENDING
+        elif state.exposure.value in {"ENTRY_PENDING", "OPEN"}:
+            event = LifecycleEvent.EXIT_REQUESTED
+        else:
+            return
+        next_state = reduce_lifecycle(
+            state,
+            event,
+            event_id=f"exit-intent:{intent_id}",
+            occurred_at=now_utc(),
+            known_quantity=quantity,
+            exit_intent_id=intent_id,
+            protection=(
+                ProtectionState.HANDOFF_PENDING
+                if state.protection
+                in {
+                    ProtectionState.ACTIVE,
+                    ProtectionState.UPDATE_PENDING,
+                    ProtectionState.FAILED_OR_UNKNOWN,
+                }
+                else state.protection
+            ),
+        )
+        self._commit_phase5_checkpoint(
+            position_key=position_key,
+            state=next_state,
+            event_id=f"exit-intent:{intent_id}",
+            event_type="EXIT_INTENT_LATCHED",
+            details={"intent_id": intent_id, "reason": reason, "quantity": quantity},
+            intents={"exit_intent_id": intent_id},
+            protection={"coverage": next_state.protection.value},
+        )
+
+    @_serialized_exit_state
+    def _record_phase5_flat_observed(self, position_key: str, *, event_id: str) -> None:
+        state = self._phase5_state_for(position_key)
+        if state is None or state.exposure.value == "FLAT_PENDING_RECONCILIATION":
+            return
+        if state.exposure.value == "RECOVERY_REQUIRED":
+            event = LifecycleEvent.RECONCILED_FLAT
+        elif state.exposure.value in {"ENTRY_PENDING", "OPEN", "EXIT_PENDING"}:
+            event = LifecycleEvent.FLAT_OBSERVED
+        else:
+            return
+        next_state = reduce_lifecycle(
+            state,
+            event,
+            event_id=event_id,
+            occurred_at=now_utc(),
+            known_quantity=0,
+        )
+        self._commit_phase5_checkpoint(
+            position_key=position_key,
+            state=next_state,
+            event_id=event_id,
+            event_type="FLAT_OBSERVED",
+            details={"known_quantity": 0},
+        )
+
+    @_serialized_exit_state
+    def _record_phase5_closed(self, position_key: str, *, event_id: str) -> None:
+        state = self._phase5_state_for(position_key)
+        if state is None or state.exposure.value == "CLOSED":
+            return
+        if state.exposure.value != "FLAT_PENDING_RECONCILIATION":
+            return
+        next_state = reduce_lifecycle(
+            state,
+            LifecycleEvent.FLAT_CONFIRMED,
+            event_id=event_id,
+            occurred_at=now_utc(),
+            known_quantity=0,
+            protection=ProtectionState.NONE_FLAT,
+        )
+        self._commit_phase5_checkpoint(
+            position_key=position_key,
+            state=next_state,
+            event_id=event_id,
+            event_type="FLAT_CONFIRMED",
+            details={"known_quantity": 0},
+            protection={
+                "coverage": ProtectionState.NONE_FLAT.value,
+                "confirmed_stop": None,
+                "confirmed_stop_order_id": None,
+                "protected_quantity": 0,
+            },
+        )
+
+    def _retire_phase5_position(self, trade: dict) -> bool:
+        """Persist closure before dropping an already reconciled operational owner."""
+        key = trade.get("exit_management_position_key")
+        if not key:
+            return True
+        try:
+            state = self._phase5_state_for(key)
+            if state is None:
+                raise ValueError("managed position checkpoint is missing")
+            if state.exposure.value in {"CLOSED", "ENTRY_ABORTED"}:
+                return True
+            self._record_phase5_flat_observed(key, event_id=f"flat-clean:{key}")
+            self._record_phase5_closed(key, event_id=f"closed-clean:{key}")
+            state = self._phase5_state_for(key)
+            if state is None or state.exposure.value != "CLOSED":
+                raise ValueError("managed position closure was not persisted")
+            return True
+        except Exception as exc:
+            failure = {
+                "broker_reconciliation_pending": True,
+                "cleanup_pending": True,
+                "exit_state_recovery_required": True,
+                "recovery_state": "EXIT_STATE_PERSISTENCE_FAILED",
+            }
+            trade.update(failure)
+            with self._trade_lock:
+                for owner in self.active_trades.values():
+                    if owner.get("exit_management_position_key") == key:
+                        owner.update(failure)
+            self._reconciliation_pending = True
+            self._push_log(f"Closure checkpoint failed for {key}: {exc}", level="error")
+            return False
+
+    def _restore_phase5_checkpoints(self) -> None:
+        """Restore replay state for persisted managed positions on restart.
+
+        The JSON active-trade file remains a compatibility operational view.
+        It is never used to recreate counters, extrema, intent links or a
+        thesis.  A malformed SQLite record becomes visible recovery state and
+        leaves the existing stop/order safeguards untouched.
+        """
+
+        namespace = getattr(getattr(kite_client, "namespace", None), "value", None)
+        account = getattr(kite_client, "account_id", None)
+        if namespace and account not in (None, "", "UNKNOWN"):
+            # A lost/stale compatibility JSON file cannot hide a SQLite owner.
+            for record in journal.list_managed_positions(
+                namespace=namespace, account_id=str(account)
+            ):
+                if record.get("provenance") == "LEGACY_PARTIAL":
+                    continue
+                symbol = record["tradingsymbol"]
+                key = record["position_key"]
+                with self._trade_lock:
+                    current = self.active_trades.get(symbol)
+                if current is not None:
+                    try:
+                        matches = self._trade_position_key(symbol, current) == key
+                    except ValueError:
+                        matches = current.get("exit_management_position_key") == key
+                    if not matches:
+                        current["ownership_quarantined"] = True
+                        current["broker_reconciliation_pending"] = True
+                        current["recovery_state"] = "DURABLE_OWNER_CONFLICT"
+                        self._reconciliation_pending = True
+                        continue
+                    current["exit_management_position_key"] = key
+                    continue
+                # Identity is sufficient to retain recovery ownership even when
+                # thesis/state payloads are damaged. No invented price or size.
+                restored = {
+                    "exit_management_position_key": key,
+                    "trade_id": record.get("trade_id"),
+                    "namespace": record["namespace"],
+                    "account_id": record["account_id"],
+                    "exchange": record["exchange"],
+                    "instrument_id": record["instrument_id"],
+                    "tradingsymbol": symbol,
+                    "product": record["product"],
+                    "position_epoch": key.rsplit(":", 1)[-1],
+                    "identity_verified": True,
+                    "entry_state": "RECOVERY_REQUIRED",
+                    "broker_reconciliation_pending": True,
+                    "quantity": None,
+                    "entry_price": None,
+                    "entry_time": None,
+                    "sl": None,
+                    "target": None,
+                    "direction": None,
+                    "stop_order_id": None,
+                    "exit_pending": False,
+                }
+                with self._trade_lock:
+                    self.active_trades.setdefault(symbol, restored)
+        with self._trade_lock:
+            records = list(self.active_trades.items())
+        for symbol, trade in records:
+            position_key = trade.get("exit_management_position_key")
+            if not position_key:
+                continue
+            try:
+                record = journal.get_managed_position(position_key)
+                if record is None or record.get("state_corrupt"):
+                    raise ValueError("checkpoint unavailable")
+                if (
+                    namespace
+                    and account not in (None, "", "UNKNOWN")
+                    and (
+                        record.get("namespace") != namespace
+                        or record.get("account_id") != str(account)
+                    )
+                ):
+                    trade["ownership_quarantined"] = True
+                    raise ValueError("checkpoint belongs to another execution scope")
+                state = PositionState.from_dict(record["state"]["state"])
+                thesis = self._phase5_thesis_for(position_key)
+                if thesis is None and record.get("provenance") != "LEGACY_PARTIAL":
+                    raise ValueError("thesis unavailable")
+                payload = record["state"]
+                updates = {
+                    "exit_management_checkpoint": payload,
+                    "exit_management_checkpoint_version": record["state_version"],
+                    "exit_management_checkpoint_sequence": record[
+                        "checkpoint_sequence"
+                    ],
+                }
+                if state.known_quantity is not None:
+                    updates["residual_quantity"] = state.known_quantity
+                first_fill_at = payload.get("input_references", {}).get("first_fill_at")
+                if trade.get("entry_time") is None and first_fill_at:
+                    updates["entry_time"] = as_utc(first_fill_at)
+                if thesis is not None:
+                    binding = thesis.fill_binding
+                    updates.update(
+                        thesis_id=thesis.thesis_id,
+                        thesis_revision=thesis.revision,
+                        management_profile=thesis.management_profile.name,
+                        direction=thesis.direction,
+                        target=thesis.objective,
+                        original_strategy=thesis.strategy,
+                        signal_entry_price=thesis.planned_entry_price,
+                    )
+                    # Restore execution facts only where JSON has no newer
+                    # operational observation; immutable thesis never uses JSON.
+                    trade.setdefault("sl", thesis.initial_stop)
+                    if trade.get("sl") is None:
+                        trade["sl"] = (
+                            payload.get("protection", {}).get("confirmed_stop")
+                            or thesis.initial_stop
+                        )
+                    if binding:
+                        if trade.get("quantity") is None:
+                            updates["quantity"] = binding.filled_quantity
+                        updates["executed_entry_quantity"] = binding.filled_quantity
+                        if trade.get("entry_price") is None:
+                            updates["entry_price"] = binding.entry_vwap
+                links = payload.get("intents", {})
+                for field, value in links.items():
+                    if value is not None and not trade.get(field):
+                        updates[field] = value
+                entry_intent = links.get("entry_intent_id")
+                if entry_intent:
+                    intent = journal.get_order_intent_projection(entry_intent) or {}
+                    attempt = intent.get("latest_attempt") or {}
+                    if not trade.get("entry_order_id") and attempt.get(
+                        "broker_order_id"
+                    ):
+                        updates["entry_order_id"] = attempt["broker_order_id"]
+                    if trade.get("quantity") is None and "quantity" not in updates:
+                        updates["quantity"] = intent.get("quantity")
+                    updates.setdefault("requested_quantity", intent.get("quantity"))
+                protection = payload.get("protection", {})
+                if not trade.get("stop_order_id"):
+                    updates["stop_order_id"] = protection.get("confirmed_stop_order_id")
+                if state.latched_exit_intent_id:
+                    updates["exit_intent_id"] = state.latched_exit_intent_id
+                    updates["exit_pending"] = True
+                self._managed_position_states[position_key] = state
+                with self._trade_lock:
+                    trade.update(updates)
+                    trade.pop("exit_state_recovery_required", None)
+            except (AttributeError, KeyError, TypeError, ValueError) as exc:
+                with self._trade_lock:
+                    trade["broker_reconciliation_pending"] = True
+                    trade["exit_state_recovery_required"] = True
+                    trade["recovery_state"] = "EXIT_STATE_CORRUPT_OR_MISSING"
+                self._reconciliation_pending = True
+                self._push_log(
+                    f"Exit state recovery required for {symbol}: {exc}", level="error"
+                )
 
     @staticmethod
     def _broker_position_key(
@@ -744,6 +1656,10 @@ class TradingEngine:
                 with self._order_lifecycle._position_lock(intent["position_key"]):
                     latest = self._lifecycle_projection(intent["intent_id"])
                     if latest is not None and not latest.get("latest_attempt"):
+                        self._record_phase5_entry_abort(
+                            intent["position_key"],
+                            event_id=f"entry-aborted-before-dispatch:{intent['intent_id']}",
+                        )
                         self._complete_lifecycle_intent(
                             intent["intent_id"], "ENTRY_ABORTED_BEFORE_DISPATCH"
                         )
@@ -801,6 +1717,15 @@ class TradingEngine:
                     current["recovery_state"] = "DURABLE_OWNER_CONFLICT"
                     self._lifecycle_recovery_pending = True
                     continue
+            # SQLite may be newer than the last JSON snapshot, including the
+            # first entry acknowledgement. Recover the frozen premise by its
+            # exact position epoch rather than rebuilding it from market data.
+            managed = journal.get_managed_position(intent["position_key"])
+            if managed is not None:
+                with self._trade_lock:
+                    current["exit_management_position_key"] = intent["position_key"]
+                    current["thesis_id"] = managed.get("thesis_id")
+                    current["thesis_revision"] = managed.get("thesis_revision")
             self._record_lifecycle_attempt_linkage(
                 intent, intent.get("latest_attempt") or {}
             )
@@ -900,6 +1825,30 @@ class TradingEngine:
         auto-mode adoption path in monitor_positions.
         """
         persisted = config_manager.load_active_trades()
+        try:
+            # Retain a durable, explicitly incomplete import before legacy JSON
+            # compatibility/reconciliation mutates the operational snapshot.
+            # Imported records stay UNKNOWN/RECOVERY_REQUIRED; this never
+            # reconstructs a thesis from today's candles.
+            imported_keys = journal.import_legacy_active_snapshot(persisted)
+            for trade in persisted.values():
+                if isinstance(trade, dict) and not trade.get(
+                    "exit_management_position_key"
+                ):
+                    trade["legacy_bounded_management"] = True
+            for key in imported_keys:
+                record = journal.get_managed_position(key)
+                symbol = record["tradingsymbol"]
+                trade = persisted.get(symbol, {})
+                if (
+                    self._has_canonical_identity(trade)
+                    and self._trade_position_key(symbol, trade) == key
+                ):
+                    trade["exit_management_position_key"] = key
+        except Exception as exc:
+            self._push_log(
+                f"Legacy position snapshot import failed: {exc}", level="warning"
+            )
 
         # Restore persisted ownership before attempting broker reads.  An
         # unavailable startup snapshot is uncertainty, not proof that the
@@ -911,6 +1860,7 @@ class TradingEngine:
             restored.update(self.active_trades)
             self.active_trades = restored
         self._restore_lifecycle_owners()
+        self._restore_phase5_checkpoints()
         with self._trade_lock:
             persisted = dict(self.active_trades)
         if not persisted:
@@ -1017,7 +1967,9 @@ class TradingEngine:
                     self.active_trades.pop(symbol, None)
             reconciled = dict(self.active_trades)
         self._reconciliation_pending = any(
-            trade.get("broker_reconciliation_pending") for trade in reconciled.values()
+            trade.get("broker_reconciliation_pending")
+            or trade.get("exit_state_recovery_required")
+            for trade in reconciled.values()
         )
         self._lifecycle_recovery_pending = bool(self._pending_lifecycle_obligations())
         self._persist_trades()
@@ -1251,6 +2203,17 @@ class TradingEngine:
                 trade["cleanup_pending"] = True
                 trade["recovery_state"] = "FLAT_ORDER_CLEANUP_PENDING"
                 return True
+            if trade.get("exit_management_position_key"):
+                self._record_phase5_flat_observed(
+                    trade["exit_management_position_key"],
+                    event_id=f"restart-flat:{trade['exit_management_position_key']}",
+                )
+                if not self._journal_external_close(symbol):
+                    trade["broker_reconciliation_pending"] = True
+                    trade["recovery_state"] = "ACCOUNTING_RECONCILIATION_PENDING"
+                    return True
+                if not self._retire_phase5_position(trade):
+                    return True
             self._push_log(
                 f"Reconcile: {symbol} no longer open; dropping stale tracking."
             )
@@ -2273,6 +3236,7 @@ class TradingEngine:
         try:
             entry_price = self._round_to_tick(float(signal["entryPrice"]), tick_size)
             signal["entryPrice"] = entry_price
+            signal["stopLoss"] = self._round_to_tick(signal["stopLoss"], tick_size)
         except (KeyError, TypeError, ValueError):
             self._push_log(
                 f"Cannot execute signal {signal.get('id')}: entry price must be numeric",
@@ -2433,23 +3397,86 @@ class TradingEngine:
                         level="warning",
                     )
                     return False
-                entry_result = self._submit_lifecycle_order(
-                    position_key=self._broker_position_key(
-                        symbol=symbol,
-                        exchange=exchange,
-                        product=product,
-                        instrument_id=instrument_id,
-                        account_id=account_id,
-                        namespace=namespace,
+                position_key = self._broker_position_key(
+                    symbol=symbol,
+                    exchange=exchange,
+                    product=product,
+                    instrument_id=instrument_id,
+                    account_id=account_id,
+                    namespace=namespace,
+                    position_epoch=position_epoch,
+                )
+                try:
+                    thesis, entry_intent_id = self._register_entry_thesis(
+                        signal=signal,
+                        position_key=position_key,
+                        trade_id=trade_id,
                         position_epoch=position_epoch,
-                    ),
+                        instrument_id=instrument_id,
+                        quantity=qty,
+                        transaction_type=transaction_type,
+                        order_kwargs=entry_order_kwargs,
+                        recovery_trade=pending_trade,
+                    )
+                except Exception as exc:
+                    with self._trade_lock:
+                        self._reserved_entry_margin -= reserved_margin
+                        self.active_trades.pop(symbol, None)
+                    reserved_margin = 0
+                    risk_manager.release_entry_reservation(reservation_id)
+                    self._push_log(
+                        f"Entry rejected for {symbol}: thesis persistence failed: {exc}",
+                        level="error",
+                    )
+                    return False
+                phase5_fields = {
+                    "exit_management_position_key": position_key,
+                    "thesis_id": thesis.thesis_id,
+                    "thesis_revision": thesis.revision,
+                    "management_profile": thesis.management_profile.name,
+                }
+                with self._trade_lock:
+                    self.active_trades[symbol].update(phase5_fields)
+                # Persistence can block long enough for an operator/session
+                # flatten to arrive. Recheck immediately before preparing an
+                # attempt; an old entry decision never overrides that control.
+                entry_allowed, entry_reason = self._entry_admission_allowed()
+                with self._trade_lock:
+                    entry_cancel_requested = bool(
+                        self.active_trades.get(symbol, {}).get("entry_cancel_requested")
+                    )
+                if not entry_allowed or entry_cancel_requested:
+                    self._record_phase5_entry_abort(
+                        position_key, event_id=f"entry-cancelled:{entry_intent_id}"
+                    )
+                    self._complete_lifecycle_intent(
+                        entry_intent_id, "ENTRY_ABORTED_BEFORE_DISPATCH"
+                    )
+                    self._settle_entry_resources(symbol, outcome="unfilled")
+                    with self._trade_lock:
+                        self.active_trades.pop(symbol, None)
+                    reserved_margin = 0
+                    self._push_log(
+                        f"Entry cancelled for {symbol} before dispatch: "
+                        f"{entry_reason or 'entry cancellation requested'}",
+                        level="warning",
+                    )
+                    return False
+                entry_result = self._submit_lifecycle_order(
+                    position_key=position_key,
                     intent_type=IntentType.ENTER,
                     role=OrderRole.ENTRY,
                     side=transaction_type,
                     quantity=qty,
                     order_kwargs=entry_order_kwargs,
+                    trade_id=trade_id,
+                    existing_intent_id=entry_intent_id,
                 )
                 if entry_result.state == AttemptState.REJECTED.value:
+                    self._record_phase5_entry_abort(
+                        position_key,
+                        event_id=f"entry-rejected:{entry_intent_id}",
+                    )
                     with self._trade_lock:
                         self._reserved_entry_margin -= reserved_margin
                         self.active_trades.pop(symbol, None)
@@ -2465,6 +3492,11 @@ class TradingEngine:
                     )
                     return False
                 if not entry_result.broker_order_id:
+                    self._record_phase5_entry_recovery(
+                        position_key,
+                        event_id=f"entry-submission-unknown:{entry_intent_id}",
+                        detail=entry_result.detail or entry_result.state,
+                    )
                     with self._trade_lock:
                         current = self.active_trades.get(symbol, pending_trade)
                         current.update(
@@ -2472,6 +3504,7 @@ class TradingEngine:
                             entry_attempt_id=entry_result.attempt_id,
                             entry_attempt_tag=entry_result.attempt_tag,
                             entry_submission_state=entry_result.state,
+                            **phase5_fields,
                         )
                         self.active_trades[symbol] = current
                     self._persist_trades()
@@ -2508,6 +3541,11 @@ class TradingEngine:
             position = self._wait_for_entry_fill(signal, order_id, baseline_quantity)
             resolution = self._entry_recovery.pop(order_id, None)
             if position is None and resolution == "UNKNOWN":
+                self._record_phase5_entry_recovery(
+                    position_key,
+                    event_id=f"entry-fill-unknown:{order_id}",
+                    detail="entry fill outcome is unknown",
+                )
                 with self._trade_lock:
                     self.active_trades[symbol] = {
                         "trade_id": trade_id,
@@ -2542,6 +3580,7 @@ class TradingEngine:
                         "exit_pending": False,
                         "exit_order_id": None,
                     }
+                    self.active_trades[symbol].update(phase5_fields)
                 self._persist_trades()
                 self._push_log(
                     f"Entry {order_id} for {symbol} has unknown fill state; retaining ownership for recovery.",
@@ -2591,6 +3630,19 @@ class TradingEngine:
                         "exit_pending": False,
                         "exit_order_id": None,
                     }
+                    self.active_trades[symbol].update(phase5_fields)
+                partial_quantity = abs(position.get("quantity", 0))
+                self._record_phase5_provisional_risk(
+                    position_key,
+                    fill_price=position.get("average_price"),
+                    quantity=partial_quantity,
+                    event_id=f"entry-partial:{order_id}:{partial_quantity}",
+                )
+                self._record_phase5_entry_recovery(
+                    position_key,
+                    event_id=f"entry-partial-recovery:{order_id}:{partial_quantity}",
+                    detail="entry remainder remains working after a partial fill",
+                )
                 reserved_margin = 0
                 self._recover_pending_entry(
                     symbol, position, dict(self.active_trades[symbol])
@@ -2606,6 +3658,10 @@ class TradingEngine:
                     level="warning",
                 )
                 if resolution == "CONFIRMED_UNFILLED":
+                    self._record_phase5_entry_abort(
+                        position_key,
+                        event_id=f"entry-unfilled:{order_id}",
+                    )
                     self._complete_lifecycle_intent(
                         entry_result.intent_id, "ENTRY_UNFILLED"
                     )
@@ -2634,6 +3690,11 @@ class TradingEngine:
                 position_epoch=position_epoch,
             )
             if not stop_order_id or not self._confirm_protective_stop(stop_order_id):
+                self._record_phase5_entry_recovery(
+                    position_key,
+                    event_id=f"entry-protection-unconfirmed:{order_id}",
+                    detail="terminal entry fill has no confirmed protective stop",
+                )
                 self._push_log(
                     f"CRITICAL: Failed to confirm protective stop for {symbol}. "
                     "Retaining a recovery/flatten obligation.",
@@ -2684,6 +3745,7 @@ class TradingEngine:
                         "exit_pending": False,
                         "exit_order_id": None,
                     }
+                    self.active_trades[symbol].update(phase5_fields)
                     recovery_trade = self.active_trades[symbol]
                     recovery_trade.update(protection_linkage)
                 self._attach_lifecycle_order(
@@ -2710,22 +3772,41 @@ class TradingEngine:
 
                 return False
 
-            # Get confluence snapshot for journal
+            # The entry thesis was captured before order submission.  Do not
+            # fetch a later position evaluation and mislabel it as the entry
+            # rationale; it remains available separately as a later market
+            # observation in future phases.
+            evaluation = {
+                "entry_thesis_id": thesis.thesis_id,
+                "selected_evidence": [
+                    item.to_dict() for item in thesis.selected_evidence
+                ],
+                "input_reference": thesis.input_reference.to_dict(),
+            }
+            # Retain the legacy post-fill assessment call for compatibility
+            # diagnostics (and broker-event races it currently observes), but
+            # never store it as the entry rationale.  Its separate label keeps
+            # replay consumers from treating later candles as entry evidence.
             try:
                 token = self._ensure_instrument_map().get(symbol)
-                evaluation = scanner.evaluate_position(symbol, token) if token else {}
-            except Exception as e:
+                post_fill_observation = (
+                    scanner.evaluate_position(symbol, token) if token else {}
+                )
+            except Exception as exc:
                 self._push_log(
-                    f"Error fetching confluence snapshot for {symbol}: {e}",
+                    f"Error fetching post-fill observation for {symbol}: {exc}",
                     level="warning",
                 )
-                evaluation = {}
+                post_fill_observation = {}
 
             actual_entry_price = position.get("average_price")
             if not self._is_valid_management_price(actual_entry_price):
                 actual_entry_price = None
             actual_quantity = abs(position.get("quantity", qty)) or qty
             entry_time = None
+            entry_fills = []
+            terminal_entry = self._find_order(order_id)
+            terminal_fill_verified = False
             try:
                 entry_fills = [
                     fill
@@ -2739,7 +3820,15 @@ class TradingEngine:
                     and fill.key.namespace.value == namespace
                     and fill.key.instrument_id == str(instrument_id)
                 ]
-                if sum(fill.quantity for fill in entry_fills) == actual_quantity:
+                filled_quantity = sum(fill.quantity for fill in entry_fills)
+                terminal_fill_verified = bool(
+                    terminal_entry
+                    and terminal_entry.get("status") in self._TERMINAL_ORDER_STATUSES
+                    and filled_quantity > 0
+                    and filled_quantity == terminal_entry.get("filled_quantity")
+                    and actual_quantity <= filled_quantity
+                )
+                if terminal_fill_verified:
                     actual_entry_price = accounting_service.project_fills(
                         entry_fills
                     ).vwap
@@ -2789,6 +3878,12 @@ class TradingEngine:
                         "exit_order_id": None,
                         "trailing_sl": signal.get("trailing_sl", False),
                     }
+                    self.active_trades[symbol].update(phase5_fields)
+                self._record_phase5_entry_recovery(
+                    position_key,
+                    event_id=f"entry-price-unavailable:{order_id}",
+                    detail="entry fills cannot establish a terminal VWAP",
+                )
                 self._persist_trades()
                 self._push_log(
                     f"Entry execution price unavailable for {symbol}; retaining protected recovery ownership.",
@@ -2806,7 +3901,9 @@ class TradingEngine:
                     product=position.get("product", product),
                     strategy=signal.get("strategy", "unknown"),
                     entry_price=actual_entry_price,
-                    quantity=actual_quantity,
+                    quantity=filled_quantity
+                    if terminal_fill_verified
+                    else actual_quantity,
                     stop_loss=signal["stopLoss"],
                     target=signal["target"],
                     signal_id=signal.get("id"),
@@ -2819,6 +3916,7 @@ class TradingEngine:
                         "features": signal.get("indicators"),
                         "raw_signals": signal.get("raw_signals"),
                         "regime": signal.get("regime"),
+                        "post_fill_observation": post_fill_observation,
                         "portfolio_state": {
                             "open_positions": risk_manager.open_positions,
                             "daily_pnl": risk_manager.daily_pnl,
@@ -2845,6 +3943,35 @@ class TradingEngine:
                     f"Failed to log trade open for {symbol}: {e}", level="error"
                 )
 
+            phase5_bound = False
+            try:
+                if not terminal_fill_verified:
+                    raise ValueError(
+                        "complete terminal entry allocation is unavailable"
+                    )
+                phase5_bound = self._bind_phase5_terminal_entry(
+                    position_key,
+                    entry_vwap=actual_entry_price,
+                    quantity=filled_quantity,
+                    residual_quantity=actual_quantity,
+                    entry_time=entry_time,
+                    terminal_at=terminal_entry.get("exchange_timestamp"),
+                    confirmed_stop=self._find_order(stop_order_id),
+                    entry_order_id=str(order_id),
+                    stop_order_id=str(stop_order_id),
+                    fill_ids=tuple(fill.broker_fill_id for fill in entry_fills),
+                )
+            except Exception as exc:
+                self._push_log(
+                    f"Entry thesis binding failed for {symbol}; retaining recovery state: {exc}",
+                    level="error",
+                )
+                self._record_phase5_entry_recovery(
+                    position_key,
+                    event_id=f"entry-thesis-binding-failed:{order_id}",
+                    detail=str(exc),
+                )
+
             with self._trade_lock:
                 self.active_trades[symbol] = {
                     "trade_id": trade_id,
@@ -2861,7 +3988,10 @@ class TradingEngine:
                     "entry_attempt_id": entry_result.attempt_id,
                     "entry_attempt_tag": entry_result.attempt_tag,
                     "stop_order_id": stop_order_id,
-                    "quantity": actual_quantity,
+                    "quantity": filled_quantity
+                    if terminal_fill_verified
+                    else actual_quantity,
+                    "residual_quantity": actual_quantity,
                     "product": position.get("product", "MIS"),
                     "exit_pending": False,
                     "exit_order_id": None,
@@ -2877,18 +4007,19 @@ class TradingEngine:
                     if journal_entry_recorded
                     else reservation_id,
                     "entry_state": "OPEN"
-                    if journal_entry_recorded
+                    if journal_entry_recorded and phase5_bound
                     else "RECOVERY_REQUIRED",
                     # trailing_sl=True disables the resistance/support smart exit
                     # (Issue 6) since the dynamic stop already handles exit management.
                     "trailing_sl": signal.get("trailing_sl", False),
+                    **phase5_fields,
                 }
                 tracked_trade = self.active_trades[symbol]
             self._attach_lifecycle_order(tracked_trade, "protection", stop_order_id)
             self._record_lifecycle_fills(symbol, tracked_trade)
             self._persist_trades()
             entry_order = self._find_order(order_id)
-            if entry_order and journal_entry_recorded:
+            if entry_order and journal_entry_recorded and phase5_bound:
                 entry_observation = self._order_lifecycle.observe_order(
                     entry_result.intent_id, entry_order
                 )
@@ -3082,7 +4213,9 @@ class TradingEngine:
                         # A completed stop is a broker event, not proof that the
                         # fill ledger can yet be allocated to this trade.
                         continue
-                if self._cancel_protective_stop(symbol):
+                if self._cancel_protective_stop(
+                    symbol
+                ) and self._retire_phase5_position(cleanup_trade):
                     with self._trade_lock:
                         removed = self.active_trades.pop(symbol, None)
                     if removed:
@@ -3174,12 +4307,17 @@ class TradingEngine:
                 stop_cancelled = self._cancel_protective_stop(symbol)
                 with self._trade_lock:
                     current = self.active_trades.get(symbol)
-                    if current and stop_cancelled:
-                        self.active_trades.pop(symbol, None)
-                    elif current:
-                        current["cleanup_pending"] = True
-                        current["broker_reconciliation_pending"] = True
-                        current["recovery_state"] = "STOP_CANCEL_UNCONFIRMED"
+                retired = bool(
+                    current and stop_cancelled and self._retire_phase5_position(current)
+                )
+                with self._trade_lock:
+                    if self.active_trades.get(symbol) is current:
+                        if retired:
+                            self.active_trades.pop(symbol, None)
+                        elif current and not stop_cancelled:
+                            current["cleanup_pending"] = True
+                            current["broker_reconciliation_pending"] = True
+                            current["recovery_state"] = "STOP_CANCEL_UNCONFIRMED"
 
             # Evaluate each open position. Trade state is re-read under a short
             # lock immediately before each decision.
@@ -3401,12 +4539,21 @@ class TradingEngine:
                         stop_cancelled = self._cancel_protective_stop(symbol)
                         with self._trade_lock:
                             current = self.active_trades.get(symbol)
-                            if current and stop_cancelled:
-                                self.active_trades.pop(symbol, None)
-                            elif current:
-                                current["cleanup_pending"] = True
-                                current["broker_reconciliation_pending"] = True
-                                current["recovery_state"] = "STOP_CANCEL_UNCONFIRMED"
+                        retired = bool(
+                            current
+                            and stop_cancelled
+                            and self._retire_phase5_position(current)
+                        )
+                        with self._trade_lock:
+                            if self.active_trades.get(symbol) is current:
+                                if retired:
+                                    self.active_trades.pop(symbol, None)
+                                elif current and not stop_cancelled:
+                                    current["cleanup_pending"] = True
+                                    current["broker_reconciliation_pending"] = True
+                                    current["recovery_state"] = (
+                                        "STOP_CANCEL_UNCONFIRMED"
+                                    )
                         continue
                     self._place_exit_order(live, symbol, reason)
             self._settle_control_obligations()
@@ -3655,7 +4802,34 @@ class TradingEngine:
         try:
             with self._trade_lock:
                 current = dict(self.active_trades.get(symbol, trade))
-            return self._ensure_recovery_protection_owned(symbol, position, current)
+            protected = self._ensure_recovery_protection_owned(
+                symbol, position, current
+            )
+            with self._trade_lock:
+                current = dict(self.active_trades.get(symbol, current))
+            key = current.get("exit_management_position_key")
+            if key:
+                stop = (
+                    self._find_order(current.get("stop_order_id"))
+                    if protected
+                    else None
+                )
+                try:
+                    self._record_phase5_broker_observation(
+                        key,
+                        trade=current,
+                        stop=stop,
+                        residual_quantity=current.get("protection_quantity"),
+                        protection_failed=bool(
+                            not protected and current.get("recovery_state")
+                        ),
+                    )
+                except Exception as exc:
+                    self._push_log(
+                        f"Protection checkpoint failed for {symbol}: {exc}",
+                        level="error",
+                    )
+            return protected
         finally:
             lock.release()
 
@@ -3883,10 +5057,20 @@ class TradingEngine:
         ):
             return
         self._record_lifecycle_fills(symbol, trade)
-        if position and trade.get("exit_intent_id"):
+        if (
+            position
+            and self._hard_flatten_reason
+            and self._in_flatten_scope(position)
+            and self._trade_matches_position(trade, position)
+        ):
+            # Reconciliation can run before the monitor's ordinary position
+            # loop. A latched flatten still owns the next broker mutation.
+            self._place_exit_order(position, symbol, self._hard_flatten_reason)
+            trade = dict(self.active_trades.get(symbol, trade))
+        reduction_pending = bool(trade.get("exit_intent_id"))
+        if position and reduction_pending:
             if self._exit_attempt_can_continue(trade):
                 self._place_exit_order(position, symbol, trade.get("exit_reason", ""))
-            return
         if position and not self._trade_matches_position(trade, position):
             self._quarantine_identity_mismatch(symbol, trade)
             return
@@ -3934,6 +5118,15 @@ class TradingEngine:
                 and self._flat_trade_orders_terminal(symbol, current)
                 and self._journal_external_close(symbol)
             ):
+                phase5_key = current.get("exit_management_position_key")
+                if phase5_key:
+                    self._record_phase5_flat_observed(
+                        phase5_key, event_id=f"adopted-flat:{current['position_epoch']}"
+                    )
+                    self._record_phase5_closed(
+                        phase5_key,
+                        event_id=f"adopted-closed:{current['position_epoch']}",
+                    )
                 self._complete_lifecycle_intent(
                     current.get("exit_intent_id"), "FLAT_ORDER_CLEAN"
                 )
@@ -4000,9 +5193,17 @@ class TradingEngine:
             )
         protected = (
             self._ensure_recovery_protection(symbol, position, trade)
-            if position
+            if position and not reduction_pending
             else False
         )
+        if protected:
+            # Cancellation/resize may itself observe a protective fill. The
+            # pre-handoff snapshot must not become the new checkpoint's
+            # residual quantity or claimed coverage.
+            refreshed = self._find_reconciled_residual(symbol, trade)
+            if refreshed is None:
+                return
+            position = refreshed
         if not entry_order:
             return
 
@@ -4026,6 +5227,11 @@ class TradingEngine:
             if entry_terminal and reported_quantity == 0 and not residual_quantity:
                 if not self._flat_trade_orders_terminal(symbol, trade):
                     return
+                phase5_key = trade.get("exit_management_position_key")
+                if phase5_key:
+                    self._record_phase5_entry_abort(
+                        phase5_key, event_id=f"entry-unfilled:{entry_order_id}"
+                    )
                 self._complete_lifecycle_intent(
                     trade.get("entry_intent_id"), "ENTRY_ABORTED"
                 )
@@ -4116,6 +5322,50 @@ class TradingEngine:
                 }
             )
 
+        phase5_key = trade.get("exit_management_position_key")
+        if phase5_key:
+            try:
+                original_thesis = journal.get_position_thesis(phase5_key)
+                if entry_terminal and original_thesis is not None:
+                    bound = self._bind_phase5_terminal_entry(
+                        phase5_key,
+                        entry_vwap=projection.vwap,
+                        quantity=original_quantity,
+                        residual_quantity=residual_quantity,
+                        entry_time=entry_time,
+                        terminal_at=entry_order.get("exchange_timestamp"),
+                        entry_order_id=str(entry_order_id),
+                        stop_order_id=current.get("stop_order_id"),
+                        protected=protected,
+                        confirmed_stop=(
+                            self._find_order(str(current.get("stop_order_id")))
+                            if protected
+                            else None
+                        ),
+                        fill_ids=tuple(fill.broker_fill_id for fill in entry_fills),
+                    )
+                    if not bound:
+                        current["broker_reconciliation_pending"] = True
+                        current["recovery_state"] = "ENTRY_PROTECTION_UNCONFIRMED"
+                        return
+                elif original_thesis is not None:
+                    self._record_phase5_provisional_risk(
+                        phase5_key,
+                        fill_price=projection.vwap,
+                        quantity=original_quantity,
+                        residual_quantity=residual_quantity,
+                        event_id=f"entry-partial:{entry_order_id}:{original_quantity}",
+                    )
+            except Exception as exc:
+                current["broker_reconciliation_pending"] = True
+                current["entry_state"] = "RECOVERY_REQUIRED"
+                current["recovery_state"] = "ENTRY_THESIS_BINDING_PENDING"
+                self._push_log(
+                    f"Recovered entry thesis persistence failed for {symbol}: {exc}",
+                    level="error",
+                )
+                return
+
         if residual_quantity <= 0:
             if not entry_terminal:
                 with self._trade_lock:
@@ -4156,6 +5406,13 @@ class TradingEngine:
             self._settle_entry_resources(symbol, outcome="filled")
             if not self._flat_trade_orders_terminal(symbol, trade):
                 return
+            if phase5_key:
+                self._record_phase5_flat_observed(
+                    phase5_key, event_id=f"recovered-flat:{entry_order_id}"
+                )
+                self._record_phase5_closed(
+                    phase5_key, event_id=f"recovered-closed:{entry_order_id}"
+                )
             self._complete_lifecycle_intent(
                 trade.get("entry_intent_id"), "ENTRY_FILLED"
             )
@@ -4217,6 +5474,12 @@ class TradingEngine:
         self, symbol: str, ltp: float, direction: str, lookback: int = 20
     ) -> bool:
         try:
+            with self._trade_lock:
+                trade = self.active_trades.get(symbol, {})
+                if trade.get("legacy_bounded_management") or trade.get(
+                    "exit_state_recovery_required"
+                ):
+                    return False
             token = self._ensure_instrument_map().get(symbol)
             if not token:
                 return False
@@ -4340,6 +5603,7 @@ class TradingEngine:
             "journal_entry_recorded": False,
             "entry_state": "RECOVERY_REQUIRED",
             "adopted": True,
+            "legacy_bounded_management": True,
             "exit_pending": False,
             "exit_order_id": None,
             "broker_reconciliation_pending": True,
@@ -4351,6 +5615,16 @@ class TradingEngine:
             if symbol in self.active_trades or symbol in self._pending_entries:
                 return
             self.active_trades[symbol] = trade
+        try:
+            imported = journal.import_legacy_active_snapshot(
+                {symbol: trade}, source="broker_position_adoption"
+            )
+            if imported:
+                trade["exit_management_position_key"] = imported[0]
+        except Exception as exc:
+            self._push_log(
+                f"Adoption checkpoint failed for {symbol}: {exc}", level="error"
+            )
         self._persist_trades()
         try:
             journal.open_trade(
@@ -4419,6 +5693,8 @@ class TradingEngine:
                     or trade.get("exit_pending")
                     or trade.get("execution_linkage_pending")
                     or trade.get("ownership_quarantined")
+                    or trade.get("legacy_bounded_management")
+                    or trade.get("exit_state_recovery_required")
                 ):
                     continue
                 direction = trade["direction"]
@@ -4567,7 +5843,25 @@ class TradingEngine:
         if not lock.acquire(blocking=False):
             return False
         try:
-            return self._tighten_to_breakeven_owned(symbol)
+            tightened = self._tighten_to_breakeven_owned(symbol)
+            with self._trade_lock:
+                trade = dict(self.active_trades.get(symbol, {}))
+            key = trade.get("exit_management_position_key")
+            if key:
+                stop = self._find_order(trade.get("stop_order_id"))
+                try:
+                    self._record_phase5_broker_observation(
+                        key,
+                        trade=trade,
+                        stop=stop,
+                        residual_quantity=(stop or {}).get("pending_quantity"),
+                    )
+                except Exception as exc:
+                    self._push_log(
+                        f"Stop modification checkpoint failed for {symbol}: {exc}",
+                        level="error",
+                    )
+            return tightened
         finally:
             lock.release()
 
@@ -5660,6 +6954,28 @@ class TradingEngine:
         existing["exit_intent_id"] = intent["intent_id"]
         with self._trade_lock:
             self.active_trades[symbol]["exit_intent_id"] = intent["intent_id"]
+        phase5_key = existing.get("exit_management_position_key")
+        if phase5_key == position_key:
+            try:
+                self._record_phase5_exit_pending(
+                    position_key,
+                    intent_id=intent["intent_id"],
+                    reason=reason,
+                    quantity=abs(int(position["quantity"])),
+                )
+            except Exception as exc:
+                # The phase-2 intent remains the execution safety authority.
+                # Record the persistence failure for reconciliation without
+                # cancelling or weakening this already-latched reduction.
+                with self._trade_lock:
+                    current = self.active_trades.get(symbol)
+                    if current:
+                        current["broker_reconciliation_pending"] = True
+                        current["recovery_state"] = "EXIT_STATE_PERSISTENCE_FAILED"
+                self._push_log(
+                    f"Exit state persistence failed for {symbol}: {exc}",
+                    level="error",
+                )
         self._persist_trades()
 
         # An external/manual stop may have no app role or checkpoint linkage.
@@ -5953,6 +7269,18 @@ class TradingEngine:
             if live_before_cleanup is not None and not live_before_cleanup:
                 # External/stop fills may flatten before our working exit does.
                 # Cancel that still-live exit before it can open the other side.
+                phase5_key = trade.get("exit_management_position_key")
+                if phase5_key:
+                    try:
+                        self._record_phase5_flat_observed(
+                            phase5_key,
+                            event_id=f"flat-observed:{order_id}",
+                        )
+                    except Exception as exc:
+                        self._push_log(
+                            f"Flat-state persistence failed for {symbol}: {exc}",
+                            level="error",
+                        )
                 if not self._flat_trade_orders_terminal(symbol, trade):
                     return
                 if trade.get("entry_state") == "RECOVERY_REQUIRED":
@@ -5962,10 +7290,25 @@ class TradingEngine:
                     trade["broker_reconciliation_pending"] = True
                     trade["recovery_state"] = "ACCOUNTING_RECONCILIATION_PENDING"
                     return
+                if not self._retire_phase5_position(trade):
+                    return
                 self._complete_lifecycle_intent(intent_id, "FLAT_ORDER_CLEAN")
+                closed_phase5_key = None
                 with self._trade_lock:
                     if self.active_trades.get(symbol) is trade:
+                        closed_phase5_key = trade.get("exit_management_position_key")
                         self.active_trades.pop(symbol, None)
+                if closed_phase5_key:
+                    try:
+                        self._record_phase5_closed(
+                            closed_phase5_key,
+                            event_id=f"flat-confirmed:{order_id}",
+                        )
+                    except Exception as exc:
+                        self._push_log(
+                            f"Closure-state persistence failed for {symbol}: {exc}",
+                            level="error",
+                        )
                 return
             if status not in self._TERMINAL_ORDER_STATUSES and intent_id:
                 projection = self._lifecycle_projection(intent_id)
@@ -6044,6 +7387,18 @@ class TradingEngine:
                         f"Exit {order_id} for {symbol} was partial; retaining the reduction obligation."
                     )
                 else:
+                    phase5_key = trade.get("exit_management_position_key")
+                    if phase5_key:
+                        try:
+                            self._record_phase5_flat_observed(
+                                phase5_key,
+                                event_id=f"flat-observed:{order_id}",
+                            )
+                        except Exception as exc:
+                            self._push_log(
+                                f"Flat-state persistence failed for {symbol}: {exc}",
+                                level="error",
+                            )
                     if trade.get("entry_state") == "RECOVERY_REQUIRED":
                         # An emergency reduction can finish while entry fills
                         # are unavailable. Keep its financial/count owner until
@@ -6062,6 +7417,9 @@ class TradingEngine:
                                 )
                         return
                     stop_cancelled = self._cancel_protective_stop(symbol)
+                    if stop_cancelled and not self._retire_phase5_position(trade):
+                        return
+                    closed_phase5_key = None
                     with self._trade_lock:
                         current = self.active_trades.get(symbol)
                         if (
@@ -6074,6 +7432,9 @@ class TradingEngine:
                                 "FLAT_ORDER_CLEAN",
                                 {"broker_order_id": order_id},
                             )
+                            closed_phase5_key = current.get(
+                                "exit_management_position_key"
+                            )
                             del self.active_trades[symbol]
                         elif current and current.get("exit_order_id") == order_id:
                             current["exit_pending"] = True
@@ -6081,6 +7442,17 @@ class TradingEngine:
                             current["cleanup_pending"] = True
                             current["broker_reconciliation_pending"] = True
                             current["recovery_state"] = "STOP_CANCEL_UNCONFIRMED"
+                    if closed_phase5_key:
+                        try:
+                            self._record_phase5_closed(
+                                closed_phase5_key,
+                                event_id=f"flat-confirmed:{order_id}",
+                            )
+                        except Exception as exc:
+                            self._push_log(
+                                f"Closure-state persistence failed for {symbol}: {exc}",
+                                level="error",
+                            )
                     self._push_log(
                         f"Exit order {order_id} for {symbol} filled and position is flat; removed from tracking."
                     )

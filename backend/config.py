@@ -150,6 +150,15 @@ class ConfigManager:
                 "swingConfirmationBars": 2,
                 "regimeTransitionConfirmBars": 2,
             },
+            # This is a provenance contract only in phase 5.  The existing
+            # normal-exit controls remain active until the later shadow/parity
+            # phases explicitly promote a deterministic policy.
+            "exitManagement": {
+                "policyVersion": "exit-thesis-state-v1",
+                "thesisSchemaVersion": "entry-thesis-v1",
+                "defaultProfileVersion": "management-profiles-v1",
+                "legacyControlPolicyVersion": "legacy-control-v1",
+            },
         }
 
         self.in_memory_credentials = {}
@@ -326,6 +335,30 @@ class ConfigManager:
         return deepcopy(
             self.config.get("marketContext", self.default_config["marketContext"])
         )
+
+    def get_exit_management_config(self):
+        """Return a detached policy/provenance contract for new positions."""
+
+        return deepcopy(
+            self.config.get("exitManagement", self.default_config["exitManagement"])
+        )
+
+    def get_effective_exit_management_config(self):
+        """Pin all non-secret settings that can explain a position's premise.
+
+        This does not validate or activate a new discretionary exit policy.
+        It is deliberately a snapshot so a Settings save cannot rewrite an
+        already accepted trade's entry premise during phase 5.
+        """
+
+        return {
+            "exitManagement": self.get_exit_management_config(),
+            "risk": deepcopy(self.get_risk_config()),
+            "strategies": deepcopy(self.get_strategy_config()),
+            "families": deepcopy(self.get_families_config()),
+            "marketContext": self.get_market_context_config(),
+            "orderLifecycle": deepcopy(self.get_order_lifecycle_config()),
+        }
 
     def get_watchlist(self):
         return self.config.get("watchlist", self.default_config["watchlist"])

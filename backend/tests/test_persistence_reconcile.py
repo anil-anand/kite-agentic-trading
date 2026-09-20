@@ -395,10 +395,18 @@ def test_reconcile_retains_closed_trade_until_stop_cancellation_confirmed(monkey
     assert fake_client.cancel_calls[0]["order_id"] == "STOP1"
     fake_client.orders[0]["status"] = "CANCELLED"
     engine.reconcile_active_trades()
+    # Phase 5 retains a migrated owner until accounting is also reconciled;
+    # terminal order cleanup alone cannot prove a complete lifecycle closure.
+    assert (
+        engine.active_trades["RELIANCE"]["recovery_state"]
+        == "ACCOUNTING_RECONCILIATION_PENDING"
+    )
+    monkeypatch.setattr(engine, "_journal_external_close", lambda symbol: True)
+    engine.reconcile_active_trades()
     assert engine.active_trades == {}
 
 
-def test_reconcile_drops_closed_trade_no_cancel_when_stop_gone(monkeypatch):
+def test_reconcile_retains_flat_accounting_until_repaired_when_stop_gone(monkeypatch):
     engine, fake_client, _ = _setup_reconcile(
         monkeypatch,
         persisted={"RELIANCE": _trade(stop_order_id="STOP1")},
@@ -407,8 +415,14 @@ def test_reconcile_drops_closed_trade_no_cancel_when_stop_gone(monkeypatch):
     )
     engine.reconcile_active_trades()
 
-    assert engine.active_trades == {}
+    assert (
+        engine.active_trades["RELIANCE"]["recovery_state"]
+        == "ACCOUNTING_RECONCILIATION_PENDING"
+    )
     assert fake_client.cancel_calls == []
+    monkeypatch.setattr(engine, "_journal_external_close", lambda symbol: True)
+    engine.reconcile_active_trades()
+    assert engine.active_trades == {}
 
 
 def test_reconcile_replaces_missing_stop_on_open_position(monkeypatch):

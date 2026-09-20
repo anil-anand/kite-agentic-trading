@@ -317,6 +317,14 @@ restores counters/extrema/intents; legacy data remain readable without fake fact
 **Expected behavior:** bookkeeping becomes explicit while approved legacy exit
 semantics can still run as control. Unknown legacy trades use bounded management.
 
+**Implementation/review evidence:** [PHASE5_REVIEW.md](PHASE5_REVIEW.md) records
+the pre-commit findings, applied corrections and phase boundaries. Immutable
+theses, causal selection provenance, original-fill risk, orthogonal state,
+atomic checkpoints and scoped restart recovery are covered by offline tests,
+including partial fills, duplicate events, failed persistence and stop handoff.
+Final validation: **979 Python tests**, Ruff lint/format and `git diff --check`
+passed. No commit, live broker order or candidate-policy activation was performed.
+
 ## Phase 6 — Pure deterministic thesis and profit-management engine
 
 **Responsibility:** implement DECISION_MODEL, STATE_MACHINE and EXIT_REASON_CODES,

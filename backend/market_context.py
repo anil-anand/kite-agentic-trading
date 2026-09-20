@@ -217,6 +217,7 @@ class MarketContext:
     confirmed_regime: str
     transition_candidate: Optional[str]
     transition_age: int
+    context_policy: Optional[ContextPolicy] = None
 
     @property
     def normal_decision_eligible(self) -> bool:
@@ -237,6 +238,33 @@ class MarketContext:
     def summary(self) -> Dict[str, Any]:
         """JSON-friendly provenance intended for current scanner consumers."""
 
+        def bar_summary(bar: Optional[OHLCVBar]) -> Optional[Dict[str, Any]]:
+            if bar is None:
+                return None
+            return {
+                "bar_id": bar.bar_id,
+                "start": bar.start.isoformat(),
+                "end": bar.end.isoformat(),
+                "available_at": bar.available_at.isoformat(),
+                "open": bar.open,
+                "high": bar.high,
+                "low": bar.low,
+                "close": bar.close,
+                "volume": bar.volume,
+                "revision": bar.revision,
+            }
+
+        setup_range = None
+        if self.setup_range is not None:
+            setup_range = {
+                "low": self.setup_range.low,
+                "high": self.setup_range.high,
+                "start": self.setup_range.start.isoformat(),
+                "end": self.setup_range.end.isoformat(),
+                "known_at": self.setup_range.known_at.isoformat(),
+                "source_bar_ids": list(self.setup_range.source_bar_ids),
+            }
+
         return {
             "snapshot_id": self.snapshot_id,
             "instrument_id": self.instrument_id,
@@ -245,6 +273,10 @@ class MarketContext:
             "received_at": self.received_at.isoformat(),
             "source_as_of": self.source_as_of.isoformat(),
             "feature_version": self.feature_version,
+            "context_policy_version": self.feature_version,
+            "policy": asdict(self.context_policy) if self.context_policy else None,
+            "primary_bar": bar_summary(self.primary_bar),
+            "higher_bar": bar_summary(self.higher_bar),
             "primary_bar_id": self.primary_bar.bar_id if self.primary_bar else None,
             "primary_bar_start": self.primary_bar.start.isoformat()
             if self.primary_bar
@@ -272,6 +304,20 @@ class MarketContext:
             "input_hash": self.input_hash,
             "session_vwap": self.session_vwap,
             "atr": self.atr,
+            "direction_dynamics": dict(self.direction_dynamics),
+            "participation": dict(self.participation),
+            "setup_range": setup_range,
+            "known_structure": [
+                {
+                    "level_id": level.level_id,
+                    "kind": level.kind,
+                    "price": level.price,
+                    "formed_at": level.formed_at.isoformat(),
+                    "known_at": level.known_at.isoformat(),
+                    "source_bar_ids": list(level.source_bar_ids),
+                }
+                for level in self.known_structure
+            ],
             "observation_quality": {
                 key: value.value for key, value in self.observation_quality.items()
             },
@@ -470,6 +516,7 @@ class MarketContextService:
             confirmed_regime=transition.confirmed_regime,
             transition_candidate=transition.transition_candidate,
             transition_age=transition.transition_age,
+            context_policy=self.policy,
         )
 
     def cache_frame(

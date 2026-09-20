@@ -1,3 +1,4 @@
+import hashlib
 import json
 import math
 import sqlite3
@@ -6,7 +7,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 from backend.accounting import (
     ACCOUNTING_POLICY_VERSION,
@@ -14,6 +15,13 @@ from backend.accounting import (
     SUPPORTED_PRODUCT,
     accounting_service,
 )
+from backend.exit_management.models import (
+    DecisionRecord,
+    PositionCheckpoint,
+    PositionState,
+    thaw,
+)
+from backend.exit_management.thesis import EntryThesis, ThesisBindingStatus
 from backend.financial_eligibility import verified_outcome_sql
 from backend.time_utils import EXCHANGE_TIMEZONE, as_utc, now_utc
 
@@ -251,12 +259,115 @@ class TradeJournal:
                 );
                 CREATE INDEX IF NOT EXISTS idx_lifecycle_events_attempt_time
                     ON order_lifecycle_events(attempt_id, timestamp);
+
+                -- Phase 5 is additive to both the financial trade journal and
+                -- phase-2 order lifecycle.  A thesis is append-only, while a
+                -- checkpoint is an ordered replay boundary for one position
+                -- epoch.  This keeps unknown/legacy records readable without
+                -- inventing an entry premise.
+                CREATE TABLE IF NOT EXISTS managed_positions (
+                    position_key TEXT PRIMARY KEY,
+                    trade_id TEXT,
+                    thesis_id TEXT,
+                    thesis_revision INTEGER,
+                    provenance TEXT NOT NULL,
+                    namespace TEXT,
+                    account_id TEXT,
+                    exchange TEXT,
+                    instrument_id TEXT,
+                    tradingsymbol TEXT,
+                    product TEXT,
+                    current_state TEXT NOT NULL,
+                    state_version INTEGER NOT NULL,
+                    checkpoint_sequence INTEGER NOT NULL,
+                    created_at TIMESTAMP NOT NULL,
+                    updated_at TIMESTAMP NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_managed_positions_trade
+                    ON managed_positions(trade_id)
+                    WHERE trade_id IS NOT NULL;
+                CREATE INDEX IF NOT EXISTS idx_managed_positions_scope
+                    ON managed_positions(namespace, account_id, tradingsymbol);
+
+                CREATE TABLE IF NOT EXISTS position_theses (
+                    thesis_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    position_key TEXT NOT NULL,
+                    schema_version TEXT NOT NULL,
+                    binding_status TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    payload_hash TEXT NOT NULL,
+                    created_at TIMESTAMP NOT NULL,
+                    PRIMARY KEY(thesis_id, revision),
+                    FOREIGN KEY(position_key) REFERENCES managed_positions(position_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_position_theses_position
+                    ON position_theses(position_key, revision DESC);
+
+                CREATE TABLE IF NOT EXISTS position_checkpoints (
+                    position_key TEXT NOT NULL,
+                    state_version INTEGER NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TIMESTAMP NOT NULL,
+                    PRIMARY KEY(position_key, state_version),
+                    UNIQUE(position_key, sequence),
+                    FOREIGN KEY(position_key) REFERENCES managed_positions(position_key)
+                );
+
+                CREATE TABLE IF NOT EXISTS position_lifecycle_events (
+                    event_id TEXT PRIMARY KEY,
+                    position_key TEXT NOT NULL,
+                    state_version INTEGER NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    timestamp TIMESTAMP NOT NULL,
+                    event_type TEXT NOT NULL,
+                    details TEXT NOT NULL,
+                    FOREIGN KEY(position_key) REFERENCES managed_positions(position_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_position_events_position_sequence
+                    ON position_lifecycle_events(position_key, sequence);
+
+                CREATE TABLE IF NOT EXISTS exit_decision_records (
+                    decision_id TEXT PRIMARY KEY,
+                    position_key TEXT NOT NULL,
+                    state_before_version INTEGER NOT NULL,
+                    state_after_version INTEGER NOT NULL,
+                    policy_version TEXT NOT NULL,
+                    input_reference TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TIMESTAMP NOT NULL,
+                    FOREIGN KEY(position_key) REFERENCES managed_positions(position_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_exit_decisions_position_time
+                    ON exit_decision_records(position_key, created_at);
+
+                CREATE TABLE IF NOT EXISTS legacy_position_snapshots (
+                    snapshot_id TEXT PRIMARY KEY,
+                    payload TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    imported_at TIMESTAMP NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS position_key_aliases (
+                    alias_key TEXT PRIMARY KEY,
+                    position_key TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    created_at TIMESTAMP NOT NULL,
+                    FOREIGN KEY(position_key) REFERENCES managed_positions(position_key)
+                );
             """)
 
             conn.execute(
                 """
                 INSERT OR IGNORE INTO journal_schema_migrations(version, applied_at)
                 VALUES ('order_lifecycle_v1', ?)
+                """,
+                (now_utc().isoformat(),),
+            )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO journal_schema_migrations(version, applied_at)
+                VALUES ('exit_management_state_v1', ?)
                 """,
                 (now_utc().isoformat(),),
             )
@@ -413,6 +524,928 @@ class TradeJournal:
                 "VALUES ('order_lifecycle_fill_identity_v2', ?)",
                 (now_utc().isoformat(),),
             )
+
+    @staticmethod
+    def _exit_payload(value: Any) -> str:
+        """Serialize immutable exit-domain contracts deterministically."""
+
+        return json.dumps(
+            thaw(value), allow_nan=False, sort_keys=True, separators=(",", ":")
+        )
+
+    @classmethod
+    def _exit_payload_hash(cls, value: Any) -> str:
+        return hashlib.sha256(cls._exit_payload(value).encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _decode_exit_payload(value: str) -> Optional[Dict[str, Any]]:
+        def reject_constant(constant):
+            raise ValueError(f"non-finite JSON value: {constant}")
+
+        try:
+            decoded = json.loads(value, parse_constant=reject_constant)
+        except (TypeError, ValueError):
+            return None
+        return decoded if isinstance(decoded, dict) else None
+
+    def _insert_position_intent_inner(
+        self, conn, intent: Mapping[str, Any], *, now: str
+    ) -> Dict[str, Any]:
+        """Create the first entry intent in the same transaction as its thesis.
+
+        Later attempts still use the phase-2 coordinator.  This narrow helper
+        deliberately mirrors its immutable identity checks so a crash cannot
+        leave an entry thesis/checkpoint without the obligation it describes.
+        """
+
+        required = (
+            "intent_id",
+            "position_key",
+            "intent_type",
+            "role",
+            "side",
+            "quantity",
+        )
+        if any(intent.get(field) in (None, "") for field in required):
+            raise ValueError("position entry intent is incomplete")
+        intent_id = str(intent["intent_id"])
+        intent_type = str(intent["intent_type"]).upper()
+        role = str(intent["role"]).upper()
+        side = str(intent["side"]).upper()
+        quantity = intent["quantity"]
+        if intent_type != "ENTER" or role != "ENTRY" or side not in {"BUY", "SELL"}:
+            raise ValueError("initial managed-position intent must be an entry")
+        if isinstance(quantity, bool) or not isinstance(quantity, int) or quantity <= 0:
+            raise ValueError("position entry intent quantity must be positive")
+        existing = conn.execute(
+            "SELECT * FROM order_intents WHERE intent_id = ?", (intent_id,)
+        ).fetchone()
+        if existing is not None:
+            immutable = {
+                "position_key": intent["position_key"],
+                "intent_type": intent_type,
+                "role": role,
+                "side": side,
+                "quantity": quantity,
+                "trade_id": intent.get("trade_id"),
+            }
+            if any(
+                str(existing[field]) != str(value) for field, value in immutable.items()
+            ):
+                raise ValueError("conflicting duplicate position entry intent")
+            if self._decode_exit_payload(existing["payload"]) != dict(
+                intent.get("payload") or {}
+            ):
+                raise ValueError("conflicting duplicate position entry intent payload")
+            return self._lifecycle_row(existing)
+        payload = dict(intent.get("payload") or {})
+        conn.execute(
+            """
+            INSERT INTO order_intents(
+                intent_id, position_key, trade_id, intent_type, role, side,
+                quantity, reason, payload, state, state_version, latched,
+                active, created_at, updated_at
+            ) VALUES (?, ?, ?, 'ENTER', ?, ?, ?, ?, ?, 'PREPARED', 1, 0, 1, ?, ?)
+            """,
+            (
+                intent_id,
+                str(intent["position_key"]),
+                intent.get("trade_id"),
+                role,
+                side,
+                quantity,
+                intent.get("reason"),
+                self._exit_payload(payload),
+                now,
+                now,
+            ),
+        )
+        self._lifecycle_event_inner(
+            conn,
+            intent_id,
+            "intent_prepared",
+            {
+                "position_key": str(intent["position_key"]),
+                "intent_type": "ENTER",
+                "role": role,
+                "side": side,
+                "quantity": quantity,
+                "source": "exit_management_state_v1",
+            },
+        )
+        return self._lifecycle_row(
+            conn.execute(
+                "SELECT * FROM order_intents WHERE intent_id = ?", (intent_id,)
+            ).fetchone()
+        )
+
+    def create_managed_position(
+        self,
+        thesis: EntryThesis,
+        checkpoint: PositionCheckpoint,
+        *,
+        entry_intent: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Atomically persist a thesis, first checkpoint and optional entry intent."""
+
+        if thesis.position_key != checkpoint.position_key:
+            raise ValueError("thesis and checkpoint position keys differ")
+        if checkpoint.state_version != checkpoint.state.version:
+            raise ValueError("initial checkpoint has inconsistent state version")
+        if (
+            entry_intent
+            and str(entry_intent.get("position_key")) != thesis.position_key
+        ):
+            raise ValueError("entry intent position key differs from thesis")
+        if entry_intent and (
+            str(entry_intent.get("side", "")).upper() != thesis.direction
+            or entry_intent.get("trade_id") != thesis.trade_id
+            or checkpoint.intents.get("entry_intent_id")
+            != entry_intent.get("intent_id")
+        ):
+            raise ValueError("entry intent does not match its thesis and checkpoint")
+        thesis_payload = thesis.to_dict()
+        thesis_json = self._exit_payload(thesis_payload)
+        thesis_hash = self._exit_payload_hash(thesis_payload)
+        checkpoint_json = self._exit_payload(checkpoint.to_dict())
+        now = now_utc().isoformat()
+        conn = self._get_conn()
+        conn.row_factory = sqlite3.Row
+        with self._transaction(conn):
+            existing = conn.execute(
+                "SELECT * FROM managed_positions WHERE position_key = ?",
+                (thesis.position_key,),
+            ).fetchone()
+            if existing is not None:
+                if existing["thesis_id"] != thesis.thesis_id:
+                    raise ValueError("position key is already owned by another thesis")
+                original = conn.execute(
+                    "SELECT payload, payload_hash FROM position_theses "
+                    "WHERE thesis_id = ? AND revision = ?",
+                    (thesis.thesis_id, thesis.revision),
+                ).fetchone()
+                initial = conn.execute(
+                    "SELECT payload FROM position_checkpoints "
+                    "WHERE position_key = ? AND state_version = ?",
+                    (checkpoint.position_key, checkpoint.state_version),
+                ).fetchone()
+                if (
+                    original is None
+                    or original["payload_hash"] != thesis_hash
+                    or original["payload"] != thesis_json
+                    or initial is None
+                    or initial["payload"] != checkpoint_json
+                ):
+                    raise ValueError("conflicting duplicate managed position")
+                if entry_intent:
+                    self._insert_position_intent_inner(conn, entry_intent, now=now)
+                return self._managed_position_row(existing)
+
+            conn.execute(
+                """
+                INSERT INTO managed_positions(
+                    position_key, trade_id, thesis_id, thesis_revision, provenance,
+                    namespace, account_id, exchange, instrument_id, tradingsymbol,
+                    product, current_state, state_version, checkpoint_sequence,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    thesis.position_key,
+                    thesis.trade_id,
+                    thesis.thesis_id,
+                    thesis.revision,
+                    thesis.provenance.value,
+                    thesis.position_key.split(":", 2)[0],
+                    thesis.position_key.split(":", 2)[1],
+                    thesis.exchange,
+                    thesis.instrument_id,
+                    thesis.symbol,
+                    thesis.product,
+                    checkpoint_json,
+                    checkpoint.state_version,
+                    checkpoint.sequence,
+                    now,
+                    now,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO position_theses(
+                    thesis_id, revision, position_key, schema_version, binding_status,
+                    payload, payload_hash, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    thesis.thesis_id,
+                    thesis.revision,
+                    thesis.position_key,
+                    thesis.schema_version,
+                    thesis.binding_status.value,
+                    thesis_json,
+                    thesis_hash,
+                    now,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO position_checkpoints(
+                    position_key, state_version, sequence, payload, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    thesis.position_key,
+                    checkpoint.state_version,
+                    checkpoint.sequence,
+                    checkpoint_json,
+                    now,
+                ),
+            )
+            event_id = f"position-created:{thesis.thesis_id}"
+            conn.execute(
+                """
+                INSERT INTO position_lifecycle_events(
+                    event_id, position_key, state_version, sequence, timestamp,
+                    event_type, details
+                ) VALUES (?, ?, ?, ?, ?, 'POSITION_REGISTERED', ?)
+                """,
+                (
+                    event_id,
+                    thesis.position_key,
+                    checkpoint.state_version,
+                    checkpoint.sequence,
+                    now,
+                    self._exit_payload(
+                        {
+                            "thesis_id": thesis.thesis_id,
+                            "thesis_revision": thesis.revision,
+                            "schema_version": thesis.schema_version,
+                        }
+                    ),
+                ),
+            )
+            if entry_intent:
+                self._insert_position_intent_inner(conn, entry_intent, now=now)
+            row = conn.execute(
+                "SELECT * FROM managed_positions WHERE position_key = ?",
+                (thesis.position_key,),
+            ).fetchone()
+        return self._managed_position_row(row)
+
+    def _managed_position_row(self, row) -> Optional[Dict[str, Any]]:
+        if row is None:
+            return None
+        result = dict(row)
+        decoded = self._decode_exit_payload(result.pop("current_state", ""))
+        if not self._valid_checkpoint_payload(
+            decoded,
+            position_key=result["position_key"],
+            state_version=result["state_version"],
+            sequence=result["checkpoint_sequence"],
+        ):
+            decoded = None
+        if decoded is not None:
+            checkpoint = (
+                self._get_conn()
+                .execute(
+                    "SELECT payload FROM position_checkpoints "
+                    "WHERE position_key = ? AND state_version = ? AND sequence = ?",
+                    (
+                        result["position_key"],
+                        result["state_version"],
+                        result["checkpoint_sequence"],
+                    ),
+                )
+                .fetchone()
+            )
+            if (
+                checkpoint is None
+                or self._decode_exit_payload(checkpoint[0]) != decoded
+            ):
+                decoded = None
+        result["state"] = decoded
+        result["state_corrupt"] = decoded is None
+        return result
+
+    @staticmethod
+    def _valid_checkpoint_payload(
+        payload, *, position_key: str, state_version: int, sequence: int
+    ) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        try:
+            checkpoint = PositionCheckpoint.from_dict(payload)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return False
+        return (
+            checkpoint.position_key == position_key
+            and checkpoint.state_version == state_version
+            and checkpoint.sequence == sequence
+            and all(
+                isinstance(payload.get(field), dict)
+                for field in (
+                    "counters",
+                    "extrema",
+                    "intents",
+                    "protection",
+                    "input_references",
+                )
+            )
+        )
+
+    def get_managed_position(self, position_key: str) -> Optional[Dict[str, Any]]:
+        conn = self._get_conn()
+        conn.row_factory = sqlite3.Row
+        return self._managed_position_row(
+            conn.execute(
+                "SELECT * FROM managed_positions WHERE position_key = ?",
+                (position_key,),
+            ).fetchone()
+        )
+
+    def get_position_lifecycle_event(self, event_id: str) -> Optional[Dict[str, Any]]:
+        """Find a previously committed source event across later checkpoints."""
+        conn = self._get_conn()
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM position_lifecycle_events WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["details"] = self._decode_exit_payload(row["details"])
+        return result
+
+    def list_managed_positions(
+        self,
+        *,
+        namespace: Optional[str] = None,
+        account_id: Optional[str] = None,
+        include_closed: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Read authoritative restart records, including corrupt rows for recovery."""
+
+        conn = self._get_conn()
+        conn.row_factory = sqlite3.Row
+        predicates, values = [], []
+        for field, value in (("namespace", namespace), ("account_id", account_id)):
+            if value is not None:
+                predicates.append(f"{field} = ?")
+                values.append(value)
+        where = " WHERE " + " AND ".join(predicates) if predicates else ""
+        rows = conn.execute(
+            "SELECT * FROM managed_positions"
+            + where
+            + " ORDER BY created_at, position_key",
+            values,
+        ).fetchall()
+        result = []
+        for row in rows:
+            record = self._managed_position_row(row)
+            exposure = ((record.get("state") or {}).get("state") or {}).get("exposure")
+            if include_closed or exposure not in {"CLOSED", "ENTRY_ABORTED"}:
+                result.append(record)
+        return result
+
+    def get_position_thesis(
+        self, position_key: str, revision: Optional[int] = None
+    ) -> Optional[Dict[str, Any]]:
+        conn = self._get_conn()
+        conn.row_factory = sqlite3.Row
+        if revision is None:
+            row = conn.execute(
+                """
+                SELECT t.* FROM position_theses t
+                JOIN managed_positions p ON p.thesis_id = t.thesis_id
+                    AND p.thesis_revision = t.revision
+                WHERE p.position_key = ?
+                """,
+                (position_key,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                """
+                SELECT * FROM position_theses
+                WHERE position_key = ? AND revision = ?
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (position_key, revision),
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["payload"] = self._decode_exit_payload(result["payload"])
+        if result["payload"] is not None and (
+            self._exit_payload_hash(result["payload"]) != result["payload_hash"]
+            or result["payload"].get("position_key") != result["position_key"]
+            or result["payload"].get("thesis_id") != result["thesis_id"]
+            or result["payload"].get("revision") != result["revision"]
+            or result["payload"].get("binding_status") != result["binding_status"]
+        ):
+            result["payload"] = None
+        result["payload_corrupt"] = result["payload"] is None
+        return result
+
+    def bind_managed_position_thesis(
+        self,
+        thesis: EntryThesis,
+        checkpoint: PositionCheckpoint,
+        *,
+        event_id: str,
+        event_type: str,
+        decision: Optional[DecisionRecord] = None,
+    ) -> Dict[str, Any]:
+        """Append the terminal-fill thesis together with its protected checkpoint."""
+
+        return self.commit_position_checkpoint(
+            checkpoint,
+            event_id=event_id,
+            event_type=event_type,
+            decision=decision,
+            bound_thesis=thesis,
+        )
+
+    def _bind_managed_position_thesis_inner(
+        self, conn, thesis: EntryThesis, *, now: str
+    ):
+        if thesis.binding_status is not ThesisBindingStatus.BOUND:
+            raise ValueError("only a terminal fill-bound thesis can be persisted")
+        payload = thesis.to_dict()
+        payload_json = self._exit_payload(payload)
+        payload_hash = self._exit_payload_hash(payload)
+        position = conn.execute(
+            "SELECT * FROM managed_positions WHERE position_key = ?",
+            (thesis.position_key,),
+        ).fetchone()
+        if position is None:
+            raise ValueError("cannot bind an unknown managed position")
+        if position["thesis_id"] != thesis.thesis_id:
+            raise ValueError("fill binding thesis does not own this position")
+        current_revision = int(position["thesis_revision"])
+        existing = conn.execute(
+            "SELECT * FROM position_theses WHERE thesis_id = ? AND revision = ?",
+            (thesis.thesis_id, thesis.revision),
+        ).fetchone()
+        if existing is not None:
+            if (
+                existing["payload_hash"] != payload_hash
+                or existing["payload"] != payload_json
+            ):
+                raise ValueError("conflicting duplicate terminal fill binding")
+            return
+        if thesis.revision != current_revision + 1:
+            raise ValueError("terminal fill binding revision is out of order")
+        current = conn.execute(
+            "SELECT binding_status, payload, payload_hash FROM position_theses "
+            "WHERE thesis_id = ? AND revision = ?",
+            (thesis.thesis_id, current_revision),
+        ).fetchone()
+        if (
+            current is None
+            or current["binding_status"] != ThesisBindingStatus.DRAFT.value
+        ):
+            raise ValueError("a terminal fill binding cannot replace a bound thesis")
+        draft = self._decode_exit_payload(current["payload"])
+        if draft is None or self._exit_payload_hash(draft) != current["payload_hash"]:
+            raise ValueError("cannot bind a corrupt entry thesis")
+        draft = EntryThesis.from_dict(draft).to_dict()
+        binding_fields = {
+            "revision",
+            "binding_status",
+            "fill_binding",
+            "provisional_risk",
+        }
+        if {
+            key: value for key, value in draft.items() if key not in binding_fields
+        } != {
+            key: value for key, value in payload.items() if key not in binding_fields
+        }:
+            raise ValueError("terminal fill binding cannot change the entry premise")
+        conn.execute(
+            """
+            INSERT INTO position_theses(
+                thesis_id, revision, position_key, schema_version, binding_status,
+                payload, payload_hash, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                thesis.thesis_id,
+                thesis.revision,
+                thesis.position_key,
+                thesis.schema_version,
+                thesis.binding_status.value,
+                payload_json,
+                payload_hash,
+                now,
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE managed_positions SET thesis_revision = ?, updated_at = ?
+            WHERE position_key = ? AND thesis_revision = ?
+            """,
+            (thesis.revision, now, thesis.position_key, current_revision),
+        )
+
+    def commit_position_checkpoint(
+        self,
+        checkpoint: PositionCheckpoint,
+        *,
+        event_id: str,
+        event_type: str,
+        details: Optional[Mapping[str, Any]] = None,
+        expected_state_version: Optional[int] = None,
+        decision: Optional[DecisionRecord] = None,
+        bound_thesis: Optional[EntryThesis] = None,
+    ) -> Dict[str, Any]:
+        """Commit an ordered state/checkpoint/trace transition atomically."""
+
+        if not event_id or not event_type:
+            raise ValueError("checkpoint events require identity and type")
+        if checkpoint.state.last_event_id != event_id:
+            raise ValueError("checkpoint state and event identities differ")
+        if decision and decision.position_key != checkpoint.position_key:
+            raise ValueError("decision and checkpoint position keys differ")
+        if bound_thesis and (
+            bound_thesis.position_key != checkpoint.position_key
+            or bound_thesis.fill_binding is None
+            or checkpoint.state.known_quantity is None
+            or not 0
+            <= checkpoint.state.known_quantity
+            <= bound_thesis.fill_binding.filled_quantity
+        ):
+            raise ValueError("bound thesis and checkpoint position/quantity differ")
+        now = now_utc().isoformat()
+        checkpoint_json = self._exit_payload(checkpoint.to_dict())
+        conn = self._get_conn()
+        conn.row_factory = sqlite3.Row
+        with self._transaction(conn):
+            position = conn.execute(
+                "SELECT * FROM managed_positions WHERE position_key = ?",
+                (checkpoint.position_key,),
+            ).fetchone()
+            if position is None:
+                raise ValueError("cannot checkpoint an unknown managed position")
+            duplicate = conn.execute(
+                "SELECT * FROM position_lifecycle_events WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            if duplicate is not None:
+                if duplicate["position_key"] != checkpoint.position_key:
+                    raise ValueError("event id belongs to another position")
+                recorded_checkpoint = conn.execute(
+                    "SELECT payload FROM position_checkpoints "
+                    "WHERE position_key = ? AND state_version = ?",
+                    (checkpoint.position_key, duplicate["state_version"]),
+                ).fetchone()
+                if (
+                    duplicate["event_type"] != event_type
+                    or self._decode_exit_payload(duplicate["details"])
+                    != dict(details or {})
+                    or recorded_checkpoint is None
+                    or recorded_checkpoint["payload"] != checkpoint_json
+                ):
+                    raise ValueError("conflicting duplicate checkpoint event")
+                if decision:
+                    recorded_decision = conn.execute(
+                        "SELECT payload FROM exit_decision_records WHERE decision_id = ?",
+                        (decision.decision_id,),
+                    ).fetchone()
+                    if recorded_decision is None or recorded_decision[
+                        "payload"
+                    ] != self._exit_payload(decision.to_dict()):
+                        raise ValueError("conflicting duplicate checkpoint decision")
+                if bound_thesis:
+                    binding = conn.execute(
+                        "SELECT revision FROM position_theses "
+                        "WHERE thesis_id = ? AND revision = ?",
+                        (bound_thesis.thesis_id, bound_thesis.revision),
+                    ).fetchone()
+                    if binding is None:
+                        raise ValueError("conflicting duplicate checkpoint binding")
+                    self._bind_managed_position_thesis_inner(
+                        conn, bound_thesis, now=now
+                    )
+                return self._managed_position_row(position)
+            current_record = self._managed_position_row(position)
+            if current_record["state_corrupt"]:
+                raise ValueError("cannot advance a corrupt managed-position checkpoint")
+            current_version = int(position["state_version"])
+            expected = (
+                current_version
+                if expected_state_version is None
+                else expected_state_version
+            )
+            if expected != current_version:
+                raise RuntimeError("stale managed-position checkpoint version")
+            if checkpoint.state_version != current_version + 1:
+                raise RuntimeError("checkpoint state version must advance exactly once")
+            if checkpoint.sequence != int(position["checkpoint_sequence"]) + 1:
+                raise RuntimeError("checkpoint sequence must advance exactly once")
+            if decision and (
+                decision.state_before
+                != PositionState.from_dict(current_record["state"]["state"])
+                or decision.state_after != checkpoint.state
+            ):
+                raise ValueError(
+                    "decision does not describe the committed state transition"
+                )
+            if bound_thesis:
+                self._bind_managed_position_thesis_inner(conn, bound_thesis, now=now)
+            conn.execute(
+                """
+                INSERT INTO position_checkpoints(
+                    position_key, state_version, sequence, payload, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    checkpoint.position_key,
+                    checkpoint.state_version,
+                    checkpoint.sequence,
+                    checkpoint_json,
+                    now,
+                ),
+            )
+            update = conn.execute(
+                """
+                UPDATE managed_positions
+                SET current_state = ?, state_version = ?, checkpoint_sequence = ?,
+                    updated_at = ?
+                WHERE position_key = ? AND state_version = ?
+                """,
+                (
+                    checkpoint_json,
+                    checkpoint.state_version,
+                    checkpoint.sequence,
+                    now,
+                    checkpoint.position_key,
+                    current_version,
+                ),
+            )
+            if update.rowcount != 1:
+                raise RuntimeError("concurrent managed-position checkpoint update")
+            conn.execute(
+                """
+                INSERT INTO position_lifecycle_events(
+                    event_id, position_key, state_version, sequence, timestamp,
+                    event_type, details
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    checkpoint.position_key,
+                    checkpoint.state_version,
+                    checkpoint.sequence,
+                    checkpoint.state.last_transition_at or now,
+                    event_type,
+                    self._exit_payload(dict(details or {})),
+                ),
+            )
+            if decision:
+                payload = decision.to_dict()
+                conn.execute(
+                    """
+                    INSERT INTO exit_decision_records(
+                        decision_id, position_key, state_before_version,
+                        state_after_version, policy_version, input_reference,
+                        payload, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        decision.decision_id,
+                        decision.position_key,
+                        decision.state_before.version,
+                        decision.state_after.version,
+                        decision.policy_version,
+                        self._exit_payload(payload["input_references"]),
+                        self._exit_payload(payload),
+                        decision.occurred_at,
+                    ),
+                )
+            row = conn.execute(
+                "SELECT * FROM managed_positions WHERE position_key = ?",
+                (checkpoint.position_key,),
+            ).fetchone()
+        return self._managed_position_row(row)
+
+    def get_position_checkpoints(self, position_key: str) -> List[Dict[str, Any]]:
+        conn = self._get_conn()
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT * FROM position_checkpoints WHERE position_key = ?
+            ORDER BY sequence ASC
+            """,
+            (position_key,),
+        ).fetchall()
+        result = []
+        for row in rows:
+            decoded = self._decode_exit_payload(row["payload"])
+            if not self._valid_checkpoint_payload(
+                decoded,
+                position_key=row["position_key"],
+                state_version=row["state_version"],
+                sequence=row["sequence"],
+            ):
+                decoded = None
+            result.append(
+                {
+                    "position_key": row["position_key"],
+                    "state_version": row["state_version"],
+                    "sequence": row["sequence"],
+                    "payload": decoded,
+                    "payload_corrupt": decoded is None,
+                    "created_at": row["created_at"],
+                }
+            )
+        return result
+
+    def get_exit_decisions(self, position_key: str) -> List[Dict[str, Any]]:
+        conn = self._get_conn()
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT * FROM exit_decision_records WHERE position_key = ?
+            ORDER BY created_at ASC, decision_id ASC
+            """,
+            (position_key,),
+        ).fetchall()
+        result = []
+        for row in rows:
+            decoded = self._decode_exit_payload(row["payload"])
+            item = dict(row)
+            item["payload"] = decoded
+            item["payload_corrupt"] = decoded is None
+            result.append(item)
+        return result
+
+    def import_legacy_active_snapshot(
+        self, trades: Mapping[str, Any], *, source: str = "active_trades.json"
+    ) -> List[str]:
+        """Back up legacy checkpoints without fabricating a thesis or quantity.
+
+        Legacy records remain in the JSON compatibility path.  The SQLite copy
+        is a recovery/audit import only, and always starts in RECOVERY_REQUIRED
+        with an UNKNOWN thesis and UNCONFIRMED protection until broker facts can
+        establish otherwise.
+        """
+
+        if not isinstance(trades, Mapping):
+            raise ValueError("legacy active-trade snapshot must be an object")
+        snapshot_json = self._exit_payload(trades)
+        snapshot_id = hashlib.sha256(snapshot_json.encode("utf-8")).hexdigest()
+        now = now_utc().isoformat()
+        imported = []
+        conn = self._get_conn()
+        conn.row_factory = sqlite3.Row
+        with self._transaction(conn):
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO legacy_position_snapshots(
+                    snapshot_id, payload, source, imported_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (snapshot_id, snapshot_json, source, now),
+            )
+            for symbol, raw_trade in trades.items():
+                if not isinstance(raw_trade, Mapping):
+                    continue
+                trade = dict(raw_trade)
+                if trade.get("exit_management_position_key"):
+                    continue
+                namespace = str(trade.get("namespace") or "UNKNOWN")
+                account_id = str(trade.get("account_id") or "UNKNOWN")
+                exchange = str(trade.get("exchange") or "UNKNOWN")
+                product = str(trade.get("product") or "UNKNOWN")
+                instrument_id = str(trade.get("instrument_id") or "UNKNOWN")
+                stable_id = trade.get("position_epoch") or trade.get("entry_order_id")
+                epoch = str(stable_id or snapshot_id[:12])
+                canonical = all(
+                    value not in {"", "UNKNOWN"}
+                    for value in (
+                        namespace,
+                        account_id,
+                        exchange,
+                        product,
+                        instrument_id,
+                    )
+                )
+                position_key = (
+                    f"{namespace}:{account_id}:{exchange}:{instrument_id}:{symbol}:{product}:{epoch}"
+                    if canonical
+                    else f"LEGACY:{snapshot_id}:{symbol}"
+                )
+                existing = conn.execute(
+                    "SELECT * FROM managed_positions WHERE position_key = ?",
+                    (position_key,),
+                ).fetchone()
+                if existing is None and trade.get("trade_id"):
+                    previous = conn.execute(
+                        "SELECT * FROM managed_positions WHERE trade_id = ?",
+                        (trade["trade_id"],),
+                    ).fetchone()
+                    if previous is not None:
+                        # A changed mark/stop or a different companion position
+                        # changes the backup hash, never the identity of a
+                        # previously imported trade. Keep each original backup.
+                        scope = {
+                            "namespace": namespace,
+                            "account_id": account_id,
+                            "exchange": exchange,
+                            "instrument_id": instrument_id,
+                            "tradingsymbol": str(symbol),
+                            "product": product,
+                        }
+                        if previous["provenance"] != "LEGACY_PARTIAL" or any(
+                            previous[field] not in (None, value) and value != "UNKNOWN"
+                            for field, value in scope.items()
+                        ):
+                            raise ValueError(
+                                "legacy trade identity conflicts with existing owner"
+                            )
+                        existing = previous
+                        position_key = previous["position_key"]
+                if existing is None:
+                    state = PositionState(
+                        position_key=position_key,
+                        exposure="RECOVERY_REQUIRED",
+                        thesis_health="UNKNOWN",
+                        protection="UNCONFIRMED",
+                        version=1,
+                        last_event_id=f"legacy-import:{snapshot_id}:{symbol}",
+                        last_transition_at=now,
+                    )
+                    checkpoint = PositionCheckpoint(
+                        position_key=position_key,
+                        state_version=1,
+                        sequence=0,
+                        state=state,
+                        protection={
+                            "legacy_stop_order_id": trade.get("stop_order_id"),
+                            "legacy_stop_loss": trade.get("sl"),
+                            "legacy_target": trade.get("target"),
+                        },
+                        input_references={"legacy_snapshot_id": snapshot_id},
+                    )
+                    checkpoint_json = self._exit_payload(checkpoint.to_dict())
+                    conn.execute(
+                        """
+                        INSERT INTO managed_positions(
+                            position_key, trade_id, thesis_id, thesis_revision,
+                            provenance, namespace, account_id, exchange,
+                            instrument_id, tradingsymbol, product, current_state,
+                            state_version, checkpoint_sequence, created_at, updated_at
+                        ) VALUES (?, ?, NULL, NULL, 'LEGACY_PARTIAL', ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?)
+                        """,
+                        (
+                            position_key,
+                            trade.get("trade_id"),
+                            namespace if canonical else None,
+                            account_id if canonical else None,
+                            exchange if canonical else None,
+                            instrument_id if canonical else None,
+                            str(symbol),
+                            product if canonical else None,
+                            checkpoint_json,
+                            now,
+                            now,
+                        ),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO position_checkpoints(
+                            position_key, state_version, sequence, payload, created_at
+                        ) VALUES (?, 1, 0, ?, ?)
+                        """,
+                        (position_key, checkpoint_json, now),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO position_lifecycle_events(
+                            event_id, position_key, state_version, sequence,
+                            timestamp, event_type, details
+                        ) VALUES (?, ?, 1, 0, ?, 'LEGACY_IMPORTED', ?)
+                        """,
+                        (
+                            f"legacy-import:{snapshot_id}:{symbol}",
+                            position_key,
+                            now,
+                            self._exit_payload(
+                                {"snapshot_id": snapshot_id, "source": source}
+                            ),
+                        ),
+                    )
+                alias = f"legacy:{snapshot_id}:{symbol}"
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO position_key_aliases(
+                        alias_key, position_key, source, created_at
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (alias, position_key, source, now),
+                )
+                imported.append(position_key)
+        return imported
 
     def open_trade(
         self,
