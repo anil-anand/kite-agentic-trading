@@ -88,23 +88,24 @@ class KiteClient:
         self.refresh_account_id()
         return session
 
-    def get_positions_snapshot(self) -> PositionSnapshot:
+    def get_positions_snapshot(self, *, critical: bool = False) -> PositionSnapshot:
         if not self.kite:
             return unavailable_position_snapshot("Kite client is not initialized")
         try:
-            res = broker_gateway.execute(
-                self.kite.positions, priority=Priority.RECONCILE
-            )
+            priority = Priority.CRITICAL if critical else Priority.RECONCILE
+            res = broker_gateway.execute(self.kite.positions, priority=priority)
             snapshot = normalize_positions_response(
                 res,
                 namespace=self.namespace,
                 account_id=self.account_id,
             )
-            return self._attach_timestamped_marks(snapshot)
+            return self._attach_timestamped_marks(snapshot, critical=critical)
         except Exception as exc:
             return unavailable_position_snapshot(exc)
 
-    def _attach_timestamped_marks(self, snapshot: PositionSnapshot) -> PositionSnapshot:
+    def _attach_timestamped_marks(
+        self, snapshot: PositionSnapshot, *, critical: bool = False
+    ) -> PositionSnapshot:
         """Enrich positions with exchange/last-trade time from full quotes.
 
         Kite position rows normally expose ``last_price`` but no mark time.
@@ -121,8 +122,14 @@ class KiteClient:
             for position in positions
         ]
         try:
-            quotes = self.get_quote(instruments)
+            quotes = (
+                self.get_quote(instruments, critical=True)
+                if critical
+                else self.get_quote(instruments)
+            )
         except Exception:
+            return snapshot
+        if not isinstance(quotes, dict):
             return snapshot
         enriched = []
         for position in positions:
@@ -166,13 +173,14 @@ class KiteClient:
 
         return position_snapshot_to_renderer_dto(self.get_positions_snapshot())
 
-    def get_current_orders_snapshot(self) -> OrderSnapshot:
+    def get_current_orders_snapshot(self, *, critical: bool = False) -> OrderSnapshot:
         from .config import config_manager
 
         if not self.kite:
             return unavailable_order_snapshot("Kite client is not initialized")
         try:
-            res = broker_gateway.execute(self.kite.orders, priority=Priority.RECONCILE)
+            priority = Priority.CRITICAL if critical else Priority.RECONCILE
+            res = broker_gateway.execute(self.kite.orders, priority=priority)
             return normalize_orders_response(
                 res,
                 namespace=self.namespace,
@@ -242,11 +250,12 @@ class KiteClient:
             snapshot_id=current.snapshot_id,
         )
 
-    def get_fills_snapshot(self) -> FillSnapshot:
+    def get_fills_snapshot(self, *, critical: bool = False) -> FillSnapshot:
         if not self.kite:
             return unavailable_fill_snapshot("Kite client is not initialized")
         try:
-            res = broker_gateway.execute(self.kite.trades, priority=Priority.RECONCILE)
+            priority = Priority.CRITICAL if critical else Priority.RECONCILE
+            res = broker_gateway.execute(self.kite.trades, priority=priority)
             return normalize_fills_response(
                 res,
                 namespace=self.namespace,
@@ -258,10 +267,10 @@ class KiteClient:
     def get_trades(self) -> List[Dict[str, Any]]:
         return fill_snapshot_to_renderer_dto(self.get_fills_snapshot())
 
-    def get_broker_snapshot(self) -> BrokerSnapshot:
-        positions = self.get_positions_snapshot()
-        orders = self.get_current_orders_snapshot()
-        fills = self.get_fills_snapshot()
+    def get_broker_snapshot(self, *, critical: bool = False) -> BrokerSnapshot:
+        positions = self.get_positions_snapshot(critical=critical)
+        orders = self.get_current_orders_snapshot(critical=critical)
+        fills = self.get_fills_snapshot(critical=critical)
         return BrokerSnapshot(
             namespace=self.namespace,
             account_id=self.account_id,
@@ -310,7 +319,8 @@ class KiteClient:
             # manual order.  An exact durable tag is the only safe automatic
             # reconciliation key; a missing tag remains UNKNOWN for recovery.
             orders = broker_gateway.execute(
-                self.kite.orders, priority=Priority.RECONCILE
+                self.kite.orders,
+                priority=Priority.CRITICAL if critical else Priority.RECONCILE,
             )
             for o in orders:
                 if str(o.get("tag", "")) == idempotency_tag:
@@ -327,9 +337,16 @@ class KiteClient:
             )
         except ValueError:
             role = OrderRole.UNKNOWN
+        critical = bool(kwargs.pop("critical", False)) or role in {
+            OrderRole.PROTECTION,
+        }
+        # A hard supervisor passes ``critical`` for a flatten/recovery.  A
+        # routine reduction retains ORDER priority so it cannot starve native
+        # protection while the broker gateway is rate-limited.
+        priority = Priority.CRITICAL if critical else Priority.ORDER
         order_id = broker_gateway.execute(
             self.kite.place_order,
-            priority=Priority.ORDER,
+            priority=priority,
             is_order=True,
             order_reconciler=reconciler,
             variety=variety,
@@ -378,11 +395,17 @@ class KiteClient:
             return []
         return broker_gateway.execute(self.kite.holdings, priority=Priority.RECONCILE)
 
-    def get_quote(self, instruments: List[str]) -> Dict[str, Any]:
+    def get_quote(
+        self, instruments: List[str], *, critical: bool = False
+    ) -> Dict[str, Any]:
         if not self.kite:
             return {}
         return broker_gateway.execute(
-            self.kite.quote, Priority.ANALYTICS, False, None, instruments
+            self.kite.quote,
+            Priority.CRITICAL if critical else Priority.ANALYTICS,
+            False,
+            None,
+            instruments,
         )
 
     def get_ltp(self, instruments: List[str]) -> Dict[str, Any]:

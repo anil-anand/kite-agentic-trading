@@ -4,10 +4,11 @@ import { XCircle } from 'lucide-react';
 
 interface Props {
   position: Position;
-  onExit: (symbol: string) => void;
+  onExit: (position: Position) => void;
+  exitPending?: boolean;
 }
 
-const PositionCard: React.FC<Props> = ({ position, onExit }) => {
+const PositionCard: React.FC<Props> = ({ position, onExit, exitPending = false }) => {
   const isProfit = position.pnl != null && position.pnl >= 0;
   
   return (
@@ -17,10 +18,16 @@ const PositionCard: React.FC<Props> = ({ position, onExit }) => {
           <h3 className="font-bold text-white text-lg">{position.tradingsymbol}</h3>
           <span className="text-xs bg-surface-700 px-2 py-1 rounded text-surface-300">{position.exchange}</span>
         </div>
-        <button onClick={() => onExit(position.tradingsymbol)} className="text-loss-light hover:text-loss-dark transition-colors" title="Exit Position">
+        <button
+          onClick={() => onExit(position)}
+          disabled={exitPending || !position.positionKey}
+          className="text-loss-light hover:text-loss-dark transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+          title={position.positionKey ? 'Exit Position' : 'Position identity unavailable'}
+        >
           <XCircle size={20} />
         </button>
       </div>
+      {exitPending && <p className="text-xs text-amber-200">Close pending broker reconciliation…</p>}
       <div className="grid grid-cols-3 gap-2 text-sm">
         <div>
           <div className="text-surface-400">Qty</div>

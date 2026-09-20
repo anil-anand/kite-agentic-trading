@@ -319,6 +319,7 @@ class TestJournalExternalClose:
                             "tradingsymbol": "RELIANCE",
                             "quantity": 10,
                             "lastPrice": 95.0,
+                            "timestamp": te.now_utc(),
                             "exchange": "NSE",
                             "product": "MIS",
                         }

@@ -1040,6 +1040,126 @@ class TradeJournal:
                 ).fetchone()
             )
 
+    def record_external_handoff(
+        self, intent_id: str, recovery_trade: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Persist external-order fill baselines before cancelling their orders.
+
+        This narrow amendment preserves the immutable recovery identity and
+        original quantity. A failed write propagates so the caller cannot
+        cancel first and lose the fill constraint across a checkpoint crash.
+        """
+        baselines = recovery_trade.get("external_handoff_baselines", {})
+        orders = recovery_trade.get("external_handoff_orders", {})
+        quantity = recovery_trade.get("quantity")
+        if (
+            not isinstance(baselines, dict)
+            or not isinstance(orders, dict)
+            or isinstance(quantity, bool)
+            or not isinstance(quantity, int)
+            or quantity <= 0
+        ):
+            raise ValueError("external handoff requires valid baselines and quantity")
+        for order_id, baseline in baselines.items():
+            order = orders.get(order_id)
+            if (
+                not isinstance(order_id, str)
+                or not order_id
+                or isinstance(baseline, bool)
+                or not isinstance(baseline, int)
+                or baseline < 0
+                or not isinstance(order, dict)
+                or str(order.get("order_id")) != order_id
+                or order.get("transaction_type") not in {"BUY", "SELL"}
+            ):
+                raise ValueError("external handoff order/baseline is invalid")
+            filled = order.get("filled_quantity", 0)
+            if (
+                isinstance(filled, bool)
+                or not isinstance(filled, int)
+                or filled < baseline
+            ):
+                raise ValueError("external handoff cumulative fill count is invalid")
+
+        conn = self._get_conn()
+        conn.row_factory = sqlite3.Row
+        with self._transaction(conn):
+            row = conn.execute(
+                "SELECT * FROM order_intents WHERE intent_id = ?", (intent_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"unknown lifecycle intent {intent_id}")
+            intent = self._lifecycle_row(row)
+            if not intent["active"] or intent["intent_type"] not in {"EXIT", "FLATTEN"}:
+                raise ValueError("external handoff requires an active reduction intent")
+            payload = intent["payload"]
+            recovery = payload.setdefault("recovery_trade", {})
+            if not isinstance(recovery, dict):
+                raise ValueError("persisted recovery trade is invalid")
+            stored_baselines = recovery.setdefault("external_handoff_baselines", {})
+            stored_orders = recovery.setdefault("external_handoff_orders", {})
+            recovery.setdefault("quantity", quantity)
+            for order_id, baseline in baselines.items():
+                if (
+                    order_id in stored_baselines
+                    and stored_baselines[order_id] != baseline
+                ):
+                    raise ValueError("external handoff baseline cannot change")
+                previous = stored_orders.get(order_id)
+                order = orders[order_id]
+                if previous:
+                    for field in (
+                        "transaction_type",
+                        "namespace",
+                        "account_id",
+                        "exchange",
+                        "instrument_id",
+                        "tradingsymbol",
+                        "product",
+                    ):
+                        if previous.get(field) != order.get(field):
+                            raise ValueError(
+                                "external handoff order identity cannot change"
+                            )
+                    if previous.get("filled_quantity", 0) > order.get(
+                        "filled_quantity", 0
+                    ):
+                        continue
+                    terminal = {
+                        "COMPLETE",
+                        "CANCELLED",
+                        "REJECTED",
+                        "EXPIRED",
+                        "REJECTED AMO",
+                    }
+                    if (
+                        previous.get("status") in terminal
+                        and order.get("status") not in terminal
+                    ):
+                        continue
+                stored_baselines[order_id] = baseline
+                stored_orders[order_id] = dict(order)
+            serialized = json.dumps(payload, default=str, sort_keys=True)
+            if json.loads(row["payload"] or "{}") == payload:
+                return intent
+            conn.execute(
+                "UPDATE order_intents SET payload = ?, "
+                "state_version = state_version + 1, updated_at = ? "
+                "WHERE intent_id = ? AND state_version = ?",
+                (serialized, now_utc().isoformat(), intent_id, intent["state_version"]),
+            )
+            self._lifecycle_event_inner(
+                conn,
+                intent_id,
+                "external_handoff_recorded",
+                {"order_ids": sorted(baselines), "quantity": recovery["quantity"]},
+            )
+            return self._lifecycle_row(
+                conn.execute(
+                    "SELECT * FROM order_intents WHERE intent_id = ?", (intent_id,)
+                ).fetchone()
+            )
+
     def update_protection_trigger(
         self, intent_id: str, trigger_price: float, confirmed: bool = False
     ) -> Dict[str, Any]:

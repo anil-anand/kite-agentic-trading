@@ -46,6 +46,9 @@ export const AGENT_SIGNAL = 'agent:signal'; // Main → Renderer event
 export const AGENT_EXECUTE_SIGNAL = 'agent:execute-signal';
 export const AGENT_DISMISS_SIGNAL = 'agent:dismiss-signal';
 export const AGENT_SCAN_NOW = 'agent:scan-now';
+export const AGENT_SET_MODE = 'agent:set-mode';
+export const AGENT_CLOSE_POSITION = 'agent:close-position';
+export const AGENT_EMERGENCY_FLATTEN = 'agent:emergency-flatten';
 
 // ─── Activity Log ─────────────────────────────────────────────────
 export const LOG_ENTRY = 'log:entry'; // Main → Renderer event

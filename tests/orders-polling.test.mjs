@@ -8,6 +8,8 @@ test('Orders retains uncertain rows, reports transport failures, and shows all w
   let poll;
   let nextResponse;
   let transportFailure = false;
+  let cancelFailure = false;
+  const cancelled = [];
   let stateCursor = 0;
   const localState = [];
   const state = {
@@ -20,7 +22,7 @@ test('Orders retains uncertain rows, reports transport failures, and shows all w
     useState: (initial) => {
       const index = stateCursor++;
       if (!(index in localState)) localState[index] = initial;
-      return [localState[index], (value) => { localState[index] = value; }];
+      return [localState[index], (value) => { localState[index] = typeof value === 'function' ? value(localState[index]) : value; }];
     },
     useEffect: (callback) => { effect = callback; },
     createElement: (type, props, ...children) => ({ type, props, children }),
@@ -29,7 +31,7 @@ test('Orders retains uncertain rows, reports transport failures, and shows all w
     entryPoints: ['src/renderer/pages/Orders.tsx'], bundle: true,
     format: 'cjs', platform: 'node', write: false, jsx: 'transform',
     plugins: [{ name: 'offline-orders-dependencies', setup(builder) {
-      builder.onResolve({ filter: /^react(?:\/jsx-runtime)?$|stores\/trading-store|components\// },
+      builder.onResolve({ filter: /^react(?:\/jsx-runtime)?$|stores\/trading-store|hooks\/useKiteAPI|components\// },
         ({ path }) => ({ path, namespace: 'fixture' }));
       builder.onLoad({ filter: /.*/, namespace: 'fixture' }, ({ path }) => ({
         contents: path === 'react/jsx-runtime'
@@ -38,6 +40,8 @@ test('Orders retains uncertain rows, reports transport failures, and shows all w
           ? 'export default globalThis.fixtureReact; export const useState = globalThis.fixtureReact.useState;'
           : path.includes('trading-store')
             ? 'export const useTradingStore = globalThis.fixtureStore'
+            : path.includes('useKiteAPI')
+              ? 'export const useKiteAPI = () => globalThis.fixtureKiteAPI;'
             : 'export default () => null;',
         loader: 'js',
       }));
@@ -50,15 +54,22 @@ test('Orders retains uncertain rows, reports transport failures, and shows all w
   const context = vm.createContext({
     module: { exports: {} }, console: { error: () => {} },
     fixtureReact: react, fixtureStore: store,
+    fixtureKiteAPI: { cancelOrder: async (orderId, variety) => {
+      if (cancelFailure) throw new Error('broker refused cancellation');
+      cancelled.push([orderId, variety]);
+      return { accepted: true };
+    } },
     window: { electronAPI: api },
     setInterval: (callback) => { poll = callback; return 1; },
     clearInterval: () => {},
   });
   vm.runInContext(bundled.outputFiles[0].text, context);
-  const render = () => {
+  const renderTree = () => {
     stateCursor = 0;
-    return JSON.stringify(context.module.exports.default());
+    return context.module.exports.default();
   };
+  const render = () => JSON.stringify(renderTree());
+  const flatten = tree => Array.isArray(tree) ? tree.flatMap(flatten) : tree && typeof tree === 'object' ? [tree, ...flatten(tree.children)] : [];
   const row = (symbol, status, extra = {}) => ({
     orderId: symbol, tradingsymbol: symbol, status, quantity: 10,
     transactionType: 'BUY', ...extra,
@@ -105,6 +116,28 @@ test('Orders retains uncertain rows, reports transport failures, and shows all w
   }
   assert.ok(!open.includes('ARCHIVED_OPEN'));
   assert.ok(!open.includes('TERMINAL_EXPIRED'));
+  nextResponse = { snapshotQuality: 'COMPLETE', orders: [row('TRIGGER', 'TRIGGER PENDING', { variety: 'amo' })] };
+  await poll();
+  let cancelButton = flatten(renderTree()).find(node => node.type === 'button' && node.children.includes('Cancel'));
+  await cancelButton.props.onClick();
+  assert.deepEqual(cancelled, [['TRIGGER', 'amo']]);
+  assert.match(render(), /Cancellation pending/);
+  cancelButton = flatten(renderTree()).find(node => node.type === 'button' && node.children.includes('Cancellation pending…'));
+  assert.equal(cancelButton.props.disabled, true);
+  await cancelButton.props.onClick();
+  assert.equal(cancelled.length, 1);
+  nextResponse = { snapshotQuality: 'PARTIAL', orders: [row('TRIGGER', 'COMPLETE')] };
+  await poll();
+  assert.match(render(), /Cancellation pending broker reconciliation/);
+  nextResponse = { snapshotQuality: 'COMPLETE', orders: [row('TRIGGER', 'COMPLETE')] };
+  await poll();
+  assert.doesNotMatch(render(), /Cancellation pending broker reconciliation/);
+  nextResponse = { snapshotQuality: 'COMPLETE', orders: [row('REJECT_CANCEL', 'OPEN')] };
+  await poll();
+  cancelFailure = true;
+  cancelButton = flatten(renderTree()).find(node => node.type === 'button' && node.children.includes('Cancel'));
+  await cancelButton.props.onClick();
+  assert.match(render(), /Cancellation not confirmed/);
   nextResponse = { snapshotQuality: 'COMPLETE', orders: [] };
   await poll();
   assert.equal(state.orders.length, 0);

@@ -16,7 +16,7 @@ import { useTradingStore } from './stores/trading-store';
 import { useKiteAPI } from './hooks/useKiteAPI';
 
 const App: React.FC = () => {
-  useKiteAPI();
+  useKiteAPI({ subscribe: true });
   const auth = useTradingStore(state => state.auth);
 
   return (

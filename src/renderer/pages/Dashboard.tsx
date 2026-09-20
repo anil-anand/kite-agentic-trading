@@ -8,21 +8,31 @@ import type { Position } from '@shared/types';
 
 const Dashboard: React.FC = () => {
   const { dashboard, positions, agentState, activityLog, setDashboard, setPositions } = useTradingStore();
-  const { startAgent, stopAgent } = useKiteAPI();
+  const { startAgent, stopAgent, closePosition, emergencyFlatten } = useKiteAPI();
   const [positionQuality, setPositionQuality] = React.useState<string | null>(null);
   const [summaryQuality, setSummaryQuality] = React.useState<string | null>(null);
+  const [operatorPending, setOperatorPending] = React.useState<string | null>(null);
+  const [flattenSubmitting, setFlattenSubmitting] = React.useState(false);
+  const [controlPending, setControlPending] = React.useState(false);
+  const [operatorError, setOperatorError] = React.useState<string | null>(null);
 
   const handleToggleAgent = async () => {
+    if (controlPending) return;
+    setControlPending(true);
+    setOperatorError(null);
     try {
       if (agentState.running) {
-        await stopAgent();
-        useTradingStore.getState().setAgentState({ running: false });
+        const state = await stopAgent();
+        useTradingStore.getState().setAgentState(state);
       } else {
-        await startAgent(agentState.mode || 'confirm');
-        useTradingStore.getState().setAgentState({ running: true });
+        const state = await startAgent(agentState.mode || 'confirm');
+        useTradingStore.getState().setAgentState(state);
       }
     } catch (e) {
+      setOperatorError(e instanceof Error ? e.message : 'Agent command failed');
       console.error('Failed to toggle agent from dashboard', e);
+    } finally {
+      setControlPending(false);
     }
   };
 
@@ -81,13 +91,43 @@ const Dashboard: React.FC = () => {
     return () => clearInterval(interval);
   }, [setDashboard, setPositions]);
 
-  const handleExit = (symbol: string) => {
-    console.log("Exit", symbol);
+  const handleExit = async (position: Position) => {
+    if (!position.positionKey || operatorPending || agentState.pendingClosePositionKeys?.includes(position.positionKey)) return;
+    setOperatorPending(position.positionKey);
+    setOperatorError(null);
+    try {
+      const result = await closePosition(position.positionKey);
+      if (result?.accepted !== true) throw new Error('Position close was not acknowledged');
+    } catch (error) {
+      setOperatorError(error instanceof Error ? error.message : 'Position close failed');
+      console.error('Failed to request managed position close', error);
+    } finally {
+      setOperatorPending(null);
+    }
+  };
+
+  const handleEmergencyFlatten = async () => {
+    if (flattenSubmitting || agentState.hardFlattenPending || !window.confirm('Flatten all account positions? This action remains active until broker reconciliation confirms it.')) return;
+    setFlattenSubmitting(true);
+    setOperatorError(null);
+    try {
+      const result = await emergencyFlatten();
+      if (result?.accepted !== true) throw new Error('Emergency flatten was not acknowledged');
+    } catch (error) {
+      setOperatorError(error instanceof Error ? error.message : 'Emergency flatten failed');
+      console.error('Failed to request emergency flatten', error);
+    } finally {
+      setFlattenSubmitting(false);
+    }
   };
 
   return (
     <div className="p-6 space-y-6 h-full overflow-auto">
       <h1 className="text-2xl font-bold text-white">Dashboard</h1>
+      {operatorError && <div role="alert" className="rounded border border-loss-dark p-3 text-loss-light">{operatorError}</div>}
+      {(agentState.reconciliationPending || agentState.lifecycleRecoveryPending || agentState.controlStateInvalid || agentState.protectionFailureHalt) && (
+        <div role="alert" className="rounded border border-amber-700/60 bg-amber-900/20 p-3 text-sm text-amber-200">Entries are blocked while broker state, protection, or saved control state requires recovery.</div>
+      )}
       {((positionQuality && positionQuality !== 'COMPLETE') || summaryQuality ||
         (dashboard?.reconciliationStatus && dashboard.reconciliationStatus !== 'RECONCILED')) && (
         <div className="rounded border border-amber-700/60 bg-amber-900/20 p-3 text-sm text-amber-200">
@@ -137,7 +177,14 @@ const Dashboard: React.FC = () => {
             </div>
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {positions.filter(p => p.quantity !== 0).map(p => <PositionCard key={p.tradingsymbol} position={p} onExit={handleExit} />)}
+              {positions.filter(p => p.quantity !== 0).map(p => (
+                <PositionCard
+                  key={p.positionKey ?? p.tradingsymbol}
+                  position={p}
+                  onExit={handleExit}
+                  exitPending={operatorPending === p.positionKey || Boolean(p.positionKey && agentState.pendingClosePositionKeys?.includes(p.positionKey)) || agentState.hardFlattenPending}
+                />
+              ))}
             </div>
           )}
         </div>
@@ -148,19 +195,32 @@ const Dashboard: React.FC = () => {
             <div className="flex items-center justify-between mb-4">
               <span className="text-surface-300">Status</span>
               <span className={`px-2 py-1 rounded text-xs font-bold ${agentState.running ? 'bg-profit-fade text-profit-light' : 'bg-surface-700 text-surface-400'}`}>
-                {agentState.running ? 'RUNNING' : 'STOPPED'}
+                {agentState.running ? 'RUNNING' : agentState.supervisionActive ? 'ENTRIES PAUSED' : 'SUPERVISION UNVERIFIED'}
               </span>
             </div>
             <div className="flex items-center justify-between mb-4">
               <span className="text-surface-300">Mode</span>
-              <span className="text-white capitalize">{agentState.mode}</span>
+              <span className="text-white capitalize">{agentState.effectiveMode ?? agentState.mode}</span>
             </div>
             <button 
               onClick={handleToggleAgent}
+              disabled={controlPending}
               className={`w-full py-2 rounded font-bold transition-colors ${agentState.running ? 'bg-loss-dark hover:bg-loss text-white' : 'bg-profit-dark hover:bg-profit text-white'}`}
             >
-              {agentState.running ? 'Stop Agent' : 'Start Agent'}
+              {controlPending ? 'Updating…' : agentState.running ? 'Pause Entries' : 'Start Agent'}
             </button>
+            <button
+              onClick={handleEmergencyFlatten}
+              disabled={flattenSubmitting || agentState.hardFlattenPending}
+              className="mt-3 w-full rounded border border-loss-dark py-2 text-sm font-bold text-loss-light transition-colors hover:bg-loss-dark/30 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {flattenSubmitting || agentState.hardFlattenPending ? 'Flatten pending reconciliation…' : 'Emergency Flatten Account'}
+            </button>
+            {agentState.hardFlattenReason && <p className="mt-3 text-xs text-amber-200">Account entry halt: {agentState.hardFlattenReason}</p>}
+            {agentState.statusMessage && <p className="mt-3 text-xs text-surface-300">{agentState.statusMessage}</p>}
+            {!agentState.running && agentState.supervisionActive && (
+              <p className="mt-3 text-xs text-amber-200">Entries paused; position supervision remains active.</p>
+            )}
           </div>
           
           <h2 className="text-xl font-semibold text-white pt-4">Recent Activity</h2>

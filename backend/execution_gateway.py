@@ -168,7 +168,9 @@ class ExecutionGateway:
         )
 
         try:
-            order_id = kite_client.place_order(order_role=OrderRole.REDUCTION, **kwargs)
+            order_id = kite_client.place_order(
+                order_role=OrderRole.REDUCTION, critical=True, **kwargs
+            )
             push_log(
                 f"ExecutionGateway: Emergency order {order_id} placed for {symbol}"
             )

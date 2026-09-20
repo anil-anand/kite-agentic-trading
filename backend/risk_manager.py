@@ -25,6 +25,7 @@ from .broker_models import (
 )
 from .config import config_manager
 from .nifty_universe import get_sector
+from .session_clock import SessionSnapshot
 from .time_utils import as_utc
 
 
@@ -87,7 +88,11 @@ class RiskManager:
 
     def _load_state(self):
         state = config_manager.load_daily_risk_state()
-        if state.get("date") == self.date_str:
+        if state:
+            # A restart after midnight is not evidence that yesterday's
+            # exposure/flatten orders are terminal. Retain the old session
+            # and its latch until the supervisor verifies rollover safety.
+            self.date_str = str(state.get("date") or self.date_str)
             self.daily_pnl = float(state.get("daily_pnl", 0.0))
             self.incurred_fees = float(state.get("incurred_fees", 0.0))
             self.accounting_quality = state.get(
@@ -101,9 +106,7 @@ class RiskManager:
             )
             self.rounding_version = state.get("rounding_version", self.rounding_version)
             self.kill_switch_active = bool(state.get("kill_switch_active", False))
-            self.reconciliation_status = state.get(
-                "reconciliation_status", "RECONCILIATION_PENDING"
-            )
+            self.reconciliation_status = "RECONCILIATION_PENDING"
         else:
             self.daily_pnl = 0.0
             self.incurred_fees = 0.0
@@ -128,6 +131,50 @@ class RiskManager:
             "reconciliation_status": self.reconciliation_status,
         }
         config_manager.save_daily_risk_state(state)
+
+    def rotate_session_if_verified(
+        self,
+        session: SessionSnapshot,
+        *,
+        reconciliation_verified: bool,
+        has_residual_obligations: bool,
+    ) -> bool:
+        """Rotate daily limits only after an exchange-session reconciliation.
+
+        A host-local midnight must never clear a daily-loss latch.  Nor may a
+        new date erase a prior-session flatten/recovery obligation: callers
+        must first prove the broker snapshot is complete and there is no known
+        residual to manage.
+        """
+
+        with self._admission_lock:
+            session_id = session.session_id
+            if (
+                session_id <= self.date_str
+                or not session.is_trading_day
+                or not session.is_open
+            ):
+                return False
+            if (
+                not reconciliation_verified
+                or has_residual_obligations
+                or self._entry_reservations
+                or self.open_positions
+            ):
+                self.reconciliation_status = "RECONCILIATION_PENDING"
+                self._save_state()
+                return False
+
+            self.date_str = session_id
+            self.daily_pnl = 0.0
+            self.incurred_fees = 0.0
+            self.accounting_quality = AccountingQuality.UNAVAILABLE.value
+            self.kill_switch_active = False
+            self.reconciliation_status = "RECONCILIATION_PENDING"
+            self._correlation_cache.clear()
+            self._last_corr_date = None
+            self._save_state()
+            return True
 
     def _apply_accounting(self, accounting) -> bool:
         # Even an incomplete execution set establishes an incurred-cost floor.
@@ -222,15 +269,6 @@ class RiskManager:
         from .kite_client import kite_client
         from .utils import push_log
 
-        current_date = get_ist_now().strftime("%Y-%m-%d")
-        if current_date != self.date_str:
-            self.date_str = current_date
-            self.daily_pnl = 0.0
-            self.incurred_fees = 0.0
-            self.accounting_quality = AccountingQuality.UNAVAILABLE.value
-            self.kill_switch_active = False
-            self.reconciliation_status = "RECONCILIATION_PENDING"
-
         snapshot = kite_client.get_broker_snapshot()
         self._apply_conservative_hard_loss(
             snapshot.day_positions,
@@ -284,6 +322,9 @@ class RiskManager:
                 False,
                 f"Broker risk state is not reconciled ({self.reconciliation_status})",
             )
+
+        if self.date_str != get_ist_now().date().isoformat():
+            return False, "Exchange session reset requires verified reconciliation"
 
         config = config_manager.get_risk_config()
         now = get_ist_now().time()
@@ -924,6 +965,8 @@ class RiskManager:
             return False, "DAILY_LOSS_LIMIT"
         if self.reconciliation_status != "RECONCILED":
             return False, f"RECONCILIATION_REQUIRED: {self.reconciliation_status}"
+        if self.date_str != get_ist_now().date().isoformat():
+            return False, "RECONCILIATION_REQUIRED: SESSION_RESET_PENDING"
         if exchange != SUPPORTED_EXCHANGE or product != SUPPORTED_PRODUCT:
             return False, "UNSUPPORTED_PRODUCT_OR_EXCHANGE"
         if direction not in {"BUY", "SELL"}:

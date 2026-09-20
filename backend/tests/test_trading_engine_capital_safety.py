@@ -450,6 +450,7 @@ def test_monitor_positions_updates_pnl_and_prevents_double_exit(monkeypatch):
                 "exchange": "NSE",
                 "product": "MIS",
                 "lastPrice": 94.0,
+                "timestamp": te.now_utc(),
                 "realised": -50.0,
                 "unrealised": -25.0,
                 "average_price": 100.0,
@@ -460,6 +461,7 @@ def test_monitor_positions_updates_pnl_and_prevents_double_exit(monkeypatch):
         {
             "orderId": "STOP1",
             "status": "CANCELLED",
+            "instrument_token": 111,
             "filledQuantity": 0,
             "quantity": 10,
             "pendingQuantity": 0,
@@ -497,13 +499,11 @@ def test_monitor_positions_updates_pnl_and_prevents_double_exit(monkeypatch):
     engine.monitor_positions()
     assert fake_risk.daily_pnl == -75.0
     assert fake_risk.pnl_updates == [-75.0]
-    # The terminal old stop is replaced before the app-side stop decision. The
-    # new stop must itself reach a terminal cancellation observation before an
-    # opposing reduction can be sent.
+    # A fresh breached stop preempts replacing a cancelled stop. The residual
+    # goes straight to the coordinated market reduction.
     assert len(fake_client.place_calls) == 1
     assert fake_client.place_calls[0]["transaction_type"] == "SELL"
-    assert fake_client.place_calls[0]["order_type"] == "SL"
-    assert fake_client.cancel_calls[0]["order_id"] == "OID1"
+    assert fake_client.place_calls[0]["order_type"] == "MARKET"
     assert engine.active_trades["RELIANCE"]["exit_pending"] is True
 
     engine.monitor_positions()
@@ -1016,6 +1016,7 @@ def test_monitor_skips_exit_when_broker_stop_already_closed(monkeypatch):
             "exchange": "NSE",
             "product": "MIS",
             "lastPrice": 94.0,  # <= sl of 95 -> stop hit
+            "timestamp": te.now_utc(),
             "realised": 0.0,
             "unrealised": -60.0,
             "average_price": 100.0,

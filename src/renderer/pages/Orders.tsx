@@ -1,11 +1,18 @@
 import React, { useState } from 'react';
 import { useTradingStore } from '../stores/trading-store';
 import OrderForm from '../components/OrderForm';
+import { useKiteAPI } from '../hooks/useKiteAPI';
+import type { Order } from '@shared/types';
+
+const isWorkingOrder = (order: Order) => order.isWorking ?? !['COMPLETE', 'REJECTED', 'CANCELLED', 'EXPIRED', 'REJECTED AMO'].includes(order.status);
 
 const Orders: React.FC = () => {
   const { orders, setOrders } = useTradingStore();
   const [tab, setTab] = useState<'open' | 'executed' | 'all'>('all');
   const [snapshotQuality, setSnapshotQuality] = useState<string | null>(null);
+  const [cancellingOrders, setCancellingOrders] = useState<string[]>([]);
+  const [cancelError, setCancelError] = useState<string | null>(null);
+  const { cancelOrder } = useKiteAPI();
 
   React.useEffect(() => {
     const fetchOrders = async () => {
@@ -18,6 +25,12 @@ const Orders: React.FC = () => {
         const incoming = isLegacyList ? response : response.orders;
         if (!Array.isArray(incoming)) throw new Error('Invalid order snapshot');
         setSnapshotQuality(quality);
+        if (quality === 'COMPLETE') {
+          // Disappearance alone does not prove cancellation. A broker terminal
+          // row also records the cancel/fill race without claiming a cancel won.
+          const terminalIds = new Set(incoming.filter((order: Order) => !order.isArchived && !isWorkingOrder(order)).map((order: Order) => order.orderId));
+          setCancellingOrders(previous => previous.filter(id => !terminalIds.has(id)));
+        }
         if (quality === 'COMPLETE') {
           setOrders(incoming);
         } else if (quality !== 'UNAVAILABLE' && incoming.length > 0) {
@@ -37,15 +50,32 @@ const Orders: React.FC = () => {
   }, [setOrders]);
 
   const visibleOrders = orders.filter(order => {
-    const working = order.isWorking ?? !['COMPLETE', 'REJECTED', 'CANCELLED', 'EXPIRED', 'REJECTED AMO'].includes(order.status);
+    const working = isWorkingOrder(order);
     if (tab === 'open') return !order.isArchived && working;
     if (tab === 'executed') return !working;
     return true;
   });
 
+  const handleCancel = async (order: Order) => {
+    const orderId = order.orderId;
+    if (cancellingOrders.includes(orderId)) return;
+    setCancellingOrders(previous => [...previous, orderId]);
+    setCancelError(null);
+    try {
+      const result = await cancelOrder(orderId, order.variety || 'regular');
+      if (result?.accepted !== true) throw new Error('Cancellation was not acknowledged');
+    } catch (error) {
+      setCancelError(`Cancellation not confirmed: ${error instanceof Error ? error.message : 'request failed'}`);
+      console.error('Failed to cancel order', error);
+      setCancellingOrders(previous => previous.filter(id => id !== orderId));
+    }
+  };
+
   return (
     <div className="p-6 h-full flex flex-col space-y-6">
       <h1 className="text-2xl font-bold text-white">Orders</h1>
+      {cancelError && <div role="alert" className="rounded border border-loss-dark p-3 text-loss-light">{cancelError}</div>}
+      {cancellingOrders.length > 0 && <p className="text-sm text-amber-200">Cancellation pending broker reconciliation. An order may fill before cancellation completes.</p>}
       {snapshotQuality && snapshotQuality !== 'COMPLETE' && (
         <div className="rounded border border-amber-700/60 bg-amber-900/20 p-3 text-sm text-amber-200">
           Order data is degraded or archived; live order state is not fully verified.
@@ -101,7 +131,15 @@ const Orders: React.FC = () => {
                       <td className="px-6 py-4 font-mono">{o.price != null || o.averagePrice != null ? `₹${(o.price ?? o.averagePrice)?.toFixed(2)}` : 'Unavailable'}</td>
                       <td className="px-6 py-4">{o.status}</td>
                       <td className="px-6 py-4">
-                        {o.status === 'OPEN' && <button className="text-loss-light hover:underline">Cancel</button>}
+                        {!o.isArchived && isWorkingOrder(o) && (
+                          <button
+                            onClick={() => handleCancel(o)}
+                            disabled={cancellingOrders.includes(o.orderId)}
+                            className="text-loss-light hover:underline disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            {cancellingOrders.includes(o.orderId) ? 'Cancellation pending…' : 'Cancel'}
+                          </button>
+                        )}
                       </td>
                     </tr>
                   ))

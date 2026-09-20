@@ -26,6 +26,17 @@ class TickerManager:
         self._dev_thread = None
         self._symbol_map = {}  # instrument_token -> tradingsymbol
         self._dev_prices = {}  # token -> last synthetic price
+        self._order_update_listeners = []
+
+    def add_order_update_listener(self, listener):
+        """Register a backend consumer without giving ticker callbacks state ownership."""
+
+        if listener not in self._order_update_listeners:
+            self._order_update_listeners.append(listener)
+
+    def remove_order_update_listener(self, listener):
+        if listener in self._order_update_listeners:
+            self._order_update_listeners.remove(listener)
 
     def start(self, api_key: str, access_token: str):
         if self.running:
@@ -133,6 +144,11 @@ class TickerManager:
             self._emit_tick(token, ltp, change_pct, tick.get("volume", 0))
 
     def on_order_update(self, ws, data):
+        for listener in tuple(self._order_update_listeners):
+            try:
+                listener(dict(data))
+            except Exception as exc:
+                print(f"Ticker order listener failed: {exc}", file=sys.stderr)
         event = {"event": _ORDER_UPDATE_CHANNEL, "data": data}
         with _stdout_lock:
             print(json.dumps(event, cls=DateTimeEncoder))

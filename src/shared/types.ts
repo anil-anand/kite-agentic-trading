@@ -273,8 +273,19 @@ export interface AgentState {
   currentPnl: number;
   maxDrawdownToday: number;
   lastScanTime: string | null;
-  status: 'idle' | 'scanning' | 'placing_order' | 'monitoring' | 'stopped' | 'error';
+  status: 'idle' | 'scanning' | 'placing_order' | 'monitoring' | 'supervising' | 'stopped' | 'error';
   statusMessage: string;
+  effectiveMode?: AgentMode | 'paused';
+  entryPaused?: boolean;
+  supervisionActive?: boolean;
+  protectionFailureHalt?: boolean;
+  reconciliationPending?: boolean;
+  lifecycleRecoveryPending?: boolean;
+  controlStateInvalid?: boolean;
+  supervisionGeneration?: number;
+  hardFlattenReason?: string | null;
+  hardFlattenPending?: boolean;
+  pendingClosePositionKeys?: string[];
 }
 
 // ─── Risk Management ──────────────────────────────────────────────

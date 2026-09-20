@@ -39,6 +39,10 @@ class ConfigManager:
                 "positionRevalBreakevenMins": 45,
                 "stopOrderType": "SL",
                 "haltAutoTradesOnStopFailure": True,
+                "hardRiskPolicyVersion": "hard-risk-v1",
+                "supervisorIntervalSeconds": 5,
+                "marketOpenTime": "09:15",
+                "marketCloseTime": "15:30",
                 "maxGrossExposure": 200000,
                 "maxNetExposure": 100000,
                 "maxSingleSymbolExposure": 50000,
@@ -452,6 +456,43 @@ class ConfigManager:
                 return json.load(f)
         except Exception:
             return {}
+
+    @staticmethod
+    def _operator_state_key(namespace: str, account_id: str) -> str:
+        if not namespace or not account_id or account_id == "UNKNOWN":
+            raise ValueError("operator state requires a verified account identity")
+        return json.dumps([str(namespace), str(account_id)], separators=(",", ":"))
+
+    def _load_operator_states(self) -> dict:
+        path = self.config_dir / "operator_state.json"
+        if not path.exists():
+            return {}
+        with path.open() as stream:
+            states = json.load(stream)
+        if not isinstance(states, dict) or any(
+            not isinstance(state, dict) for state in states.values()
+        ):
+            raise ValueError("persisted operator state is malformed")
+        return states
+
+    def load_operator_state(self, namespace: str, account_id: str) -> dict:
+        """Restore control obligations only for their original account.
+
+        Unreadable state is a recovery error, never proof that no flatten or
+        pause was requested. These records contain no authentication material.
+        """
+        key = self._operator_state_key(namespace, account_id)
+        with self._state_file_lock:
+            return deepcopy(self._load_operator_states().get(key, {}))
+
+    def save_operator_state(self, namespace: str, account_id: str, state: dict) -> None:
+        key = self._operator_state_key(namespace, account_id)
+        if not isinstance(state, dict):
+            raise ValueError("operator state must be an object")
+        with self._state_file_lock:
+            states = self._load_operator_states()
+            states[key] = deepcopy(state)
+            self._atomic_write_json(self.config_dir / "operator_state.json", states)
 
 
 config_manager = ConfigManager()

@@ -296,6 +296,7 @@ class TestSimulatedBook:
 class TestSessionBypass:
     def test_check_session_valid_without_credentials_in_dev(self, monkeypatch):
         monkeypatch.setattr(m, "is_dev_mode", lambda: True)
+        monkeypatch.setattr(m, "_resume_authenticated_supervision", lambda: None)
         res = m.handle_request({"method": "check_session", "id": 1})
         assert res["result"] == {"is_valid": True}
 

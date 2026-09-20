@@ -153,6 +153,9 @@ class FakeKiteClient:
 
 
 class FakeRiskManager:
+    def reconcile_state(self):
+        pass
+
     def can_trade(self):
         return True, "OK"
 
@@ -603,6 +606,8 @@ def test_start_invokes_reconcile(monkeypatch):
         engine, "reconcile_active_trades", lambda: called.__setitem__("reconcile", True)
     )
     monkeypatch.setattr(engine, "_run_loop", lambda: None)  # don't spin the loop
+    monkeypatch.setattr(engine, "_supervisor_loop", lambda: None)
+    monkeypatch.setattr(engine, "_normal_management_loop", lambda: None)
 
     engine.start("confirm")
     try:
@@ -612,11 +617,13 @@ def test_start_invokes_reconcile(monkeypatch):
         engine.stop()
 
 
-def test_start_reconcile_failure_does_not_block(monkeypatch):
+def test_start_reconcile_failure_pauses_entries_but_keeps_supervision(monkeypatch):
     monkeypatch.setattr(te, "execution_gateway", FakeKiteClient())
     monkeypatch.setattr(te, "risk_manager", FakeRiskManager())
 
     engine = TradingEngine()
+    monkeypatch.setattr(engine, "_supervisor_loop", lambda: None)
+    monkeypatch.setattr(engine, "_normal_management_loop", lambda: None)
 
     def boom():
         raise RuntimeError("kite down")
@@ -626,7 +633,9 @@ def test_start_reconcile_failure_does_not_block(monkeypatch):
 
     engine.start("confirm")
     try:
-        assert engine.running is True  # startup proceeded despite reconcile failure
+        assert engine.running is False
+        assert engine.status()["entryPaused"] is True
+        assert engine.status()["supervisionActive"] is True
     finally:
         engine.stop()
 
