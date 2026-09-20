@@ -93,7 +93,11 @@ export type OrderStatus =
   | 'MODIFY PENDING'
   | 'CANCEL PENDING'
   | 'PUT ORDER REQ RECEIVED'
-  | 'VALIDATION PENDING';
+  | 'VALIDATION PENDING'
+  | 'OPEN PENDING'
+  | 'MODIFY VALIDATION PENDING'
+  | 'AMO REQ RECEIVED'
+  | (string & {});
 
 export interface OrderRequest {
   tradingsymbol: string;
@@ -118,53 +122,68 @@ export interface Order {
   quantity: number;
   filledQuantity: number;
   pendingQuantity: number;
-  price: number;
-  averagePrice: number;
-  triggerPrice: number;
+  price: number | null;
+  averagePrice: number | null;
+  triggerPrice: number | null;
   product: ProductType;
   orderType: OrderType;
   variety: string;
   status: OrderStatus;
-  statusMessage: string;
-  tag: string;
-  orderTimestamp: string;
-  exchangeTimestamp: string;
+  statusMessage: string | null;
+  isWorking?: boolean;
+  tag: string | null;
+  isArchived?: boolean;
+  snapshotQuality?: 'COMPLETE' | 'PARTIAL' | 'STALE' | 'UNAVAILABLE';
+  orderTimestamp: string | null;
+  exchangeTimestamp: string | null;
+}
+
+export interface OrderSnapshot {
+  orders: Order[];
+  snapshotQuality: 'COMPLETE' | 'PARTIAL' | 'STALE' | 'UNAVAILABLE';
+  snapshotId: string;
+  fetchedAt: string;
+  errors?: string[];
 }
 
 // ─── Positions & Holdings ─────────────────────────────────────────
 
 export interface Position {
+  positionKey?: string;
+  namespace?: string;
+  accountId?: string;
   tradingsymbol: string;
   exchange: string;
-  instrumentToken: number;
+  instrumentToken: number | string;
   product: ProductType;
   quantity: number;
   overnightQuantity: number;
-  averagePrice: number;
-  lastPrice: number;
-  closePrice: number;
-  pnl: number;
-  unrealised: number;
-  realised: number;
+  averagePrice: number | null;
+  lastPrice: number | null;
+  closePrice: number | null;
+  pnl: number | null;
+  unrealised: number | null;
+  realised: number | null;
   buyQuantity: number;
   sellQuantity: number;
-  buyPrice: number;
-  sellPrice: number;
-  multiplier: number;
-  value: number;
+  buyPrice: number | null;
+  sellPrice: number | null;
+  multiplier: number | null;
+  value: number | null;
   dayBuyQuantity: number;
   daySellQuantity: number;
+  markTime?: string | null;
 }
 
 export interface Holding {
   tradingsymbol: string;
   exchange: string;
-  instrumentToken: number;
+  instrumentToken: number | string;
   quantity: number;
-  averagePrice: number;
-  lastPrice: number;
-  pnl: number;
-  closePrice: number;
+  averagePrice: number | null;
+  lastPrice: number | null;
+  pnl: number | null;
+  closePrice: number | null;
 }
 
 // ─── Margins ──────────────────────────────────────────────────────
@@ -254,8 +273,19 @@ export interface AgentState {
   currentPnl: number;
   maxDrawdownToday: number;
   lastScanTime: string | null;
-  status: 'idle' | 'scanning' | 'placing_order' | 'monitoring' | 'stopped' | 'error';
+  status: 'idle' | 'scanning' | 'placing_order' | 'monitoring' | 'supervising' | 'stopped' | 'error';
   statusMessage: string;
+  effectiveMode?: AgentMode | 'paused';
+  entryPaused?: boolean;
+  supervisionActive?: boolean;
+  protectionFailureHalt?: boolean;
+  reconciliationPending?: boolean;
+  lifecycleRecoveryPending?: boolean;
+  controlStateInvalid?: boolean;
+  supervisionGeneration?: number;
+  hardFlattenReason?: string | null;
+  hardFlattenPending?: boolean;
+  pendingClosePositionKeys?: string[];
 }
 
 // ─── Risk Management ──────────────────────────────────────────────
@@ -381,18 +411,20 @@ export interface RPCEvent {
 // ─── Dashboard Summary ────────────────────────────────────────────
 
 export interface DashboardSummary {
-  totalPnl: number;
-  netPnl: number;
-  realisedPnl: number;
-  unrealisedPnl: number;
+  totalPnl: number | null;
+  netPnl: number | null;
+  realisedPnl: number | null;
+  unrealisedPnl: number | null;
   tradesToday: number;
   winningTrades: number;
   losingTrades: number;
   winRate: number;
   maxDrawdown: number;
   openPositionsCount: number;
-  availableMargin: number;
-  usedMargin: number;
+  availableMargin: number | null;
+  usedMargin: number | null;
+  reconciliationStatus?: string;
+  killSwitchActive?: boolean;
 }
 
 // ─── Journal & Analytics ──────────────────────────────────────────
@@ -426,7 +458,12 @@ export interface JournalTrade {
   other_fees: number | null;
   slippage: number | null;
   signal_entry_price: number | null;
-  status: 'OPEN' | 'CLOSED';
+  status: 'OPEN' | 'CLOSED' | 'RECONCILIATION_PENDING';
+  financial_quality?: 'RECONCILED' | 'ESTIMATED' | 'UNAVAILABLE' | null;
+  financial_provenance?: string | null;
+  accounting_policy_version?: string | null;
+  cost_model_version?: string | null;
+  rounding_version?: string | null;
   confluence_snapshot: string | null;
   indicator_snapshot: string | null;
   market_regime?: string | null;

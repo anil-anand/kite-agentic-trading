@@ -1,9 +1,10 @@
-import datetime
 import uuid
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List
 
 import pandas as pd
+
+from ..time_utils import now_utc
 
 
 class BaseStrategy(ABC):
@@ -78,6 +79,6 @@ class BaseStrategy(ABC):
             "target": target,
             "riskReward": rr,
             "reasoning": reasoning,
-            "timestamp": datetime.datetime.now().isoformat(),
+            "timestamp": now_utc().isoformat(),
             "indicators": indicators,
         }

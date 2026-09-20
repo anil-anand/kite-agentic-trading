@@ -6,6 +6,10 @@ from backend.trading_engine import TradingEngine
 
 class FakeKiteClient:
     def __init__(self):
+        self.account_id = "dummy"
+        from backend.broker_models import ExecutionNamespace
+
+        self.namespace = ExecutionNamespace.LIVE
         self.positions = {"net": []}
         self.orders = []
         self.place_calls = []
@@ -14,12 +18,79 @@ class FakeKiteClient:
         self._next_id = 1
         self.margins = {"equity": {"available": {"live_balance": 10_000}}}
 
+    def get_broker_snapshot(self):
+        import datetime
+
+        from backend.broker_models import (
+            BrokerSnapshot,
+            ExecutionNamespace,
+            SnapshotQuality,
+            normalize_orders_response,
+            normalize_positions_response,
+        )
+
+        positions = normalize_positions_response(
+            self.positions, namespace=ExecutionNamespace.LIVE, account_id="dummy"
+        )
+        orders = normalize_orders_response(
+            self.orders, namespace=ExecutionNamespace.LIVE, account_id="dummy"
+        )
+        return BrokerSnapshot(
+            namespace=ExecutionNamespace.LIVE,
+            account_id="dummy",
+            positions=positions.net,
+            day_positions=positions.day,
+            current_orders=orders.orders,
+            fills=tuple(),
+            positions_quality=SnapshotQuality.COMPLETE,
+            orders_quality=SnapshotQuality.COMPLETE,
+            fills_quality=SnapshotQuality.COMPLETE,
+            fetched_at=datetime.datetime.now(datetime.timezone.utc),
+            errors=[],
+        )
+
+    def get_positions_snapshot(self):
+        from backend.broker_models import (
+            normalize_positions_response,
+        )
+
+        payload = self.get_positions()
+        payload = {
+            "net": [
+                dict(
+                    row,
+                    instrument_token=111 if row["tradingsymbol"] == "RELIANCE" else 222,
+                )
+                for row in payload["net"]
+            ]
+        }
+        payload["day"] = list(payload["net"])
+        return normalize_positions_response(
+            payload, namespace=self.namespace, account_id=self.account_id
+        )
+
+    def get_current_orders_snapshot(self):
+        from backend.broker_models import ExecutionNamespace, normalize_orders_response
+
+        return normalize_orders_response(
+            self.orders, namespace=ExecutionNamespace.LIVE, account_id="dummy"
+        )
+
+    def get_fills_snapshot(self):
+        from backend.broker_models import ExecutionNamespace, normalize_fills_response
+
+        return normalize_fills_response(
+            [], namespace=ExecutionNamespace.LIVE, account_id="dummy"
+        )
+
     def place_order(self, **kwargs):
         self.place_calls.append(kwargs)
         order_id = f"OID{self._next_id}"
         self._next_id += 1
         status = (
-            "COMPLETE" if kwargs.get("order_type") in ["LIMIT", "MARKET"] else "OPEN"
+            "COMPLETE"
+            if kwargs.get("order_type") in ["LIMIT", "MARKET"]
+            else "TRIGGER PENDING"
         )
         qty = kwargs.get("quantity", 0) if status == "COMPLETE" else 0
         self.orders.append(
@@ -27,7 +98,18 @@ class FakeKiteClient:
                 "orderId": order_id,
                 "order_id": order_id,
                 "status": status,
+                "quantity": kwargs.get("quantity", 0),
                 "filledQuantity": qty,
+                "tradingsymbol": kwargs.get("tradingsymbol", "RELIANCE"),
+                "exchange": kwargs.get("exchange", "NSE"),
+                "product": kwargs.get("product", "MIS"),
+                "transaction_type": kwargs.get("transaction_type", "BUY"),
+                "order_type": kwargs.get("order_type", "MARKET"),
+                "instrument_token": 111
+                if kwargs.get("tradingsymbol") == "RELIANCE"
+                else 222,
+                "trigger_price": kwargs.get("trigger_price", 0),
+                "price": kwargs.get("price", 0),
             }
         )
 
@@ -69,6 +151,9 @@ class FakeKiteClient:
 
     def modify_order(self, **kwargs):
         self.modify_calls.append(kwargs)
+        for order in self.orders:
+            if order.get("order_id") == kwargs["order_id"]:
+                order.update(kwargs)
 
     def get_positions(self):
         # Return net positions as day positions as well for test simplicity
@@ -124,6 +209,22 @@ class FakeRiskManager:
     def set_open_positions(self, count):
         self.open_positions = count
 
+    def reserve_entry(
+        self, symbol, direction, qty, price, exchange="NSE", product="MIS", **kwargs
+    ):
+        return "res1", None
+
+    def validate_entry_reservation(
+        self, reservation_id, symbol, direction, quantity, price
+    ):
+        return True
+
+    def bind_entry_order(self, reservation_id, broker_order_id):
+        return True
+
+    def release_entry_reservation(self, reservation_id):
+        pass
+
     def can_accept_position(
         self, symbol, direction, qty, price, active_trades, open_orders
     ):
@@ -144,6 +245,15 @@ class FakeRiskManager:
         if delta != 0:
             self.pnl_updates.append(delta)
 
+    def update_from_position_snapshot(self, snapshot):
+        realized_gross = sum((p.realised_gross or 0.0) for p in snapshot.net)
+        unrealized = sum((p.unrealised_gross or 0.0) for p in snapshot.net)
+        pnl = realized_gross + unrealized
+        delta = pnl - self.daily_pnl
+        self.daily_pnl = pnl
+        if delta != 0:
+            self.pnl_updates.append(delta)
+
 
 def _sample_signal():
     return {
@@ -155,6 +265,7 @@ def _sample_signal():
         "stopLoss": 95.0,
         "target": 110.0,
         "strategy": "test",
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
 
 
@@ -169,6 +280,7 @@ def test_execute_signal_places_protective_stop_and_tracks_trade(monkeypatch):
                 "quantity": 10,
                 "exchange": "NSE",
                 "product": "MIS",
+                "averagePrice": 100.0,
                 "lastPrice": 100.0,
             }
         ]
@@ -293,8 +405,24 @@ def test_execute_signal_does_not_track_unfilled_order(monkeypatch):
 
     fake_client = FakeKiteClient()
     fake_client.orders = [
-        {"orderId": "OID1", "status": "REJECTED", "filledQuantity": 0},
+        {
+            "orderId": "OID1",
+            "status": "REJECTED",
+            "filledQuantity": 0,
+            "quantity": 10,
+            "tradingsymbol": "RELIANCE",
+            "exchange": "NSE",
+            "product": "MIS",
+            "transaction_type": "BUY",
+            "order_type": "MARKET",
+        },
     ]
+
+    def rejected_submission(**kwargs):
+        fake_client.place_calls.append(kwargs)
+        return "OID1"
+
+    fake_client.place_order = rejected_submission
     fake_risk = FakeRiskManager()
     monkeypatch.setattr(te, "execution_gateway", fake_client)
     monkeypatch.setattr(te, "kite_client", fake_client)
@@ -322,13 +450,28 @@ def test_monitor_positions_updates_pnl_and_prevents_double_exit(monkeypatch):
                 "exchange": "NSE",
                 "product": "MIS",
                 "lastPrice": 94.0,
+                "timestamp": te.now_utc(),
                 "realised": -50.0,
                 "unrealised": -25.0,
                 "average_price": 100.0,
             }
         ]
     }
-    fake_client.orders = [{"orderId": "OID1", "status": "OPEN", "filledQuantity": 0}]
+    fake_client.orders = [
+        {
+            "orderId": "STOP1",
+            "status": "CANCELLED",
+            "instrument_token": 111,
+            "filledQuantity": 0,
+            "quantity": 10,
+            "pendingQuantity": 0,
+            "tradingsymbol": "RELIANCE",
+            "exchange": "NSE",
+            "product": "MIS",
+            "transaction_type": "SELL",
+            "order_type": "SL",
+        }
+    ]
     fake_risk = FakeRiskManager()
     monkeypatch.setattr(te, "execution_gateway", fake_client)
     monkeypatch.setattr(te, "kite_client", fake_client)
@@ -336,6 +479,12 @@ def test_monitor_positions_updates_pnl_and_prevents_double_exit(monkeypatch):
 
     engine = TradingEngine()
     engine.active_trades["RELIANCE"] = {
+        "tradingsymbol": "RELIANCE",
+        "namespace": "LIVE",
+        "account_id": "dummy",
+        "instrument_id": "111",
+        "exchange": "NSE",
+        "product": "MIS",
         "sl": 95.0,
         "target": 110.0,
         "direction": "BUY",
@@ -350,9 +499,11 @@ def test_monitor_positions_updates_pnl_and_prevents_double_exit(monkeypatch):
     engine.monitor_positions()
     assert fake_risk.daily_pnl == -75.0
     assert fake_risk.pnl_updates == [-75.0]
+    # A fresh breached stop preempts replacing a cancelled stop. The residual
+    # goes straight to the coordinated market reduction.
     assert len(fake_client.place_calls) == 1
     assert fake_client.place_calls[0]["transaction_type"] == "SELL"
-    assert fake_client.cancel_calls[0]["order_id"] == "STOP1"
+    assert fake_client.place_calls[0]["order_type"] == "MARKET"
     assert engine.active_trades["RELIANCE"]["exit_pending"] is True
 
     engine.monitor_positions()
@@ -364,11 +515,34 @@ def test_tighten_to_breakeven_modifies_broker_side_stop(monkeypatch):
     import backend.trading_engine as te
 
     fake_client = FakeKiteClient()
+    fake_client.orders = [
+        {
+            "order_id": "STOP1",
+            "tradingsymbol": "RELIANCE",
+            "exchange": "NSE",
+            "product": "MIS",
+            "instrument_token": 111,
+            "transaction_type": "SELL",
+            "order_type": "SL",
+            "quantity": 10,
+            "filled_quantity": 0,
+            "pending_quantity": 10,
+            "trigger_price": 95.0,
+            "price": 94.05,
+            "status": "TRIGGER PENDING",
+        }
+    ]
     monkeypatch.setattr(te, "execution_gateway", fake_client)
     monkeypatch.setattr(te, "kite_client", fake_client)
 
     engine = TradingEngine()
     engine.active_trades["RELIANCE"] = {
+        "tradingsymbol": "RELIANCE",
+        "namespace": "LIVE",
+        "account_id": "dummy",
+        "instrument_id": "111",
+        "exchange": "NSE",
+        "product": "MIS",
         "sl": 95.0,
         "target": 110.0,
         "direction": "BUY",
@@ -388,6 +562,57 @@ def test_tighten_to_breakeven_modifies_broker_side_stop(monkeypatch):
     assert len(fake_client.modify_calls) == 1
     assert fake_client.modify_calls[0]["order_id"] == "STOP1"
     assert fake_client.modify_calls[0]["trigger_price"] == 100.0
+
+
+def test_tighten_unknown_keeps_the_last_confirmed_stop(monkeypatch):
+    """A modification failure must not claim that the stop is already tighter."""
+    import backend.trading_engine as te
+
+    fake_client = FakeKiteClient()
+    fake_client.orders = [
+        {
+            "order_id": "STOP1",
+            "tradingsymbol": "RELIANCE",
+            "exchange": "NSE",
+            "product": "MIS",
+            "instrument_token": 111,
+            "transaction_type": "SELL",
+            "order_type": "SL",
+            "quantity": 10,
+            "filled_quantity": 0,
+            "pending_quantity": 10,
+            "trigger_price": 95.0,
+            "price": 94.05,
+            "status": "TRIGGER PENDING",
+        }
+    ]
+    fake_client.modify_order = lambda **kwargs: (_ for _ in ()).throw(
+        RuntimeError("timeout")
+    )
+    monkeypatch.setattr(te, "execution_gateway", fake_client)
+    monkeypatch.setattr(te, "kite_client", fake_client)
+
+    engine = TradingEngine()
+    engine.active_trades["RELIANCE"] = {
+        "tradingsymbol": "RELIANCE",
+        "namespace": "LIVE",
+        "account_id": "dummy",
+        "instrument_id": "111",
+        "exchange": "NSE",
+        "product": "MIS",
+        "sl": 95.0,
+        "target": 110.0,
+        "direction": "BUY",
+        "entry_price": 100.0,
+        "stop_order_id": "STOP1",
+    }
+
+    assert engine._tighten_to_breakeven("RELIANCE") is False
+    assert engine.active_trades["RELIANCE"]["sl"] == 95.0
+    assert (
+        engine.active_trades["RELIANCE"]["recovery_state"]
+        == "TIGHTEN_MODIFICATION_UNKNOWN"
+    )
 
 
 def test_adopted_position_gets_protective_stop(monkeypatch):
@@ -438,7 +663,7 @@ def test_adopted_position_gets_protective_stop(monkeypatch):
 
 
 def test_exit_order_uses_market_when_ltp_zero(monkeypatch):
-    """When LTP is 0, _place_exit_order should use MARKET order type instead of LIMIT at price 0."""
+    """A post-handoff residual with no mark uses an explicit MARKET order."""
     import backend.trading_engine as te
 
     fake_client = FakeKiteClient()
@@ -448,12 +673,19 @@ def test_exit_order_uses_market_when_ltp_zero(monkeypatch):
     engine = TradingEngine()
 
     position = {
+        "namespace": "LIVE",
+        "account_id": "dummy",
+        "instrument_token": 111,
         "tradingsymbol": "RELIANCE",
         "quantity": 10,
         "exchange": "NSE",
         "product": "MIS",
         "lastPrice": 0,
+        "position_epoch": "market-without-mark",
     }
+    # Phase 2 must use a fresh broker residual after the stop handoff, rather
+    # than trusting the caller's potentially stale position dictionary.
+    fake_client.positions = {"net": [dict(position)]}
 
     engine._place_exit_order(position, "RELIANCE", "Square off")
 
@@ -461,10 +693,12 @@ def test_exit_order_uses_market_when_ltp_zero(monkeypatch):
     call = fake_client.place_calls[0]
     assert call["order_type"] == "MARKET"
     assert "price" not in call
+    assert engine.active_trades["RELIANCE"]["exit_intent_id"]
+    assert engine.active_trades["RELIANCE"]["exit_pending"] is True
 
 
 def test_exit_order_uses_limit_when_ltp_available(monkeypatch):
-    """When LTP is available, _place_exit_order should use LIMIT order type."""
+    """A fresh marked residual uses the existing marketable LIMIT policy."""
     import backend.trading_engine as te
 
     fake_client = FakeKiteClient()
@@ -474,12 +708,17 @@ def test_exit_order_uses_limit_when_ltp_available(monkeypatch):
     engine = TradingEngine()
 
     position = {
+        "namespace": "LIVE",
+        "account_id": "dummy",
+        "instrument_token": 111,
         "tradingsymbol": "RELIANCE",
         "quantity": 10,
         "exchange": "NSE",
         "product": "MIS",
-        "lastPrice": 100.0,
+        "last_price": 111.0,
+        "position_epoch": "limit-with-mark",
     }
+    fake_client.positions = {"net": [dict(position)]}
 
     engine._place_exit_order(position, "RELIANCE", "Target")
 
@@ -495,17 +734,36 @@ def test_sync_exit_pending_removes_trade_on_complete(monkeypatch):
 
     fake_client = FakeKiteClient()
     fake_client.orders = [
-        {"orderId": "EXIT1", "status": "COMPLETE", "filledQuantity": 10}
+        {
+            "orderId": "EXIT1",
+            "instrument_token": 111,
+            "status": "COMPLETE",
+            "quantity": 10,
+            "filledQuantity": 10,
+            "tradingsymbol": "RELIANCE",
+            "exchange": "NSE",
+            "product": "MIS",
+            "transaction_type": "SELL",
+            "order_type": "LIMIT",
+        }
     ]
     monkeypatch.setattr(te, "execution_gateway", fake_client)
     monkeypatch.setattr(te, "kite_client", fake_client)
 
     engine = TradingEngine()
     engine.active_trades["RELIANCE"] = {
+        "tradingsymbol": "RELIANCE",
+        "namespace": "LIVE",
+        "account_id": "dummy",
+        "instrument_id": "111",
+        "exchange": "NSE",
+        "product": "MIS",
         "sl": 95.0,
         "target": 110.0,
         "direction": "BUY",
         "entry_price": 100.0,
+        "quantity": 10,
+        "entry_state": "OPEN",
         "entry_time": datetime.datetime.now(),
         "original_strategy": "test",
         "stop_order_id": None,
@@ -533,6 +791,7 @@ def test_duplicate_execute_signal_is_blocked(monkeypatch):
                 "quantity": 10,
                 "exchange": "NSE",
                 "product": "MIS",
+                "averagePrice": 100.0,
                 "lastPrice": 100.0,
             }
         ]
@@ -580,6 +839,12 @@ def test_concurrent_place_exit_order_only_fires_once(monkeypatch):
 
     engine = TradingEngine()
     engine.active_trades["RELIANCE"] = {
+        "tradingsymbol": "RELIANCE",
+        "namespace": "LIVE",
+        "account_id": "dummy",
+        "instrument_id": "111",
+        "exchange": "NSE",
+        "product": "MIS",
         "sl": 95.0,
         "target": 110.0,
         "direction": "BUY",
@@ -589,15 +854,21 @@ def test_concurrent_place_exit_order_only_fires_once(monkeypatch):
         "stop_order_id": None,
         "exit_pending": False,
         "exit_order_id": None,
+        "position_epoch": "concurrent-exit",
     }
 
     position = {
+        "namespace": "LIVE",
+        "account_id": "dummy",
+        "instrument_token": 111,
         "tradingsymbol": "RELIANCE",
         "quantity": 10,
         "exchange": "NSE",
         "product": "MIS",
         "lastPrice": 94.0,
+        "position_epoch": "concurrent-exit",
     }
+    fake_client.positions = {"net": [dict(position)]}
 
     barrier = threading.Barrier(2)
 
@@ -656,8 +927,8 @@ def test_pending_entries_prevents_adoption(monkeypatch):
     assert len(fake_client.place_calls) == 0
 
 
-def test_exit_pending_resets_on_place_order_failure(monkeypatch):
-    """If place_order raises during exit, exit_pending must be reset so the next cycle can retry."""
+def test_exit_submission_failure_latches_unknown_intent_without_retry(monkeypatch):
+    """An untyped mutation failure is UNKNOWN, not permission to resubmit."""
     import backend.trading_engine as te
 
     call_count = 0
@@ -674,6 +945,12 @@ def test_exit_pending_resets_on_place_order_failure(monkeypatch):
 
     engine = TradingEngine()
     engine.active_trades["RELIANCE"] = {
+        "tradingsymbol": "RELIANCE",
+        "namespace": "LIVE",
+        "account_id": "dummy",
+        "instrument_id": "111",
+        "exchange": "NSE",
+        "product": "MIS",
         "sl": 95.0,
         "target": 110.0,
         "direction": "BUY",
@@ -683,24 +960,30 @@ def test_exit_pending_resets_on_place_order_failure(monkeypatch):
         "stop_order_id": None,
         "exit_pending": False,
         "exit_order_id": None,
+        "position_epoch": "unknown-exit",
     }
 
     position = {
+        "namespace": "LIVE",
+        "account_id": "dummy",
+        "instrument_token": 111,
         "tradingsymbol": "RELIANCE",
         "quantity": 10,
         "exchange": "NSE",
         "product": "MIS",
-        "lastPrice": 94.0,
+        "last_price": 94.0,
+        "position_epoch": "unknown-exit",
     }
+    fake_client.positions = {"net": [dict(position)]}
 
     try:
         engine._place_exit_order(position, "RELIANCE", "SL")
     except Exception:
         pass
 
-    # exit_pending must be reset so the next cycle can retry
-    assert engine.active_trades["RELIANCE"]["exit_pending"] is False
-    assert call_count == 2
+    assert call_count == 1
+    assert engine.active_trades["RELIANCE"]["exit_pending"] is True
+    assert engine.active_trades["RELIANCE"]["recovery_state"] == "UNKNOWN"
 
 
 class SequencedKiteClient(FakeKiteClient):
@@ -733,6 +1016,7 @@ def test_monitor_skips_exit_when_broker_stop_already_closed(monkeypatch):
             "exchange": "NSE",
             "product": "MIS",
             "lastPrice": 94.0,  # <= sl of 95 -> stop hit
+            "timestamp": te.now_utc(),
             "realised": 0.0,
             "unrealised": -60.0,
             "average_price": 100.0,
@@ -747,6 +1031,12 @@ def test_monitor_skips_exit_when_broker_stop_already_closed(monkeypatch):
 
     engine = TradingEngine()
     engine.active_trades["RELIANCE"] = {
+        "tradingsymbol": "RELIANCE",
+        "namespace": "LIVE",
+        "account_id": "dummy",
+        "instrument_id": "111",
+        "exchange": "NSE",
+        "product": "MIS",
         "sl": 95.0,
         "target": 110.0,
         "direction": "BUY",
@@ -762,8 +1052,13 @@ def test_monitor_skips_exit_when_broker_stop_already_closed(monkeypatch):
 
     # No exit order placed — the position was already flat on re-read.
     assert fake_client.place_calls == []
-    # Trade cleaned up, lingering broker stop cancelled.
-    assert "RELIANCE" not in engine.active_trades
+    # The stop's cancellation request is not a terminal broker fact.  Retain
+    # the flat cleanup obligation rather than dropping ownership while a
+    # potentially live stop is unaccounted for.
+    assert engine.active_trades["RELIANCE"]["cleanup_pending"] is True
+    assert (
+        engine.active_trades["RELIANCE"]["recovery_state"] == "STOP_CANCEL_UNCONFIRMED"
+    )
     assert fake_client.cancel_calls[0]["order_id"] == "STOP1"
 
 
@@ -813,6 +1108,12 @@ def test_trade_lock_not_held_during_order_io(monkeypatch):
     monkeypatch.setattr(te, "risk_manager", fake_risk)
 
     engine.active_trades["RELIANCE"] = {
+        "tradingsymbol": "RELIANCE",
+        "namespace": "LIVE",
+        "account_id": "dummy",
+        "instrument_id": "111",
+        "exchange": "NSE",
+        "product": "MIS",
         "sl": 95.0,
         "target": 110.0,
         "direction": "BUY",

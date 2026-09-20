@@ -1,22 +1,167 @@
+import concurrent.futures
 import json
+import math
 import sys
+import threading
 import traceback
+import uuid
+from datetime import timedelta
+
+from kiteconnect import KiteConnect
 
 from .analytics import analytics
+from .broker_models import (
+    SnapshotQuality,
+    order_snapshot_to_renderer_dto,
+    position_to_backend_dict,
+)
 from .config import config_manager
 from .dev_mode import is_dev_mode
 from .execution_gateway import execution_gateway
 from .journal import journal
 from .kite_client import kite_client
 from .llm_client import OPENCODE_PLANS, OpenAICompatibleClient
+from .request_policy import Priority, broker_gateway
 from .risk_manager import risk_manager
 from .scanner import scanner
 from .ticker import ticker_manager
+from .time_utils import now_utc
 from .trading_engine import trading_engine
 from .utils import DateTimeEncoder
 
+# Research work may fetch history or call an LLM. It must not occupy the serial
+# stdin dispatcher that admits an operator close or an emergency flatten.
+_RESEARCH_METHODS = {
+    "discover_models",
+    "analytics_llm_post_mortem",
+    "analytics_what_if",
+    "run_backtest",
+    "scan_now",
+    "get_historical",
+}
+_RESEARCH_WORKERS = 2
+_BROKER_WORKERS = 4
+_OPERATOR_WORKERS = 2
+_FAST_CONTROL_METHODS = {
+    "stop_agent",
+    "agent_status",
+    "agent_set_mode",
+    "agent_emergency_flatten",
+}
+_OPERATOR_METHODS = {"agent_close_position", "cancel_order"}
+_LIFECYCLE_METHODS = {
+    "set_credentials",
+    "login",
+    "check_session",
+    "logout",
+    "generate_session",
+    "start_agent",
+    "resume_supervision",
+}
+_lifecycle_lock = threading.RLock()
+
+
+def _request_error(req, code, message):
+    return {
+        "jsonrpc": "2.0",
+        "error": {"code": code, "message": message},
+        "id": req.get("id") if isinstance(req, dict) else None,
+    }
+
+
+def _validate_request(req):
+    if not isinstance(req, dict):
+        return _request_error(req, -32600, "Request must be an object")
+    if not isinstance(req.get("method"), str) or not req["method"]:
+        return _request_error(req, -32600, "method must be a nonempty string")
+    if req.get("jsonrpc", "2.0") != "2.0":
+        return _request_error(req, -32600, "jsonrpc must be 2.0")
+    if not isinstance(req.get("params", {}), dict):
+        return _request_error(req, -32602, "params must be an object")
+    return None
+
+
+def _assert_logout_safe():
+    """Pause admission before proving authentication is no longer needed."""
+
+    trading_engine.stop()
+    if (
+        trading_engine._has_residual_obligations()
+        or trading_engine._pending_lifecycle_obligations()
+    ):
+        raise ValueError(
+            "Logout requires all managed exposure and orders to be settled"
+        )
+    # Read orders before positions: an entry filling between a first position
+    # read and a terminal order read must not be mistaken for a flat account.
+    orders = trading_engine._order_snapshot(critical=True).require_complete()
+    terminal = {"COMPLETE", "CANCELLED", "REJECTED", "EXPIRED", "REJECTED AMO"}
+    if any(str(order.status).upper() not in terminal for order in orders.orders):
+        raise ValueError("Logout requires all account orders to be terminal")
+    positions = trading_engine._position_snapshot(critical=True).require_complete()
+    if any(position.signed_quantity != 0 for position in positions.net):
+        raise ValueError("Logout requires all account positions to be flat")
+    if trading_engine._has_residual_obligations():
+        raise ValueError(
+            "Logout requires all managed exposure and orders to be settled"
+        )
+
+
+def _resume_authenticated_supervision():
+    if not trading_engine.status()["supervisionActive"]:
+        trading_engine.resume_supervision()
+
+
+def _verify_candidate_account(candidate):
+    """Authenticate off to the side before replacing a supervised connection."""
+
+    profile = broker_gateway.execute(candidate.profile, priority=Priority.CRITICAL)
+    account_id = str(profile.get("user_id") or "UNKNOWN")
+    if account_id == "UNKNOWN":
+        raise ValueError("Broker account identity could not be verified")
+    previous_account = getattr(kite_client, "account_id", "UNKNOWN")
+    if previous_account not in {None, "", "UNKNOWN"} and previous_account != account_id:
+        raise ValueError(
+            "Log out of the current account before switching broker accounts"
+        )
+    # Startup can have durable owners before the broker identity is restored.
+    with trading_engine._trade_lock:
+        owned_accounts = {
+            trade.get("account_id")
+            for trade in trading_engine.active_trades.values()
+            if trade.get("account_id") not in {None, "", "UNKNOWN", "TEST_COMPAT"}
+        }
+    if owned_accounts and owned_accounts != {account_id}:
+        raise ValueError("Broker account differs from unresolved managed exposure")
+    scope = trading_engine._control_state_scope
+    if scope and scope[1] != account_id and trading_engine._has_residual_obligations():
+        raise ValueError("Broker account differs from unresolved operator obligations")
+    return account_id
+
+
+def _install_candidate_session(candidate, access_token, account_id):
+    trading_engine.stop()
+    # Both the old and candidate connections have the same verified account.
+    # Do not call init()/set_access_token(): those clear account_id to UNKNOWN
+    # while the risk worker can still be reading the shared client.
+    kite_client.kite = candidate
+    kite_client.access_token = access_token
+    kite_client.account_id = account_id
+
 
 def handle_request(req):
+    invalid = _validate_request(req)
+    if invalid is not None:
+        return invalid
+    # Authentication mutates a shared broker client. A concurrent logout/login
+    # must not invalidate the identity halfway through startup reconciliation.
+    if req["method"] in _LIFECYCLE_METHODS:
+        with _lifecycle_lock:
+            return _handle_request(req)
+    return _handle_request(req)
+
+
+def _handle_request(req):
     method = req.get("method")
     params = req.get("params", {})
     req_id = req.get("id")
@@ -46,14 +191,12 @@ def handle_request(req):
         elif method == "login":
             creds = config_manager.get_credentials()
             api_key = params.get("api_key", creds.get("apiKey"))
-            api_secret = params.get("api_secret", creds.get("apiSecret"))
 
             if not api_key:
                 return error(-32602, "API Key required")
 
-            config_manager.save_credentials(api_key, api_secret)
-            kite_client.init(api_key)
-            return success({"login_url": kite_client.login_url()})
+            candidate = KiteConnect(api_key=api_key)
+            return success({"login_url": candidate.login_url()})
 
         elif method == "check_session":
             # Development bypass: no Zerodha login required. Start the ticker so
@@ -61,6 +204,7 @@ def handle_request(req):
             # client, not a real websocket).
             if is_dev_mode():
                 ticker_manager.start("dev", "dev")
+                _resume_authenticated_supervision()
                 return success({"is_valid": True})
 
             creds = config_manager.get_credentials()
@@ -69,21 +213,43 @@ def handle_request(req):
             if not api_key or not access_token:
                 return success({"is_valid": False})
 
-            kite_client.init(api_key)
-            kite_client.set_access_token(access_token)
-
+            # Status refreshes must not reset the shared account identity while
+            # the independent supervisor is reconciling existing exposure.
+            same_session = (
+                kite_client.kite is not None
+                and kite_client.access_token == access_token
+                and getattr(kite_client.kite, "api_key", None) == api_key
+            )
             # Verify the token is actually still valid with the Kite API
             try:
-                kite_client.get_margins()
+                if same_session:
+                    kite_client.get_margins()
+                    account_id = kite_client.account_id
+                    if account_id == "UNKNOWN":
+                        account_id = _verify_candidate_account(kite_client.kite)
+                        kite_client.account_id = account_id
+                else:
+                    candidate = KiteConnect(api_key=api_key)
+                    candidate.set_access_token(access_token)
+                    account_id = _verify_candidate_account(candidate)
+                    _install_candidate_session(candidate, access_token, account_id)
             except Exception:
+                return success({"is_valid": False})
+            if account_id == "UNKNOWN":
+                risk_manager.reconciliation_status = "RECONCILIATION_PENDING"
                 return success({"is_valid": False})
 
             # Start ticker on resume
             ticker_manager.start(api_key, access_token)
+            if same_session:
+                _resume_authenticated_supervision()
+            else:
+                trading_engine.resume_supervision()
 
             return success({"is_valid": True})
 
         elif method == "logout":
+            _assert_logout_safe()
             config_manager.clear_access_token()
             kite_client.set_access_token(None)
             ticker_manager.stop()
@@ -94,10 +260,11 @@ def handle_request(req):
             api_key = params.get("api_key")
             api_secret = params.get("api_secret")
 
-            # Initialize client before generating session
-            kite_client.init(api_key)
-
-            session = kite_client.generate_session(request_token, api_secret)
+            candidate = KiteConnect(api_key=api_key)
+            session = candidate.generate_session(request_token, api_secret)
+            candidate.set_access_token(session["access_token"])
+            account_id = _verify_candidate_account(candidate)
+            _install_candidate_session(candidate, session["access_token"], account_id)
 
             # Save all creds including token
             config_manager.save_credentials(
@@ -105,12 +272,19 @@ def handle_request(req):
             )
 
             ticker_manager.start(api_key, session["access_token"])
+            trading_engine.resume_supervision()
             return success(session)
 
         elif method == "get_positions":
             return success(kite_client.get_positions())
 
         elif method == "get_orders":
+            if hasattr(kite_client, "get_order_history_snapshot"):
+                return success(
+                    order_snapshot_to_renderer_dto(
+                        kite_client.get_order_history_snapshot()
+                    )
+                )
             return success(kite_client.get_orders())
 
         elif method == "get_holdings":
@@ -120,13 +294,20 @@ def handle_request(req):
             return success(kite_client.get_margins())
 
         elif method == "place_order":
-            params["is_entry"] = True  # Assume UI orders are entries unless specified
-            order_id = execution_gateway.place_order(**params)
-            return success({"order_id": order_id})
+            # The legacy ticket has no server-owned stop/thesis and cannot be
+            # admitted safely as an entry.  Keep the route explicit and fail
+            # closed until it is wired through the signal/reservation flow.
+            return error(
+                -32004,
+                "Manual entries are disabled: submit a fresh validated signal "
+                "through execute_signal, or use a managed reduction command.",
+            )
 
         elif method == "cancel_order":
-            res = execution_gateway.cancel_order(**params)
-            return success(res)
+            order_id = params.get("order_id", params.get("orderId"))
+            if not order_id:
+                return error(-32602, "orderId is required")
+            return success(trading_engine.request_operator_cancel(order_id))
 
         elif method == "modify_order":
             res = execution_gateway.modify_order(**params)
@@ -163,15 +344,29 @@ def handle_request(req):
 
         elif method == "start_agent":
             mode = params.get("mode", "auto")
-            trading_engine.start(mode)
-            return success({"status": "started", "mode": mode})
+            return success(trading_engine.start(mode))
 
         elif method == "stop_agent":
-            trading_engine.stop()
-            return success({"status": "stopped"})
+            return success(trading_engine.stop())
 
         elif method == "agent_status":
             return success(trading_engine.status())
+
+        elif method == "resume_supervision":
+            return success(trading_engine.resume_supervision())
+
+        elif method == "agent_set_mode":
+            return success(trading_engine.set_mode(params.get("mode")))
+
+        elif method == "agent_close_position":
+            return success(
+                trading_engine.request_operator_close(params.get("positionKey"))
+            )
+
+        elif method == "agent_emergency_flatten":
+            return success(
+                trading_engine.request_emergency_flatten(params.get("scope"))
+            )
 
         elif method == "get_settings":
             return success(config_manager.get_settings())
@@ -224,9 +419,15 @@ def handle_request(req):
         elif method == "dashboard_summary":
             margins = kite_client.get_margins()
             equity_margin = margins.get("equity", {})
-            available_margin = equity_margin.get("available", {}).get("live_balance", 0)
-            if not available_margin:
-                available_margin = equity_margin.get("net", 0)
+            available_margin = equity_margin.get("available", {}).get("live_balance")
+            if available_margin is None:
+                available_margin = equity_margin.get("net")
+            if (
+                isinstance(available_margin, bool)
+                or not isinstance(available_margin, (int, float))
+                or not math.isfinite(available_margin)
+            ):
+                available_margin = None
 
             if risk_manager.reconciliation_status == "RECONCILIATION_PENDING":
                 try:
@@ -238,38 +439,69 @@ def handle_request(req):
                         f"Auto-reconcile on dashboard failed: {e}", level="warning"
                     )
 
-            positions = kite_client.get_positions().get("net", [])
-            total_pnl = sum(p.get("pnl", p.get("m2m", 0)) for p in positions)
+            position_snapshot = kite_client.get_positions_snapshot()
+            positions = (
+                [
+                    position_to_backend_dict(position)
+                    for position in position_snapshot.net
+                ]
+                if position_snapshot.quality is SnapshotQuality.COMPLETE
+                else []
+            )
+            known_pnl = [p["pnl"] for p in positions if p.get("pnl") is not None]
+            total_pnl = (
+                sum(known_pnl)
+                if position_snapshot.quality is SnapshotQuality.COMPLETE
+                and len(known_pnl) == len(positions)
+                else None
+            )
 
-            calculated_used_margin = 0
+            calculated_used_margin = 0.0
+            used_margin_known = position_snapshot.quality is SnapshotQuality.COMPLETE
             for p in positions:
                 if p.get("quantity", 0) != 0:
                     multiplier = 0.2 if p.get("product") == "MIS" else 1.0
-                    avg_price = p.get("average_price", 0)
-                    if avg_price == 0:
+                    avg_price = p.get("average_price")
+                    if avg_price is None:
                         avg_price = (
-                            p.get("buy_price", 0)
+                            p.get("buy_price")
                             if p.get("quantity", 0) > 0
-                            else p.get("sell_price", 0)
+                            else p.get("sell_price")
                         )
+                    if avg_price is None or avg_price <= 0:
+                        used_margin_known = False
+                        continue
                     calculated_used_margin += (
                         abs(p.get("quantity", 0)) * avg_price * multiplier
                     )
 
-            used_margin = calculated_used_margin
+            used_margin = calculated_used_margin if used_margin_known else None
 
             # Count trades and win rate based on realized positions (quantity == 0) and open positions
-            trades_today = len(positions)
+            counts = journal.get_todays_trade_counts()
+            trades_today = counts["total"]
+            verified_today = journal.get_verified_todays_outcomes()
             winning_trades = sum(
-                1 for p in positions if p.get("pnl", p.get("m2m", 0)) > 0
+                1 for trade in verified_today if (trade.get("net_pnl") or 0) > 0
             )
-            win_rate = (winning_trades / trades_today * 100) if trades_today > 0 else 0
+            losing_trades = sum(
+                1 for trade in verified_today if (trade.get("net_pnl") or 0) <= 0
+            )
+            win_rate = (
+                winning_trades / len(verified_today) * 100 if verified_today else 0
+            )
 
             summary = {
-                "totalPnl": round(total_pnl, 2),
-                "netPnl": round(risk_manager.daily_pnl, 2),
+                "totalPnl": round(total_pnl, 2) if total_pnl is not None else None,
+                "netPnl": (
+                    round(risk_manager.daily_pnl, 2)
+                    if risk_manager.accounting_quality != "UNAVAILABLE"
+                    else None
+                ),
                 "tradesToday": trades_today,
                 "winRate": round(win_rate, 2),
+                "winningTrades": winning_trades,
+                "losingTrades": losing_trades,
                 "availableMargin": available_margin,
                 "usedMargin": used_margin,
                 "killSwitchActive": risk_manager.kill_switch_active,
@@ -278,6 +510,11 @@ def handle_request(req):
             return success(summary)
 
         elif method == "execute_signal":
+            if not trading_engine.status().get("supervisionActive", False):
+                return error(
+                    -32004,
+                    "Entry requires active, reconciled position supervision",
+                )
             res = trading_engine.execute_signal(params.get("signal", {}))
             return success({"executed": res})
 
@@ -319,16 +556,14 @@ def handle_request(req):
             if not strategy:
                 return error(-32602, f"Strategy {strategy_id} not found")
 
-            import datetime
-
             import pandas as pd
 
             from .backtesting.backtest_engine import BacktestEngine
             from .backtesting.metrics_evaluator import MetricsEvaluator
 
             # Fetch data (mocking the date range based on days parameter)
-            now = datetime.datetime.now()
-            from_date = now - datetime.timedelta(days=days)
+            now = now_utc()
+            from_date = now - timedelta(days=days)
 
             instruments = kite_client.get_instruments("NSE")
             instrument_map = {
@@ -368,31 +603,87 @@ def handle_request(req):
         return error(-32000, str(e), traceback.format_exc())
 
 
+def _write_response(response):
+    from .utils import stdout_lock as _stdout_lock
+
+    with _stdout_lock:
+        print(json.dumps(response, cls=DateTimeEncoder))
+        sys.stdout.flush()
+
+
 def main():
     from .utils import stdout_lock as _stdout_lock
 
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
+    generation = str(uuid.uuid4())
+    with _stdout_lock:
+        print(
+            json.dumps(
+                {
+                    "event": "backend:ready",
+                    "data": {"ready": True, "generation": generation},
+                }
+            )
+        )
+        sys.stdout.flush()
 
+    pools = {
+        name: (
+            concurrent.futures.ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix=f"{name}-rpc"
+            ),
+            threading.BoundedSemaphore(workers),
+        )
+        for name, workers in (
+            ("research", _RESEARCH_WORKERS),
+            ("broker", _BROKER_WORKERS),
+            ("operator", _OPERATOR_WORKERS),
+        )
+    }
+
+    def run_worker(req, capacity):
         try:
-            req = json.loads(line)
-        except json.JSONDecodeError:
-            res = {
-                "jsonrpc": "2.0",
-                "error": {"code": -32700, "message": "Parse error"},
-                "id": None,
-            }
-            with _stdout_lock:
-                print(json.dumps(res))
-                sys.stdout.flush()
-            continue
+            _write_response(handle_request(req))
+        finally:
+            capacity.release()
 
-        res = handle_request(req)
-        with _stdout_lock:
-            print(json.dumps(res, cls=DateTimeEncoder))
-            sys.stdout.flush()
+    try:
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+
+            try:
+                req = json.loads(line)
+            except json.JSONDecodeError:
+                _write_response(_request_error(None, -32700, "Parse error"))
+                continue
+
+            invalid = _validate_request(req)
+            if invalid is not None:
+                _write_response(invalid)
+                continue
+            method = req["method"]
+            if method in _FAST_CONTROL_METHODS:
+                _write_response(handle_request(req))
+                continue
+
+            pool = (
+                "research"
+                if method in _RESEARCH_METHODS
+                else "operator"
+                if method in _OPERATOR_METHODS
+                else "broker"
+            )
+            executor, capacity = pools[pool]
+            if not capacity.acquire(blocking=False):
+                _write_response(
+                    _request_error(req, -32005, f"{pool} worker capacity is full")
+                )
+                continue
+            executor.submit(run_worker, req, capacity)
+    finally:
+        for executor, _ in pools.values():
+            executor.shutdown(wait=False)
 
 
 if __name__ == "__main__":

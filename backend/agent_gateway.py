@@ -1,11 +1,12 @@
 import json
+import math
 import uuid
-from datetime import datetime
 
 from .config import config_manager
 from .kite_client import kite_client
 from .nifty_universe import get_nifty100_universe
 from .risk_manager import risk_manager
+from .time_utils import now_utc
 from .trading_engine import trading_engine
 from .utils import push_log
 
@@ -71,12 +72,16 @@ class AgentGateway:
             return decision
 
         try:
+            if isinstance(quantity, bool) or not isinstance(quantity, (int, float)):
+                raise ValueError
+            if not math.isfinite(float(quantity)) or not float(quantity).is_integer():
+                raise ValueError
             quantity = int(quantity)
             if quantity <= 0 or quantity > 100000:
                 decision["reason"] = f"Invalid quantity bounds: {quantity}"
                 self._audit_log(model_info, llm_output, decision)
                 return decision
-        except ValueError:
+        except (ValueError, OverflowError):
             decision["reason"] = "Quantity must be an integer"
             self._audit_log(model_info, llm_output, decision)
             return decision
@@ -87,6 +92,13 @@ class AgentGateway:
             return decision
 
         try:
+            for value in (price, stop_loss, target):
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(value)
+                ):
+                    raise ValueError
             price = float(price)
             stop_loss = float(stop_loss)
             target = float(target)
@@ -105,8 +117,8 @@ class AgentGateway:
                     decision["reason"] = "Invalid price levels for SELL"
                     self._audit_log(model_info, llm_output, decision)
                     return decision
-        except ValueError:
-            decision["reason"] = "Prices must be numeric"
+        except (ValueError, OverflowError):
+            decision["reason"] = "Prices must be finite numeric values"
             self._audit_log(model_info, llm_output, decision)
             return decision
 
@@ -123,6 +135,7 @@ class AgentGateway:
         candidate_signal = {
             "id": str(uuid.uuid4()),
             "tradingsymbol": symbol,
+            "exchange": str(proposal.get("exchange", "NSE")).upper(),
             "direction": direction,
             "entryPrice": price,
             "stopLoss": stop_loss,
@@ -131,24 +144,28 @@ class AgentGateway:
             "strategy": "llm_agent",
             "reasoning": proposal.get("reasoning", ""),
             "signal_score": 100,
+            "timestamp": now_utc().isoformat(),
             # estimated_probability is intentionally omitted: the normal calibration
             # pipeline will populate it only when statistically backed.
         }
+        candidate_product = str(proposal.get("product", "MIS")).upper()
+        if candidate_signal["exchange"] != "NSE" or candidate_product != "MIS":
+            decision["reason"] = "Only NSE/MIS entries are supported in phase 1"
+            self._audit_log(model_info, llm_output, decision)
+            return decision
+        candidate_signal["product"] = candidate_product
 
         try:
-            open_orders = []
-            try:
-                open_orders = kite_client.get_orders()
-            except Exception:
-                pass
+            broker_snapshot = kite_client.get_broker_snapshot()
 
             can_accept, reject_reason = risk_manager.can_accept_position(
                 symbol=symbol,
                 direction=direction,
                 qty=quantity,
                 price=price,
-                active_trades=trading_engine.active_trades,
-                open_orders=open_orders,
+                broker_snapshot=broker_snapshot,
+                exchange=candidate_signal["exchange"],
+                product=candidate_product,
             )
 
             if not can_accept:
@@ -171,7 +188,7 @@ class AgentGateway:
 
     def _audit_log(self, model_info: dict, output: str, decision: dict):
         log_entry = {
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": now_utc().isoformat(),
             "model": model_info.get("model", "unknown"),
             "prompt_version": model_info.get("prompt_version", "unknown"),
             "llm_output": output,

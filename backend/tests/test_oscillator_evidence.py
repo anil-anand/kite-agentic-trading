@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 import pytest
 
 from backend.config import config_manager
@@ -34,6 +35,8 @@ def test_oscillator_evidence_aggregation_scan_watchlist(
     # Simulate a ranging market that triggers 5 oscillators
     closes = list(np.linspace(100, 102, 50))
     df = build_candles(closes)
+    decision = (df["date"].iloc[-1] + pd.Timedelta(minutes=5)).to_pydatetime()
+    monkeypatch.setattr("backend.scanner.now_utc", lambda: decision)
     monkeypatch.setattr(scanner, "_fetch_candles", lambda t, s: (df, False))
 
     def mock_calc_signals(strategy_id):

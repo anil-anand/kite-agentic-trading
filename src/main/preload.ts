@@ -8,7 +8,13 @@ try {
   electron.contextBridge.exposeInMainWorld('electronAPI', {
     isDevMode,
     invoke: (channel: string, ...args: any[]) => electron.ipcRenderer.invoke(channel, ...args),
-    on: (channel: string, listener: (...args: any[]) => void) => electron.ipcRenderer.on(channel, listener),
+    on: (channel: string, listener: (...args: any[]) => void) => {
+      const wrapped = (_event: any, ...args: any[]) => listener(undefined, ...args);
+      electron.ipcRenderer.on(channel, wrapped);
+      // Keep the exact native listener in this context, including on renderer
+      // remount/reload. Do not return the privileged ipcRenderer emitter.
+      return () => electron.ipcRenderer.removeListener(channel, wrapped);
+    },
     removeListener: (channel: string, listener: (...args: any[]) => void) => electron.ipcRenderer.removeListener(channel, listener),
     removeAllListeners: (channel: string) => electron.ipcRenderer.removeAllListeners(channel),
     
@@ -53,9 +59,12 @@ try {
       }
     },
     agent: {
-      start: () => electron.ipcRenderer.invoke(channels.AGENT_START),
+      start: (params: { mode: string }) => electron.ipcRenderer.invoke(channels.AGENT_START, params),
       stop: () => electron.ipcRenderer.invoke(channels.AGENT_STOP),
       status: () => electron.ipcRenderer.invoke(channels.AGENT_STATUS),
+      setMode: (mode: string) => electron.ipcRenderer.invoke(channels.AGENT_SET_MODE, mode),
+      closePosition: (positionKey: string) => electron.ipcRenderer.invoke(channels.AGENT_CLOSE_POSITION, positionKey),
+      emergencyFlatten: () => electron.ipcRenderer.invoke(channels.AGENT_EMERGENCY_FLATTEN, 'account'),
       executeSignal: (signalId: string) => electron.ipcRenderer.invoke(channels.AGENT_EXECUTE_SIGNAL, signalId),
       dismissSignal: (signalId: string) => electron.ipcRenderer.invoke(channels.AGENT_DISMISS_SIGNAL, signalId),
       scanNow: () => electron.ipcRenderer.invoke(channels.AGENT_SCAN_NOW),

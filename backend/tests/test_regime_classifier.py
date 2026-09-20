@@ -36,3 +36,12 @@ def test_regime_uncertain():
     df = build_candles(closes)
     result = regime_classifier.classify(df)
     assert result["regime"] == "UNCERTAIN"
+
+
+def test_zero_volume_preserves_raw_regime_but_value_context_is_unknown():
+    frame = build_candles(np.linspace(100, 200, 60), volumes=[0] * 60)
+    result = regime_classifier.classify(frame)
+    assert result["regime"] == "TRENDING"
+    assert result["features"]["vwap"] is None
+    assert result["features"]["price_above_vwap"] is None
+    assert result["features"]["price_below_vwap"] is None

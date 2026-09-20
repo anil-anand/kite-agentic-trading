@@ -1,11 +1,13 @@
 import csv
 import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
+from .financial_eligibility import verified_outcome_sql
 from .llm_client import OpenAICompatibleClient
+from .time_utils import as_utc
 
 
 class TradeAnalytics:
@@ -20,12 +22,19 @@ class TradeAnalytics:
         conn.row_factory = sqlite3.Row
         return conn
 
+    @staticmethod
+    def _verified_clause(conn) -> str:
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(trades)").fetchall()
+        }
+        return verified_outcome_sql(columns)
+
     def get_strategy_expectancy(self) -> List[Dict[str, Any]]:
         """
         Per-strategy expectancy: win rate, avg R, avg hold time, profit factor.
         """
         conn = self._get_conn()
-        query = "SELECT * FROM trades WHERE status = 'CLOSED'"
+        query = f"SELECT * FROM trades WHERE status = 'CLOSED' AND {self._verified_clause(conn)}"
         rows = conn.execute(query).fetchall()
 
         strategies = {}
@@ -73,11 +82,11 @@ class TradeAnalytics:
             # Hold time
             if r["exit_time"] and r["entry_time"]:
                 try:
-                    exit_t = datetime.fromisoformat(r["exit_time"])
-                    entry_t = datetime.fromisoformat(r["entry_time"])
+                    exit_t = as_utc(r["exit_time"])
+                    entry_t = as_utc(r["entry_time"])
                     hold_time = (exit_t - entry_t).total_seconds() / 60.0
                     strategies[strat]["hold_times"].append(hold_time)
-                except ValueError:
+                except (TypeError, ValueError):
                     pass
 
         results = []
@@ -121,7 +130,7 @@ class TradeAnalytics:
         Confluence validation: win rate and profit by number of firing strategies at entry.
         """
         conn = self._get_conn()
-        query = "SELECT * FROM trades WHERE status = 'CLOSED'"
+        query = f"SELECT * FROM trades WHERE status = 'CLOSED' AND {self._verified_clause(conn)}"
         rows = conn.execute(query).fetchall()
 
         confluence_stats = {}
@@ -200,7 +209,8 @@ class TradeAnalytics:
         """
         conn = self._get_conn()
         query = (
-            "SELECT * FROM trades WHERE status = 'CLOSED' AND confidence IS NOT NULL"
+            f"SELECT * FROM trades WHERE status = 'CLOSED' AND confidence IS NOT NULL "
+            f"AND {self._verified_clause(conn)}"
         )
         rows = conn.execute(query).fetchall()
 
@@ -253,7 +263,8 @@ class TradeAnalytics:
         """
         conn = self._get_conn()
         query = (
-            "SELECT * FROM trades WHERE status = 'CLOSED' AND exit_reason IS NOT NULL"
+            f"SELECT * FROM trades WHERE status = 'CLOSED' AND exit_reason IS NOT NULL "
+            f"AND {self._verified_clause(conn)}"
         )
         rows = conn.execute(query).fetchall()
 
@@ -325,7 +336,7 @@ class TradeAnalytics:
             return {"error": "Trade has no entry time"}
 
         try:
-            entry_time = datetime.fromisoformat(entry_time_str)
+            entry_time = as_utc(entry_time_str)
             # Fetch data for the whole day of the trade
             from_date = entry_time.strftime("%Y-%m-%d 09:15:00")
             to_date = entry_time.strftime("%Y-%m-%d 15:30:00")
@@ -365,7 +376,7 @@ class TradeAnalytics:
                 # Preserve the ISO offset — stripping it would produce a naive
                 # datetime that timestamp() interprets in the host timezone,
                 # shifting all candles by 5.5 h on a UTC server.
-                dt = datetime.fromisoformat(dt)
+                dt = as_utc(dt)
 
             formatted_candles.append(
                 {
@@ -401,7 +412,7 @@ class TradeAnalytics:
         stop_loss = trade["stop_loss"]
 
         try:
-            entry_time = datetime.fromisoformat(trade["entry_time"])
+            entry_time = as_utc(trade["entry_time"])
         except Exception:
             return {"error": "Invalid entry time"}
 
@@ -428,11 +439,15 @@ class TradeAnalytics:
         for c in post_entry_candles:
             if direction == "BUY" and c["high"] >= target:
                 target_hit = True
-                target_hit_time = str(datetime.fromtimestamp(c["time"]))
+                target_hit_time = datetime.fromtimestamp(
+                    c["time"], tz=timezone.utc
+                ).isoformat()
                 break
             elif direction == "SELL" and c["low"] <= target:
                 target_hit = True
-                target_hit_time = str(datetime.fromtimestamp(c["time"]))
+                target_hit_time = datetime.fromtimestamp(
+                    c["time"], tz=timezone.utc
+                ).isoformat()
                 break
 
         # 3. Wider Stop (1.5x)

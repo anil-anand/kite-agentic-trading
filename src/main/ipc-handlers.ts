@@ -21,12 +21,8 @@ export function setupIpcHandlers() {
   });
 
   ipcMain.handle(channels.AUTH_LOGOUT, async () => {
-    try {
-      await authManager.logout();
-      return true;
-    } catch (error) {
-      return false;
-    }
+    await authManager.logout();
+    return true;
   });
 
   ipcMain.handle(channels.AUTH_STATUS, async () => {
@@ -121,6 +117,18 @@ export function setupIpcHandlers() {
   
   ipcMain.handle(channels.AGENT_STATUS, async () => {
     return await pythonBridge.call('agent_status');
+  });
+
+  ipcMain.handle(channels.AGENT_SET_MODE, async (_, mode: string) => {
+    return await pythonBridge.call('agent_set_mode', { mode });
+  });
+
+  ipcMain.handle(channels.AGENT_CLOSE_POSITION, async (_, positionKey: string) => {
+    return await pythonBridge.call('agent_close_position', { positionKey });
+  });
+
+  ipcMain.handle(channels.AGENT_EMERGENCY_FLATTEN, async (_, scope: 'account') => {
+    return await pythonBridge.call('agent_emergency_flatten', { scope });
   });
   
   ipcMain.handle(channels.AGENT_EXECUTE_SIGNAL, async (_, signal: any) => {

@@ -7,7 +7,9 @@ import { buildStrategySettings, STRATEGY_IDS } from '../utils/strategy-settings'
 
 const AgentControl: React.FC = () => {
   const { agentState, signals, setAgentState } = useTradingStore();
-  const { startAgent, stopAgent } = useKiteAPI();
+  const { startAgent, stopAgent, setAgentMode } = useKiteAPI();
+  const [controlPending, setControlPending] = React.useState(false);
+  const [controlError, setControlError] = React.useState<string | null>(null);
 
   React.useEffect(() => {
     if (!agentState.running) {
@@ -16,23 +18,40 @@ const AgentControl: React.FC = () => {
   }, []);
 
   const handleToggle = async () => {
+    if (controlPending) return;
+    setControlPending(true);
+    setControlError(null);
     try {
       if (agentState.running) {
-        await stopAgent();
-        setAgentState({ running: false });
+        const state = await stopAgent();
+        setAgentState(state);
         useTradingStore.getState().setSignals([]); // Clear live signals on stop
       } else {
-        await startAgent(agentState.mode || 'auto');
-        setAgentState({ running: true });
+        const state = await startAgent(agentState.mode || 'auto');
+        setAgentState(state);
       }
     } catch (e) {
+      setControlError(e instanceof Error ? e.message : 'Agent command failed');
       console.error('Failed to toggle agent', e);
+    } finally {
+      setControlPending(false);
     }
   };
 
-  const handleModeChange = (mode: 'auto' | 'confirm') => {
-    setAgentState({ mode });
-    window.electronAPI?.invoke('settings:save', { mode });
+  const handleModeChange = async (mode: 'auto' | 'confirm') => {
+    if (controlPending || agentState.mode === mode) return;
+    setControlPending(true);
+    setControlError(null);
+    try {
+      const state = await setAgentMode(mode);
+      setAgentState(state);
+      await window.electronAPI?.invoke('settings:save', { mode });
+    } catch (error) {
+      setControlError(error instanceof Error ? error.message : 'Trading mode change failed');
+      console.error('Failed to change effective trading mode', error);
+    } finally {
+      setControlPending(false);
+    }
   };
 
   const handleStrategyToggle = (strat: any) => {
@@ -99,11 +118,21 @@ const AgentControl: React.FC = () => {
         </div>
         <button
           onClick={handleToggle}
+          disabled={controlPending}
           className={`px-8 py-3 rounded-lg font-bold shadow-lg transition-all ${agentState.running ? 'bg-loss-dark hover:bg-loss text-white' : 'bg-profit-dark hover:bg-profit text-white animate-pulse-slow'}`}
         >
-          {agentState.running ? 'STOP AGENT' : 'START AGENT'}
+          {controlPending ? 'UPDATING…' : agentState.running ? 'PAUSE ENTRIES' : 'START AGENT'}
         </button>
       </div>
+
+      {controlError && <div role="alert" className="rounded border border-loss-dark p-3 text-loss-light">{controlError}</div>}
+      {(agentState.reconciliationPending || agentState.lifecycleRecoveryPending || agentState.controlStateInvalid || agentState.protectionFailureHalt) && (
+        <div role="alert" className="rounded border border-amber-700/60 p-3 text-amber-200">Entries are blocked while broker state, protection, or saved control state requires recovery.</div>
+      )}
+      <p className="text-sm text-amber-200">
+        {agentState.supervisionActive ? (agentState.running ? 'Position supervision active.' : 'Entries paused; position supervision remains active.') : 'Position supervision is not yet verified.'}
+        {agentState.statusMessage && ` ${agentState.statusMessage}`}
+      </p>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 relative">
         {/* Sticky Left Column (Controls) */}
@@ -231,8 +260,11 @@ const AgentControl: React.FC = () => {
                       const isCalibrated = probRaw !== null && probRaw !== undefined;
                       const prob = isCalibrated ? probRaw : 0;
                       const isProbHigh = isCalibrated ? prob >= 0.60 : true; // Uncalibrated is allowed to explore
-                      const willAutoEnter = agentState.mode === 'auto' && isProbHigh;
-                      const autoEnterReason = agentState.mode !== 'auto'
+                      const entriesEnabled = agentState.running && !agentState.entryPaused && !agentState.reconciliationPending && !agentState.lifecycleRecoveryPending && !agentState.controlStateInvalid && !agentState.protectionFailureHalt && !agentState.hardFlattenReason;
+                      const willAutoEnter = entriesEnabled && agentState.mode === 'auto' && isProbHigh;
+                      const autoEnterReason = !entriesEnabled
+                        ? 'Entries paused or awaiting recovery'
+                        : agentState.mode !== 'auto'
                         ? 'Mode is not Auto'
                         : !isCalibrated
                           ? 'Exploring (Uncalibrated)'

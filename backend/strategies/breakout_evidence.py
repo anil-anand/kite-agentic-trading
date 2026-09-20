@@ -3,7 +3,8 @@ from typing import Any, Dict, List
 import pandas as pd
 from ta.trend import ADXIndicator
 from ta.volatility import AverageTrueRange
-from ta.volume import VolumeWeightedAveragePrice
+
+from backend.indicators import SESSION_VWAP_DEFINITION, SessionVWAP
 
 
 class BreakoutEvidence:
@@ -90,20 +91,15 @@ class BreakoutEvidence:
         adx = adx_ind.adx()
         adx_val = adx.iloc[-1] if not pd.isna(adx.iloc[-1]) else 0.0
 
-        # 4. VWAP Position
-        vwap_ind = VolumeWeightedAveragePrice(
-            high=df_calc["high"],
-            low=df_calc["low"],
-            close=df_calc["close"],
-            volume=df_calc["volume"],
-            window=14,
-        )
-        vwap = vwap_ind.volume_weighted_average_price()
+        # 4. VWAP Position.  All scanner context now uses the documented
+        # session-reset candle approximation; a rolling 14-bar VWAP would give
+        # the same label different meanings in breakout and other playbooks.
+        vwap = SessionVWAP(df_calc).vwap()
         close_price = df_calc["close"].iloc[-1]
         vwap_pos = (
             close_price / vwap.iloc[-1]
             if not pd.isna(vwap.iloc[-1]) and vwap.iloc[-1] > 0
-            else 1.0
+            else None
         )
 
         # Scoring Logic
@@ -127,10 +123,11 @@ class BreakoutEvidence:
             score_modifier += 5
 
         # VWAP Alignment
-        if direction == "BUY" and vwap_pos > 1.0:
-            score_modifier += 5
-        elif direction == "SELL" and vwap_pos < 1.0:
-            score_modifier += 5
+        if vwap_pos is not None:
+            if direction == "BUY" and vwap_pos > 1.0:
+                score_modifier += 5
+            elif direction == "SELL" and vwap_pos < 1.0:
+                score_modifier += 5
 
         final_score = min(100, base_score + score_modifier)
 
@@ -146,7 +143,10 @@ class BreakoutEvidence:
             "relative_volume": float(round(rel_vol, 2)),
             "atr_expansion": float(round(atr_expansion, 2)),
             "adx": float(round(adx_val, 2)),
-            "vwap_position": float(round(vwap_pos, 4)),
+            "vwap_position": float(round(vwap_pos, 4))
+            if vwap_pos is not None
+            else None,
+            "vwap_definition": SESSION_VWAP_DEFINITION,
             "quality": quality,
         }
 

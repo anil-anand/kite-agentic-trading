@@ -138,13 +138,10 @@ class AuthManager {
   }
 
   public async logout(): Promise<void> {
-    try {
-      secureStorage.updateCredentials({ accessToken: '' });
-      await pythonBridge.call('set_credentials', { credentials: secureStorage.loadCredentials() });
-      await pythonBridge.call('logout');
-    } catch (e) {
-      console.error('Error during logout:', e);
-    }
+    // The backend must prove there are no remaining management obligations
+    // before the only trusted recovery token is removed.
+    await pythonBridge.call('logout');
+    secureStorage.updateCredentials({ accessToken: '' });
   }
 }
 

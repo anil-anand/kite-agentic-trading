@@ -1,10 +1,14 @@
 import uuid
+from copy import deepcopy
 from typing import Any, Dict, List, Optional
 
 from .base import BasePlaybook
 
 
 class BreakoutPlaybook(BasePlaybook):
+    def management_profile(self) -> str:
+        return "breakout_follow_through"
+
     def get_name(self) -> str:
         return "Breakout"
 
@@ -49,7 +53,15 @@ class BreakoutPlaybook(BasePlaybook):
 
         # Check for trend confirmation
         trend_signals = [s for s in evidence if s.get("family") == "trend"]
-        trend_confirmed = any(s.get("direction") == direction for s in trend_signals)
+        trend_signal = next(
+            (
+                signal
+                for signal in trend_signals
+                if signal.get("direction") == direction
+            ),
+            None,
+        )
+        trend_confirmed = trend_signal is not None
 
         final_score = base_sig.get("signal_score", 0)
         reasoning = f"{self.get_name()}: {direction} breakout detected"
@@ -73,6 +85,18 @@ class BreakoutPlaybook(BasePlaybook):
             "riskReward": base_sig.get("riskReward", 0),
             "reasoning": reasoning,
             "playbook": self.get_name(),
+            "playbook_version": "playbooks-v1",
+            "management_profile": self.management_profile(),
+            "setup_variant": (
+                "breakout_with_trend_confirmation"
+                if trend_confirmed
+                else "breakout_trigger"
+            ),
+            "selected_evidence": [
+                deepcopy(base_sig),
+                *([deepcopy(trend_signal)] if trend_signal else []),
+            ],
+            "selection_inputs": deepcopy(breakout_signals + trend_signals),
         }
 
     def evaluate_invalidation(

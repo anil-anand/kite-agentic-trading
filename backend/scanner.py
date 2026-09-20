@@ -1,4 +1,8 @@
 import datetime
+import hashlib
+import json
+import threading
+from copy import deepcopy
 from typing import Any, Dict, List, Tuple
 
 import pandas as pd
@@ -6,8 +10,10 @@ import pandas as pd
 from .calibration import calibrator
 from .config import config_manager
 from .kite_client import kite_client
+from .market_context import ContextPolicy, MarketContext, MarketContextService
 from .playbooks import BreakoutPlaybook, MeanReversionPlaybook, TrendPullbackPlaybook
 from .regime_classifier import regime_classifier
+from .session_clock import SessionPolicy
 from .strategies.adx_momentum import ADXMomentumStrategy
 from .strategies.awesome_oscillator import AwesomeOscillatorStrategy
 from .strategies.bollinger_breakout import BollingerBreakoutStrategy
@@ -25,6 +31,7 @@ from .strategies.supertrend import SupertrendStrategy
 from .strategies.tsi_cross import TSICrossStrategy
 from .strategies.vwap_bounce import VWAPBounceStrategy
 from .strategies.williams_r import WilliamsRStrategy
+from .time_utils import as_utc, now_utc
 from .utils import push_log
 
 
@@ -71,6 +78,12 @@ class Scanner:
         self.candle_cache = {}
         self.last_cache_time = {}
         self.last_scanned_candle = {}
+        self._market_context_service = MarketContextService()
+        self._market_context_policy = self._market_context_service.policy
+        self._market_session_policy = SessionPolicy()
+        self._market_context_lock = threading.Lock()
+        self._scan_locks = {}
+        self._scan_locks_lock = threading.Lock()
         self.playbooks = [
             TrendPullbackPlaybook(),
             BreakoutPlaybook(),
@@ -80,17 +93,22 @@ class Scanner:
     def _fetch_candles(
         self, instrument_token: int, tradingsymbol: str
     ) -> Tuple[pd.DataFrame, bool]:
-        now = datetime.datetime.now()
+        now = now_utc()
 
-        # Use cache if less than 1 minute old
+        # Cache only within the same candle interval: a payload fetched before
+        # the close cannot become a completed candle merely by waiting.
+        last_fetch = self.last_cache_time.get(instrument_token)
+        source_as_of = self.candle_cache.get(
+            instrument_token, pd.DataFrame()
+        ).attrs.get("source_as_of", last_fetch)
         if (
             instrument_token in self.candle_cache
-            and (
-                now - self.last_cache_time.get(instrument_token, datetime.datetime.min)
-            ).seconds
-            < 60
+            and last_fetch is not None
+            and 0 <= (now - last_fetch).total_seconds() < 60
+            and source_as_of is not None
+            and int(now.timestamp()) // 300 == int(source_as_of.timestamp()) // 300
         ):
-            return self.candle_cache[instrument_token], True
+            return self.candle_cache[instrument_token].copy(deep=True), True
 
         from_date = now - datetime.timedelta(days=5)
         to_date = now
@@ -99,21 +117,128 @@ class Scanner:
             records = kite_client.get_historical_data(
                 instrument_token, from_date, to_date, "5minute"
             )
+            received_at = now_utc()
             if not records:
                 return pd.DataFrame(), False
 
-            df = pd.DataFrame(records)
-            for col in ["open", "high", "low", "close"]:
-                if col in df.columns:
-                    df[col] = df[col].astype(float)
-            self.candle_cache[instrument_token] = df
-            self.last_cache_time[instrument_token] = now
-            return df, False
+            df = self._market_context_service.cache_frame(
+                instrument_token, "5minute", pd.DataFrame(records)
+            )
+            self._preserve_candle_receipts(
+                df, self.candle_cache.get(instrument_token), received_at
+            )
+            # Retain request cutoff and actual receipt separately. A request
+            # made before a close may return after it with an unfinished bar.
+            df.attrs["source_as_of"] = to_date
+            df.attrs["received_at"] = received_at
+            self.candle_cache[instrument_token] = df.copy(deep=True)
+            self.last_cache_time[instrument_token] = received_at
+            return df.copy(deep=True), False
         except Exception as e:
             push_log(
                 f"Error fetching candles for {tradingsymbol}: {e}", level="warning"
             )
             return pd.DataFrame(), False
+
+    @staticmethod
+    def _preserve_candle_receipts(
+        frame: pd.DataFrame, previous: pd.DataFrame | None, received_at
+    ) -> None:
+        """Keep first observation times for unchanged, already-final versions."""
+
+        # Explicit source observation times take precedence, including invalid
+        # values which the context validator must surface rather than replace.
+        if "received_at" in frame:
+            return
+
+        def version_key(row):
+            try:
+                stamp = pd.Timestamp(row["date"])
+                if pd.isna(stamp):
+                    return None
+                start = as_utc(stamp.to_pydatetime())
+                values = tuple(
+                    None if pd.isna(row.get(name)) else float(row[name])
+                    for name in ("open", "high", "low", "close", "volume")
+                )
+                revision = row.get("revision")
+                revision = "source-v1" if pd.isna(revision) else str(revision)
+                return (start, *values, revision)
+            except (KeyError, TypeError, ValueError, OverflowError):
+                return None
+
+        observations = {}
+        conflicting_starts = set()
+        versions = {}
+        if previous is not None:
+            cutoff = as_utc(previous.attrs.get("source_as_of"))
+            for row in previous.to_dict("records"):
+                key = version_key(row)
+                if key is None or cutoff is None:
+                    continue
+                prior_version = versions.setdefault(key[0], key)
+                if prior_version != key:
+                    conflicting_starts.add(key[0])
+                try:
+                    receipt = as_utc(
+                        row.get("received_at", previous.attrs.get("received_at"))
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                end = key[0] + datetime.timedelta(minutes=5)
+                if (
+                    receipt is not None
+                    and not pd.isna(receipt)
+                    and end <= min(cutoff, receipt)
+                    and receipt <= received_at
+                ):
+                    observations[key] = min(receipt, observations.get(key, receipt))
+
+        frame["received_at"] = [
+            observations.get(key, received_at)
+            if key is not None and key[0] not in conflicting_starts
+            else received_at
+            for key in (version_key(row) for row in frame.to_dict("records"))
+        ]
+
+    def _market_context(
+        self, instrument_token: int, df: pd.DataFrame, decision_at=None
+    ) -> MarketContext:
+        """Build a causal context using the current versioned configuration.
+
+        Entry strategy formulas retain their existing incomplete-candle setting
+        for this phase.  Position assessment and all context provenance use the
+        completed-candle path below, independently of that legacy switch.
+        """
+
+        policy = ContextPolicy.from_config(config_manager.get_market_context_config())
+        # Operator trading hours constrain admission/supervision, not the
+        # exchange's candle grid or full-session VWAP history.
+        with self._market_context_lock:
+            if policy != self._market_context_policy:
+                self._market_context_service = MarketContextService(
+                    policy, self._market_session_policy
+                )
+                self._market_context_policy = policy
+            service = self._market_context_service
+        event_time = decision_at or now_utc()
+        return service.build(
+            instrument_token,
+            df,
+            decision_event_time=event_time,
+            received_at=df.attrs.get("received_at", event_time),
+            source_as_of=df.attrs.get(
+                "source_as_of", df.attrs.get("received_at", event_time)
+            ),
+        )
+
+    def get_market_context(
+        self, instrument_token: int, tradingsymbol: str, *, decision_at=None
+    ) -> MarketContext:
+        """Fetch a snapshot with original provenance for normal management."""
+
+        df, _ = self._fetch_candles(instrument_token, tradingsymbol)
+        return self._market_context(instrument_token, df, decision_at)
 
     def scan_watchlist(
         self, symbols: List[str], on_signal=None
@@ -121,58 +246,73 @@ class Scanner:
         import concurrent.futures
 
         all_signals = []
-        strategy_config = config_manager.get_strategy_config()
+        # Confirmation may occur after Settings are edited.  Keep the actual
+        # selection inputs detached before any symbol starts calculating.
+        strategy_config = deepcopy(config_manager.get_strategy_config())
+        entry_family_mapping = dict(self.family_mapping)
 
         instruments = kite_client.get_instruments("NSE")
         instrument_map = {
             i["tradingsymbol"]: i["instrument_token"] for i in instruments
         }
 
-        def process_symbol(symbol: str) -> List[Dict[str, Any]]:
+        def evaluate_symbol(symbol: str) -> List[Dict[str, Any]]:
             token = instrument_map.get(symbol)
             if not token:
                 return []
 
-            df, was_cached = self._fetch_candles(token, symbol)
+            df, _ = self._fetch_candles(token, symbol)
             if df.empty:
+                return []
+
+            context = self._market_context(token, df)
+            completed_df = context.primary_frame()
+            if (
+                not context.normal_decision_eligible
+                or "VOLUME_UNAVAILABLE" in context.primary_quality.issues
+                or completed_df.empty
+            ):
                 return []
 
             evaluate_on_incomplete = strategy_config.get(
                 "evaluateOnIncompleteCandle", False
             )
             if not evaluate_on_incomplete:
-                if "date" in df.columns:
-                    if not pd.api.types.is_datetime64_any_dtype(df["date"]):
-                        df["date"] = pd.to_datetime(df["date"])
-
-                    if df["date"].dt.tz is None:
-                        df["date"] = df["date"].dt.tz_localize("Asia/Kolkata")
-
-                    now = pd.Timestamp.now(tz="Asia/Kolkata")
-                    df = df[df["date"] + pd.Timedelta(minutes=5) <= now].copy()
+                df = completed_df
 
             if df.empty:
                 return []
 
-            if not evaluate_on_incomplete and "date" in df.columns:
-                latest_candle_time = df["date"].iloc[-1]
-                if self.last_scanned_candle.get(symbol) == latest_candle_time:
+            if not evaluate_on_incomplete and context.primary_bar:
+                # Corrections change provenance, not the decision event. Never
+                # trade an already-consumed candle again on a later revision.
+                latest_candle_id = context.primary_bar.end
+                last_scanned = self.last_scanned_candle.get(symbol)
+                if last_scanned is not None and latest_candle_id <= last_scanned:
                     return []
-                self.last_scanned_candle[symbol] = latest_candle_time
 
             # 1. Classify Regime
-            regime_info = regime_classifier.classify(df)
-            regime = regime_info["regime"]
-            regime_state = regime_info
+            # Keep entry gating on the raw stateless classifier so this phase
+            # does not silently change existing strategy selection.  The
+            # legacy entry-only incomplete-candle experiment retains its old
+            # regime input; position assessment never uses that path.
+            if evaluate_on_incomplete:
+                regime_state = regime_classifier.classify(df)
+            else:
+                regime_state = {
+                    "regime": context.raw_regime,
+                    "features": dict(context.raw_regime_features),
+                }
+            regime = regime_state["regime"]
 
             raw_signals = []
             for strat_id, strategy in self.strategies.items():
                 config = strategy_config.get(strat_id, {})
                 if config.get("enabled", False):
-                    signals = strategy.calculate_signals(df, symbol)
+                    signals = strategy.calculate_signals(df.copy(deep=True), symbol)
                     for s in signals:
                         s["strategy_id"] = strat_id
-                        s["family"] = self.family_mapping.get(strat_id)
+                        s["family"] = entry_family_mapping.get(strat_id)
                     raw_signals.extend(signals)
 
             from .strategies.breakout_evidence import BreakoutEvidence
@@ -213,15 +353,51 @@ class Scanner:
                         {
                             "estimated_probability": est_prob,
                             "calibration_sample_size": sample_size,
-                            "indicators": regime_info["features"],
+                            "indicators": regime_state["features"],
                             "raw_signals": raw_signals,
                             "regime": regime,
                             "strategy_count": len(strategy_ids),
+                            "market_context": context.summary(),
+                            "entry_selection_config": {
+                                "strategies": deepcopy(strategy_config),
+                                "family_mapping": dict(entry_family_mapping),
+                                "context_policy": context.summary().get("policy"),
+                                "entry_policy_version": "playbooks-v1",
+                            },
+                            "entry_input": {
+                                "mode": "INCOMPLETE_CANDLE"
+                                if evaluate_on_incomplete
+                                else "COMPLETED_CANDLES",
+                                "last_input_bar": json.loads(
+                                    df.tail(1).to_json(
+                                        orient="records", date_format="iso"
+                                    )
+                                )[0],
+                                "frame_hash": hashlib.sha256(
+                                    df.to_json(
+                                        orient="split",
+                                        date_format="iso",
+                                        double_precision=15,
+                                    ).encode()
+                                ).hexdigest(),
+                                "hash_format": "pandas-split-iso-v1",
+                                "decision_at": context.decision_event_time.isoformat(),
+                            },
                         }
                     )
                     symbol_aggregated_signals.append(decision)
 
+            if not evaluate_on_incomplete and context.primary_bar:
+                self.last_scanned_candle[symbol] = context.primary_bar.end
             return symbol_aggregated_signals
+
+        def process_symbol(symbol: str) -> List[Dict[str, Any]]:
+            with self._scan_locks_lock:
+                symbol_lock = self._scan_locks.setdefault(symbol, threading.Lock())
+            # Manual scans and the entry worker share one decision high-water
+            # mark. Unrelated symbols still run concurrently.
+            with symbol_lock:
+                return evaluate_symbol(symbol)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
             futures = [executor.submit(process_symbol, symbol) for symbol in symbols]
@@ -250,53 +426,67 @@ class Scanner:
         """
         strategy_config = config_manager.get_strategy_config()
 
-        df, _ = self._fetch_candles(instrument_token, tradingsymbol)
-        if df.empty:
+        context = self.get_market_context(instrument_token, tradingsymbol)
+        df = context.primary_frame()
+
+        # The legacy assessment depends on the 50-bar regime warmup. Missing
+        # history and unusable source data cannot mean zero supporting votes.
+        volume_available = "VOLUME_UNAVAILABLE" not in context.primary_quality.issues
+        if not context.normal_decision_eligible or not volume_available or len(df) < 50:
             return {
                 "regime": "UNCERTAIN",
-                "buy_signals": 0,
-                "sell_signals": 0,
+                "regime_features": {},
+                "buy_signals": None,
+                "sell_signals": None,
                 "strategies": [],
+                "assessment_available": False,
+                "assessment_issue": (
+                    "MARKET_CONTEXT_UNAVAILABLE"
+                    if not context.normal_decision_eligible
+                    else "VOLUME_UNAVAILABLE"
+                    if not volume_available
+                    else "INSUFFICIENT_HISTORY"
+                ),
+                "market_context": context.summary(),
             }
 
-        evaluate_on_incomplete = strategy_config.get(
-            "evaluateOnIncompleteCandle", False
-        )
-        if not evaluate_on_incomplete:
-            if "date" in df.columns:
-                if not pd.api.types.is_datetime64_any_dtype(df["date"]):
-                    df["date"] = pd.to_datetime(df["date"])
-
-                if df["date"].dt.tz is None:
-                    df["date"] = df["date"].dt.tz_localize("Asia/Kolkata")
-
-                now = pd.Timestamp.now(tz="Asia/Kolkata")
-                df = df[df["date"] + pd.Timedelta(minutes=5) <= now].copy()
-
-        if df.empty:
-            return {
-                "regime": "UNCERTAIN",
-                "buy_signals": 0,
-                "sell_signals": 0,
-                "strategies": [],
-            }
-
-        regime_info = regime_classifier.classify(df)
+        regime_info = {
+            "regime": context.raw_regime,
+            "features": dict(context.raw_regime_features),
+        }
 
         raw_signals = []
+        strategy_errors = []
+        enabled_strategies = 0
         for strat_id, strategy in self.strategies.items():
             config = strategy_config.get(strat_id, {})
             if not config.get("enabled", False):
                 continue
 
+            enabled_strategies += 1
             try:
-                signals = strategy.calculate_signals(df, tradingsymbol)
+                signals = strategy.calculate_signals(df.copy(deep=True), tradingsymbol)
                 for sig in signals:
                     sig["strategy_id"] = strat_id
                     sig["family"] = self.family_mapping.get(strat_id, "unknown")
                 raw_signals.extend(signals)
             except Exception:
-                pass  # Skip individual strategy failures silently
+                strategy_errors.append(strat_id)
+
+        if strategy_errors or not enabled_strategies:
+            return {
+                "regime": regime_info["regime"],
+                "regime_features": regime_info["features"],
+                "buy_signals": None,
+                "sell_signals": None,
+                "strategies": [],
+                "assessment_available": False,
+                "assessment_issue": (
+                    "STRATEGY_FAILURE" if strategy_errors else "NO_ENABLED_STRATEGIES"
+                ),
+                "strategy_errors": strategy_errors,
+                "market_context": context.summary(),
+            }
 
         from .strategies.breakout_evidence import BreakoutEvidence
         from .strategies.oscillator_evidence import OscillatorEvidence
@@ -332,6 +522,8 @@ class Scanner:
             "buy_signals": buy_signals,
             "sell_signals": sell_signals,
             "strategies": triggered_strategies,
+            "assessment_available": context.normal_decision_eligible,
+            "market_context": context.summary(),
         }
 
 

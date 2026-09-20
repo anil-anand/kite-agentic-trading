@@ -7,6 +7,7 @@ resulting signals without ever touching the Kite API.
 
 import os
 import tempfile
+import threading
 
 import numpy as np
 import pandas as pd
@@ -132,6 +133,20 @@ def assert_valid_signal(sig, entry_tolerance=1e-6):
     else:
         assert sl > entry - entry_tolerance, "SELL stop-loss should be above entry"
         assert target < entry + entry_tolerance, "SELL target should be below entry"
+
+
+@pytest.fixture(autouse=True)
+def isolated_default_journal(monkeypatch, tmp_path):
+    """Durable recovery from one test must not become another test's broker book."""
+    from backend.journal import journal
+
+    monkeypatch.setattr(journal, "db_path", tmp_path / "default-journal.db")
+    monkeypatch.setattr(journal, "_local", threading.local())
+    journal._init_db()
+    yield
+    connection = getattr(journal._local, "conn", None)
+    if connection is not None:
+        connection.close()
 
 
 @pytest.fixture(autouse=True)

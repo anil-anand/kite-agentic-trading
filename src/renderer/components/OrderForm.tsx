@@ -36,7 +36,12 @@ const OrderForm: React.FC = () => {
   };
 
   return (
-    <form onSubmit={handleSubmit} className="bg-surface-800 p-4 rounded-lg border border-surface-700 space-y-4 text-sm">
+    <form onSubmit={handleSubmit} className="bg-surface-800 p-4 rounded-lg border border-surface-700 space-y-4 text-sm" aria-disabled="true">
+      <div className="rounded border border-amber-700/60 bg-amber-900/20 p-3 text-xs text-amber-200">
+        Manual entries are disabled until they can be attached to a validated
+        strategy signal and protective-stop workflow. Use the agent entry path.
+      </div>
+      <fieldset disabled>
       <div className="flex gap-2">
         <button type="button" onClick={() => setType('BUY')} className={`flex-1 py-2 rounded font-bold transition-colors ${type === 'BUY' ? 'bg-profit-dark text-white' : 'bg-surface-700 text-surface-400'}`}>BUY</button>
         <button type="button" onClick={() => setType('SELL')} className={`flex-1 py-2 rounded font-bold transition-colors ${type === 'SELL' ? 'bg-loss-dark text-white' : 'bg-surface-700 text-surface-400'}`}>SELL</button>
@@ -81,6 +86,7 @@ const OrderForm: React.FC = () => {
       <button type="submit" disabled={loading} className={`w-full py-3 rounded font-bold text-white transition-colors ${type === 'BUY' ? 'bg-profit-light hover:bg-profit' : 'bg-loss-light hover:bg-loss'} ${loading ? 'opacity-50' : ''}`}>
         {loading ? 'Placing...' : `Place ${type} Order`}
       </button>
+      </fieldset>
     </form>
   );
 };
