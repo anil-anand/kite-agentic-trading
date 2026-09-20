@@ -5,16 +5,29 @@ import OrderForm from '../components/OrderForm';
 const Orders: React.FC = () => {
   const { orders, setOrders } = useTradingStore();
   const [tab, setTab] = useState<'open' | 'executed' | 'all'>('all');
+  const [snapshotQuality, setSnapshotQuality] = useState<string | null>(null);
 
   React.useEffect(() => {
     const fetchOrders = async () => {
       if (!useTradingStore.getState().auth.isLoggedIn) return;
       try {
         const response = await window.electronAPI?.orders.getAll();
-        if (response) {
-          setOrders(response);
+        if (!response) throw new Error('Order snapshot unavailable');
+        const isLegacyList = Array.isArray(response);
+        const quality = isLegacyList ? 'PARTIAL' : response.snapshotQuality ?? 'UNAVAILABLE';
+        const incoming = isLegacyList ? response : response.orders;
+        if (!Array.isArray(incoming)) throw new Error('Invalid order snapshot');
+        setSnapshotQuality(quality);
+        if (quality === 'COMPLETE') {
+          setOrders(incoming);
+        } else if (quality !== 'UNAVAILABLE' && incoming.length > 0) {
+          // A partial read cannot prove that a last-known order disappeared.
+          const merged = new Map(useTradingStore.getState().orders.map(order => [order.orderId, order]));
+          incoming.forEach(order => merged.set(order.orderId, order));
+          setOrders(Array.from(merged.values()));
         }
       } catch (e) {
+        setSnapshotQuality('UNAVAILABLE');
         console.error("Failed to fetch orders", e);
       }
     };
@@ -23,9 +36,21 @@ const Orders: React.FC = () => {
     return () => clearInterval(interval);
   }, [setOrders]);
 
+  const visibleOrders = orders.filter(order => {
+    const working = order.isWorking ?? !['COMPLETE', 'REJECTED', 'CANCELLED', 'EXPIRED', 'REJECTED AMO'].includes(order.status);
+    if (tab === 'open') return !order.isArchived && working;
+    if (tab === 'executed') return !working;
+    return true;
+  });
+
   return (
     <div className="p-6 h-full flex flex-col space-y-6">
       <h1 className="text-2xl font-bold text-white">Orders</h1>
+      {snapshotQuality && snapshotQuality !== 'COMPLETE' && (
+        <div className="rounded border border-amber-700/60 bg-amber-900/20 p-3 text-sm text-amber-200">
+          Order data is degraded or archived; live order state is not fully verified.
+        </div>
+      )}
       
       <div className="grid grid-cols-1 lg:grid-cols-4 gap-6 flex-1 min-h-0">
         <div className="lg:col-span-3 flex flex-col bg-surface-800 rounded-xl border border-surface-700 overflow-hidden">
@@ -54,22 +79,14 @@ const Orders: React.FC = () => {
                 </tr>
               </thead>
               <tbody>
-                {orders.filter(o => {
-                  if (tab === 'open') return o.status === 'OPEN' || o.status.includes('PENDING');
-                  if (tab === 'executed') return o.status === 'COMPLETE' || o.status === 'REJECTED' || o.status === 'CANCELLED';
-                  return true;
-                }).length === 0 ? (
+                {visibleOrders.length === 0 ? (
                   <tr>
-                    <td colSpan={7} className="px-6 py-8 text-center text-surface-400">No orders found.</td>
+                    <td colSpan={7} className="px-6 py-8 text-center text-surface-400">{snapshotQuality === 'COMPLETE' ? 'No orders found.' : 'Order state unavailable.'}</td>
                   </tr>
                 ) : (
-                  orders.filter(o => {
-                    if (tab === 'open') return o.status === 'OPEN' || o.status.includes('PENDING');
-                    if (tab === 'executed') return o.status === 'COMPLETE' || o.status === 'REJECTED' || o.status === 'CANCELLED';
-                    return true;
-                  }).map(o => (
+                  visibleOrders.map(o => (
                     <tr key={o.orderId} className="border-b border-surface-700 hover:bg-surface-700/50">
-                      <td className="px-6 py-4">{new Date(o.orderTimestamp).toLocaleTimeString()}</td>
+                      <td className="px-6 py-4">{o.orderTimestamp ? new Date(o.orderTimestamp).toLocaleTimeString() : 'Unavailable'}</td>
                       <td className="px-6 py-4 font-bold text-white">
                         {o.tradingsymbol}
                         {o.isAppOrder && (
@@ -77,10 +94,11 @@ const Orders: React.FC = () => {
                             AGENT
                           </span>
                         )}
+                        {o.isArchived && <span className="ml-2 text-[10px] text-amber-300">ARCHIVED</span>}
                       </td>
                       <td className={`px-6 py-4 font-bold ${o.transactionType === 'BUY' ? 'text-profit-light' : 'text-loss-light'}`}>{o.transactionType}</td>
                       <td className="px-6 py-4 font-mono">{o.quantity}</td>
-                      <td className="px-6 py-4 font-mono">₹{o.price || o.averagePrice || 0}</td>
+                      <td className="px-6 py-4 font-mono">{o.price != null || o.averagePrice != null ? `₹${(o.price ?? o.averagePrice)?.toFixed(2)}` : 'Unavailable'}</td>
                       <td className="px-6 py-4">{o.status}</td>
                       <td className="px-6 py-4">
                         {o.status === 'OPEN' && <button className="text-loss-light hover:underline">Cancel</button>}

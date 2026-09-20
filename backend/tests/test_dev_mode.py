@@ -2,8 +2,10 @@
 
 import backend.kite_client as kc
 import backend.main as m
+from backend.broker_models import OrderRole
 from backend.dev_mode import is_dev_mode
 from backend.mock_kite_client import MockKiteClient
+from backend.risk_manager import RiskManager
 
 
 class TestFlag:
@@ -73,7 +75,9 @@ class TestMockMarketData:
         assert bal > 0
 
     def test_empty_account_book(self):
-        assert self.mock.get_positions() == {"net": [], "day": []}
+        pos = self.mock.get_positions()
+        assert pos["net"] == []
+        assert pos["day"] == []
         assert self.mock.get_orders() == []
         assert self.mock.get_holdings() == []
 
@@ -111,6 +115,54 @@ class TestMockOrders:
     def test_generate_session_returns_dev_token(self):
         s = self.mock.generate_session("req", "secret")
         assert s["access_token"] == "dev-token"
+
+    def test_filled_mock_entry_uses_canonical_identity_and_fresh_exposure(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(self.mock, "_live_price", lambda _: 100.0)
+        self.mock.place_order(
+            variety="regular",
+            exchange="NSE",
+            tradingsymbol="RELIANCE",
+            transaction_type="BUY",
+            quantity=10,
+            product="MIS",
+            order_type="MARKET",
+            order_role=OrderRole.ENTRY,
+        )
+        snapshot = self.mock.get_broker_snapshot()
+        expected_token = str(
+            next(
+                instrument["instrument_token"]
+                for instrument in self.mock.get_instruments("NSE")
+                if instrument["tradingsymbol"] == "RELIANCE"
+            )
+        )
+        position = snapshot.positions[0]
+        assert position.key.instrument_id == expected_token
+        assert snapshot.current_orders[0].key == position.key
+        assert snapshot.fills[0].key == position.key
+        assert position.day_buy_quantity == 10
+        assert snapshot.entry_ready
+        state, reason = RiskManager()._build_exposure_state(snapshot)
+        assert reason == "OK"
+        # Filled quantity is already included in the broker position.
+        assert state.gross == 1000
+
+        self.mock.place_order(
+            variety="regular",
+            exchange="NSE",
+            tradingsymbol="RELIANCE",
+            transaction_type="SELL",
+            quantity=10,
+            product="MIS",
+            order_type="MARKET",
+            order_role=OrderRole.REDUCTION,
+        )
+        snapshot = self.mock.get_broker_snapshot()
+        assert snapshot.positions[0].day_sell_quantity == 10
+        assert snapshot.entry_ready
+        assert RiskManager()._build_exposure_state(snapshot)[0].gross == 0
 
 
 class TestSimulatedBook:

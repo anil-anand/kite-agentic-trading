@@ -1,8 +1,15 @@
 import json
+import math
 import sys
 import traceback
+from datetime import timedelta
 
 from .analytics import analytics
+from .broker_models import (
+    SnapshotQuality,
+    order_snapshot_to_renderer_dto,
+    position_to_backend_dict,
+)
 from .config import config_manager
 from .dev_mode import is_dev_mode
 from .execution_gateway import execution_gateway
@@ -12,6 +19,7 @@ from .llm_client import OPENCODE_PLANS, OpenAICompatibleClient
 from .risk_manager import risk_manager
 from .scanner import scanner
 from .ticker import ticker_manager
+from .time_utils import now_utc
 from .trading_engine import trading_engine
 from .utils import DateTimeEncoder
 
@@ -75,7 +83,11 @@ def handle_request(req):
             # Verify the token is actually still valid with the Kite API
             try:
                 kite_client.get_margins()
+                account_id = kite_client.refresh_account_id()
             except Exception:
+                return success({"is_valid": False})
+            if account_id == "UNKNOWN":
+                risk_manager.reconciliation_status = "RECONCILIATION_PENDING"
                 return success({"is_valid": False})
 
             # Start ticker on resume
@@ -98,6 +110,11 @@ def handle_request(req):
             kite_client.init(api_key)
 
             session = kite_client.generate_session(request_token, api_secret)
+            if kite_client.account_id == "UNKNOWN":
+                return error(
+                    -32001,
+                    "Authentication succeeded but broker account identity could not be verified.",
+                )
 
             # Save all creds including token
             config_manager.save_credentials(
@@ -111,6 +128,12 @@ def handle_request(req):
             return success(kite_client.get_positions())
 
         elif method == "get_orders":
+            if hasattr(kite_client, "get_order_history_snapshot"):
+                return success(
+                    order_snapshot_to_renderer_dto(
+                        kite_client.get_order_history_snapshot()
+                    )
+                )
             return success(kite_client.get_orders())
 
         elif method == "get_holdings":
@@ -120,9 +143,14 @@ def handle_request(req):
             return success(kite_client.get_margins())
 
         elif method == "place_order":
-            params["is_entry"] = True  # Assume UI orders are entries unless specified
-            order_id = execution_gateway.place_order(**params)
-            return success({"order_id": order_id})
+            # The legacy ticket has no server-owned stop/thesis and cannot be
+            # admitted safely as an entry.  Keep the route explicit and fail
+            # closed until it is wired through the signal/reservation flow.
+            return error(
+                -32004,
+                "Manual entries are disabled: submit a fresh validated signal "
+                "through execute_signal, or use a managed reduction command.",
+            )
 
         elif method == "cancel_order":
             res = execution_gateway.cancel_order(**params)
@@ -224,9 +252,15 @@ def handle_request(req):
         elif method == "dashboard_summary":
             margins = kite_client.get_margins()
             equity_margin = margins.get("equity", {})
-            available_margin = equity_margin.get("available", {}).get("live_balance", 0)
-            if not available_margin:
-                available_margin = equity_margin.get("net", 0)
+            available_margin = equity_margin.get("available", {}).get("live_balance")
+            if available_margin is None:
+                available_margin = equity_margin.get("net")
+            if (
+                isinstance(available_margin, bool)
+                or not isinstance(available_margin, (int, float))
+                or not math.isfinite(available_margin)
+            ):
+                available_margin = None
 
             if risk_manager.reconciliation_status == "RECONCILIATION_PENDING":
                 try:
@@ -238,38 +272,69 @@ def handle_request(req):
                         f"Auto-reconcile on dashboard failed: {e}", level="warning"
                     )
 
-            positions = kite_client.get_positions().get("net", [])
-            total_pnl = sum(p.get("pnl", p.get("m2m", 0)) for p in positions)
+            position_snapshot = kite_client.get_positions_snapshot()
+            positions = (
+                [
+                    position_to_backend_dict(position)
+                    for position in position_snapshot.net
+                ]
+                if position_snapshot.quality is SnapshotQuality.COMPLETE
+                else []
+            )
+            known_pnl = [p["pnl"] for p in positions if p.get("pnl") is not None]
+            total_pnl = (
+                sum(known_pnl)
+                if position_snapshot.quality is SnapshotQuality.COMPLETE
+                and len(known_pnl) == len(positions)
+                else None
+            )
 
-            calculated_used_margin = 0
+            calculated_used_margin = 0.0
+            used_margin_known = position_snapshot.quality is SnapshotQuality.COMPLETE
             for p in positions:
                 if p.get("quantity", 0) != 0:
                     multiplier = 0.2 if p.get("product") == "MIS" else 1.0
-                    avg_price = p.get("average_price", 0)
-                    if avg_price == 0:
+                    avg_price = p.get("average_price")
+                    if avg_price is None:
                         avg_price = (
-                            p.get("buy_price", 0)
+                            p.get("buy_price")
                             if p.get("quantity", 0) > 0
-                            else p.get("sell_price", 0)
+                            else p.get("sell_price")
                         )
+                    if avg_price is None or avg_price <= 0:
+                        used_margin_known = False
+                        continue
                     calculated_used_margin += (
                         abs(p.get("quantity", 0)) * avg_price * multiplier
                     )
 
-            used_margin = calculated_used_margin
+            used_margin = calculated_used_margin if used_margin_known else None
 
             # Count trades and win rate based on realized positions (quantity == 0) and open positions
-            trades_today = len(positions)
+            counts = journal.get_todays_trade_counts()
+            trades_today = counts["total"]
+            verified_today = journal.get_verified_todays_outcomes()
             winning_trades = sum(
-                1 for p in positions if p.get("pnl", p.get("m2m", 0)) > 0
+                1 for trade in verified_today if (trade.get("net_pnl") or 0) > 0
             )
-            win_rate = (winning_trades / trades_today * 100) if trades_today > 0 else 0
+            losing_trades = sum(
+                1 for trade in verified_today if (trade.get("net_pnl") or 0) <= 0
+            )
+            win_rate = (
+                winning_trades / len(verified_today) * 100 if verified_today else 0
+            )
 
             summary = {
-                "totalPnl": round(total_pnl, 2),
-                "netPnl": round(risk_manager.daily_pnl, 2),
+                "totalPnl": round(total_pnl, 2) if total_pnl is not None else None,
+                "netPnl": (
+                    round(risk_manager.daily_pnl, 2)
+                    if risk_manager.accounting_quality != "UNAVAILABLE"
+                    else None
+                ),
                 "tradesToday": trades_today,
                 "winRate": round(win_rate, 2),
+                "winningTrades": winning_trades,
+                "losingTrades": losing_trades,
                 "availableMargin": available_margin,
                 "usedMargin": used_margin,
                 "killSwitchActive": risk_manager.kill_switch_active,
@@ -319,16 +384,14 @@ def handle_request(req):
             if not strategy:
                 return error(-32602, f"Strategy {strategy_id} not found")
 
-            import datetime
-
             import pandas as pd
 
             from .backtesting.backtest_engine import BacktestEngine
             from .backtesting.metrics_evaluator import MetricsEvaluator
 
             # Fetch data (mocking the date range based on days parameter)
-            now = datetime.datetime.now()
-            from_date = now - datetime.timedelta(days=days)
+            now = now_utc()
+            from_date = now - timedelta(days=days)
 
             instruments = kite_client.get_instruments("NSE")
             instrument_map = {

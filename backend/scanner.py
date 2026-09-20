@@ -25,6 +25,7 @@ from .strategies.supertrend import SupertrendStrategy
 from .strategies.tsi_cross import TSICrossStrategy
 from .strategies.vwap_bounce import VWAPBounceStrategy
 from .strategies.williams_r import WilliamsRStrategy
+from .time_utils import now_utc
 from .utils import push_log
 
 
@@ -80,13 +81,17 @@ class Scanner:
     def _fetch_candles(
         self, instrument_token: int, tradingsymbol: str
     ) -> Tuple[pd.DataFrame, bool]:
-        now = datetime.datetime.now()
+        now = now_utc()
 
         # Use cache if less than 1 minute old
         if (
             instrument_token in self.candle_cache
             and (
-                now - self.last_cache_time.get(instrument_token, datetime.datetime.min)
+                now
+                - self.last_cache_time.get(
+                    instrument_token,
+                    datetime.datetime.min.replace(tzinfo=datetime.timezone.utc),
+                )
             ).seconds
             < 60
         ):

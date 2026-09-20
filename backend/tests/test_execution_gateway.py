@@ -13,6 +13,17 @@ class FakeRisk:
     def can_trade(self):
         return self._can_trade, self._reason
 
+    def validate_entry_reservation(
+        self, reservation_id, symbol, direction, quantity, price
+    ):
+        return True
+
+    def bind_entry_order(self, reservation_id, broker_order_id):
+        return True
+
+    def release_entry_reservation(self, reservation_id):
+        pass
+
 
 class FakeConfig:
     def get_risk_config(self):
@@ -48,7 +59,9 @@ def test_gateway_rejects_if_risk_manager_fails(monkeypatch):
     monkeypatch.setattr("backend.execution_gateway.kite_client", FakeKite())
 
     with pytest.raises(Exception, match="Risk check failed: Max Loss Reached"):
-        execution_gateway.place_order(tradingsymbol="RELIANCE", is_entry=True)
+        execution_gateway.place_order(
+            tradingsymbol="RELIANCE", is_entry=True, entry_reservation_id="res1"
+        )
 
 
 def test_gateway_allows_if_risk_manager_passes(monkeypatch):
@@ -57,7 +70,9 @@ def test_gateway_allows_if_risk_manager_passes(monkeypatch):
     monkeypatch.setattr("backend.execution_gateway.journal", FakeJournal())
     monkeypatch.setattr("backend.execution_gateway.kite_client", FakeKite())
 
-    order_id = execution_gateway.place_order(tradingsymbol="RELIANCE", is_entry=True)
+    order_id = execution_gateway.place_order(
+        tradingsymbol="RELIANCE", is_entry=True, entry_reservation_id="res1"
+    )
     assert order_id == "12345"
 
 
@@ -70,7 +85,9 @@ def test_gateway_max_daily_trades(monkeypatch):
     monkeypatch.setattr("backend.execution_gateway.kite_client", FakeKite())
 
     with pytest.raises(Exception, match="Max daily trades"):
-        execution_gateway.place_order(tradingsymbol="RELIANCE", is_entry=True)
+        execution_gateway.place_order(
+            tradingsymbol="RELIANCE", is_entry=True, entry_reservation_id="res1"
+        )
 
 
 def test_gateway_max_symbol_trades(monkeypatch):
@@ -83,7 +100,9 @@ def test_gateway_max_symbol_trades(monkeypatch):
     monkeypatch.setattr("backend.execution_gateway.kite_client", FakeKite())
 
     with pytest.raises(Exception, match="Max trades per symbol"):
-        execution_gateway.place_order(tradingsymbol="RELIANCE", is_entry=True)
+        execution_gateway.place_order(
+            tradingsymbol="RELIANCE", is_entry=True, entry_reservation_id="res1"
+        )
 
 
 def test_gateway_cooldown(monkeypatch):
@@ -98,7 +117,9 @@ def test_gateway_cooldown(monkeypatch):
     monkeypatch.setattr("backend.execution_gateway.kite_client", FakeKite())
 
     with pytest.raises(Exception, match="Cooldown period active"):
-        execution_gateway.place_order(tradingsymbol="RELIANCE", is_entry=True)
+        execution_gateway.place_order(
+            tradingsymbol="RELIANCE", is_entry=True, entry_reservation_id="res1"
+        )
 
 
 def test_gateway_emergency_exit(monkeypatch):

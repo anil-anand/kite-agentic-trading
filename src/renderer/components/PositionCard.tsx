@@ -8,7 +8,7 @@ interface Props {
 }
 
 const PositionCard: React.FC<Props> = ({ position, onExit }) => {
-  const isProfit = position.pnl >= 0;
+  const isProfit = position.pnl != null && position.pnl >= 0;
   
   return (
     <div className="bg-surface-800 rounded-lg p-4 border border-surface-700 flex flex-col gap-3 transition-transform hover:-translate-y-1">
@@ -28,17 +28,17 @@ const PositionCard: React.FC<Props> = ({ position, onExit }) => {
         </div>
         <div>
           <div className="text-surface-400">Avg</div>
-          <div className="font-mono text-white">₹{position.averagePrice.toFixed(2)}</div>
+          <div className="font-mono text-white">{position.averagePrice != null ? `₹${position.averagePrice.toFixed(2)}` : 'Unavailable'}</div>
         </div>
         <div>
           <div className="text-surface-400">LTP</div>
-          <div className="font-mono text-white">₹{position.lastPrice.toFixed(2)}</div>
+          <div className="font-mono text-white">{position.lastPrice != null ? `₹${position.lastPrice.toFixed(2)}` : 'Unavailable'}</div>
         </div>
       </div>
       <div className="mt-2 pt-2 border-t border-surface-700 flex justify-between items-center">
         <span className="text-surface-400 text-sm">P&L</span>
-        <div className={`font-mono font-bold ${isProfit ? 'text-profit-light' : 'text-loss-light'}`}>
-          {isProfit ? '+' : ''}₹{position.pnl.toFixed(2)}
+        <div className={`font-mono font-bold ${position.pnl == null ? 'text-surface-300' : isProfit ? 'text-profit-light' : 'text-loss-light'}`}>
+          {position.pnl == null ? 'Unavailable' : `${isProfit ? '+' : ''}₹${position.pnl.toFixed(2)}`}
         </div>
       </div>
     </div>

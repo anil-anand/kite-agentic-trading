@@ -1,10 +1,11 @@
-import datetime
 import threading
 
+from .broker_models import OrderRole, OrderSubmissionUnknown
 from .config import config_manager
 from .journal import journal
 from .kite_client import kite_client
 from .risk_manager import risk_manager
+from .time_utils import as_utc, now_utc
 from .utils import push_log
 
 
@@ -20,77 +21,93 @@ class ExecutionGateway:
         Applies risk checks and handles duplicate entry prevention.
         """
         symbol = kwargs.get("tradingsymbol")
-
-        # We need to distinguish between entry orders and protective/exit orders.
         is_entry = kwargs.pop("is_entry", False)
+        reservation_id = kwargs.pop("entry_reservation_id", None)
+        requested_role = kwargs.pop(
+            "order_role", OrderRole.ENTRY if is_entry else OrderRole.UNKNOWN
+        )
 
-        # 1. Evaluate general trading eligibility
-        # Wait, if it is an exit or a stop loss being placed, we shouldn't block it
-        # if max daily loss is reached. We actually *want* exits to happen.
-        # But wait, `can_trade` returns False if max daily loss is hit.
-        # So if we are placing a protective stop or an exit limit, we must NOT block it.
-        if is_entry:
-            can_trade, reason = risk_manager.can_trade()
-            if not can_trade:
-                push_log(
-                    f"ExecutionGateway rejected entry order for {symbol}: {reason}",
-                    level="warning",
-                )
-                raise Exception(f"Risk check failed: {reason}")
+        if not is_entry:
+            return self._submit_order(symbol, requested_role, kwargs)
 
-            risk_config = config_manager.get_risk_config()
-            max_daily_trades = risk_config.get("maxDailyTrades", 10)
-            max_symbol_trades = risk_config.get("maxTradesPerSymbolPerDay", 2)
-            cooldown_mins = risk_config.get("tradeCooldownMins", 15)
-
-            todays_counts = journal.get_todays_trade_counts()
-            if todays_counts["total"] >= max_daily_trades:
-                msg = f"Max daily trades ({max_daily_trades}) reached."
-                push_log(
-                    f"ExecutionGateway rejected entry for {symbol}: {msg}",
-                    level="warning",
-                )
-                raise Exception(msg)
-
-            if todays_counts["by_symbol"].get(symbol, 0) >= max_symbol_trades:
-                msg = f"Max trades per symbol ({max_symbol_trades}) reached today for {symbol}."
-                push_log(
-                    f"ExecutionGateway rejected entry for {symbol}: {msg}",
-                    level="warning",
-                )
-                raise Exception(msg)
-
-            last_exit = journal.get_last_exit_time(symbol)
-            if last_exit:
-                mins_since_exit = (
-                    datetime.datetime.now() - last_exit
-                ).total_seconds() / 60
-                if mins_since_exit < cooldown_mins:
-                    msg = f"Cooldown period active ({mins_since_exit:.1f}/{cooldown_mins} mins)."
-                    push_log(
-                        f"ExecutionGateway rejected entry for {symbol}: {msg}",
-                        level="warning",
-                    )
-                    raise Exception(msg)
-
-            with self._gateway_lock:
+        broker_call_started = False
+        with self._gateway_lock:
+            try:
                 if symbol in self._pending_entries:
-                    msg = f"Duplicate entry prevention: {symbol} is already pending."
-                    push_log(msg, level="warning")
-                    raise Exception(msg)
+                    raise Exception(
+                        f"Duplicate entry prevention: {symbol} is already pending."
+                    )
                 self._pending_entries.add(symbol)
 
+                if not reservation_id or not risk_manager.validate_entry_reservation(
+                    reservation_id=reservation_id,
+                    symbol=symbol,
+                    direction=kwargs.get("transaction_type"),
+                    quantity=kwargs.get("quantity"),
+                    price=kwargs.get("price"),
+                ):
+                    raise Exception(
+                        "Entry requires a valid server-side risk reservation"
+                    )
+
+                can_trade, reason = risk_manager.can_trade()
+                if not can_trade:
+                    raise Exception(f"Risk check failed: {reason}")
+
+                risk_config = config_manager.get_risk_config()
+                max_daily_trades = risk_config.get("maxDailyTrades", 10)
+                max_symbol_trades = risk_config.get("maxTradesPerSymbolPerDay", 2)
+                cooldown_mins = risk_config.get("tradeCooldownMins", 15)
+                todays_counts = journal.get_todays_trade_counts()
+                if todays_counts["total"] >= max_daily_trades:
+                    raise Exception(f"Max daily trades ({max_daily_trades}) reached.")
+                if todays_counts["by_symbol"].get(symbol, 0) >= max_symbol_trades:
+                    raise Exception(
+                        f"Max trades per symbol ({max_symbol_trades}) reached "
+                        f"today for {symbol}."
+                    )
+
+                last_exit = journal.get_last_exit_time(symbol)
+                if last_exit:
+                    normalized_last_exit = as_utc(last_exit)
+                    mins_since_exit = (
+                        now_utc() - normalized_last_exit
+                    ).total_seconds() / 60
+                    if mins_since_exit < cooldown_mins:
+                        raise Exception(
+                            f"Cooldown period active "
+                            f"({mins_since_exit:.1f}/{cooldown_mins} mins)."
+                        )
+
+                broker_call_started = True
+                order_id = self._submit_order(symbol, OrderRole.ENTRY, kwargs)
+                risk_manager.bind_entry_order(reservation_id, order_id)
+                return order_id
+            except Exception as exc:
+                if not broker_call_started:
+                    risk_manager.release_entry_reservation(reservation_id)
+                push_log(
+                    f"ExecutionGateway rejected/failed entry for {symbol}: {exc}",
+                    level="warning" if not broker_call_started else "error",
+                )
+                if broker_call_started:
+                    raise OrderSubmissionUnknown(
+                        f"Entry submission outcome is unknown for {symbol}: {exc}"
+                    ) from exc
+                raise
+            finally:
+                self._pending_entries.discard(symbol)
+
+    def _submit_order(self, symbol, order_role, kwargs):
         try:
-            order_id = kite_client.place_order(**kwargs)
+            order_id = kite_client.place_order(order_role=order_role, **kwargs)
             push_log(f"ExecutionGateway: Order {order_id} placed for {symbol}")
             return order_id
-        except Exception as e:
-            push_log(f"ExecutionGateway: Order failed for {symbol}: {e}", level="error")
-            raise e
-        finally:
-            if is_entry:
-                with self._gateway_lock:
-                    self._pending_entries.discard(symbol)
+        except Exception as exc:
+            push_log(
+                f"ExecutionGateway: Order failed for {symbol}: {exc}", level="error"
+            )
+            raise
 
     def modify_order(self, **kwargs):
         """
@@ -137,7 +154,7 @@ class ExecutionGateway:
         )
 
         try:
-            order_id = kite_client.place_order(**kwargs)
+            order_id = kite_client.place_order(order_role=OrderRole.REDUCTION, **kwargs)
             push_log(
                 f"ExecutionGateway: Emergency order {order_id} placed for {symbol}"
             )

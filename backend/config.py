@@ -2,10 +2,13 @@ import datetime
 import json
 import os
 import tempfile
+import threading
 from copy import deepcopy
 from pathlib import Path
 
 from cryptography.fernet import Fernet
+
+from .time_utils import as_utc
 
 
 class ConfigManager:
@@ -14,6 +17,7 @@ class ConfigManager:
         self.config_file = self.config_dir / "config.json"
         self.key_file = self.config_dir / ".key"
         self.config = {}
+        self._state_file_lock = threading.RLock()
 
         self.default_config = {
             "risk": {
@@ -289,56 +293,83 @@ class ConfigManager:
         return self.config.get("watchlist", self.default_config["watchlist"])
 
     def get_app_order_ids(self) -> set:
-        path = self.config_dir / "app_orders.json"
-        if path.exists():
-            try:
-                with open(path, "r") as f:
-                    return set(json.load(f))
-            except Exception:
-                return set()
-        return set()
+        with self._state_file_lock:
+            path = self.config_dir / "app_orders.json"
+            if path.exists():
+                try:
+                    with open(path, "r") as f:
+                        return {str(order_id) for order_id in json.load(f)}
+                except Exception:
+                    return set()
+            return set()
 
-    def add_app_order_id(self, order_id: str):
+    def get_app_order_roles(self) -> dict[str, str]:
+        with self._state_file_lock:
+            legacy_ids = self.get_app_order_ids()
+            path = self.config_dir / "app_order_roles.json"
+            roles = {}
+            if path.exists():
+                try:
+                    with open(path, "r") as f:
+                        loaded = json.load(f)
+                    if isinstance(loaded, dict):
+                        roles = {
+                            str(order_id): str(role).upper()
+                            for order_id, role in loaded.items()
+                        }
+                except Exception:
+                    roles = {}
+            for order_id in legacy_ids:
+                roles.setdefault(order_id, "UNKNOWN")
+            return roles
+
+    def add_app_order_id(self, order_id: str, role: str = "UNKNOWN"):
         if not order_id:
             return
-        orders = self.get_app_order_ids()
-        orders.add(str(order_id))
-        path = self.config_dir / "app_orders.json"
-        with open(path, "w") as f:
-            json.dump(list(orders), f)
+        normalized_role = str(role).upper()
+        if normalized_role not in {"ENTRY", "PROTECTION", "REDUCTION", "UNKNOWN"}:
+            normalized_role = "UNKNOWN"
+        with self._state_file_lock:
+            orders = self.get_app_order_ids()
+            orders.add(str(order_id))
+            path = self.config_dir / "app_orders.json"
+            self._atomic_write_json(path, sorted(orders))
+
+            roles = self.get_app_order_roles()
+            roles[str(order_id)] = normalized_role
+            self._atomic_write_json(self.config_dir / "app_order_roles.json", roles)
 
     def get_historical_orders(self) -> dict:
-        path = self.config_dir / "historical_orders.json"
-        if path.exists():
-            try:
-                with open(path, "r") as f:
-                    return json.load(f)
-            except Exception:
-                return {}
-        return {}
+        with self._state_file_lock:
+            path = self.config_dir / "historical_orders.json"
+            if path.exists():
+                try:
+                    with open(path, "r") as f:
+                        loaded = json.load(f)
+                    return loaded if isinstance(loaded, dict) else {}
+                except Exception:
+                    return {}
+            return {}
 
     def save_historical_orders(self, orders: dict):
-        path = self.config_dir / "historical_orders.json"
-        with open(path, "w") as f:
-            json.dump(orders, f, indent=4, default=str)
+        with self._state_file_lock:
+            path = self.config_dir / "historical_orders.json"
+            self._atomic_write_json(path, orders)
 
     def save_active_trades(self, trades: dict):
         """Persist the trading engine's active_trades to disk.
 
-        entry_time is a datetime; it's stored as an ISO string and restored by
-        load_active_trades so the engine can resume managing positions after a
-        crash or restart.
+        Execution, observation and reevaluation timestamps are stored as ISO
+        strings and restored by load_active_trades after a crash or restart.
         """
         path = self.config_dir / "active_trades.json"
         serializable = {}
         for symbol, trade in trades.items():
             record = dict(trade)
-            entry_time = record.get("entry_time")
-            if isinstance(entry_time, (datetime.datetime, datetime.date)):
-                record["entry_time"] = entry_time.isoformat()
-            last_reeval = record.get("last_reeval_time")
-            if isinstance(last_reeval, (datetime.datetime, datetime.date)):
-                record["last_reeval_time"] = last_reeval.isoformat()
+            for field in ("entry_time", "entry_observed_at", "last_reeval_time"):
+                timestamp = record.get(field)
+                if isinstance(timestamp, (datetime.datetime, datetime.date)):
+                    record[field] = timestamp.isoformat()
             serializable[symbol] = record
         self._atomic_write_json(path, serializable)
 
@@ -368,7 +399,7 @@ class ConfigManager:
             raise
 
     def load_active_trades(self) -> dict:
-        """Load persisted active_trades, restoring entry_time to a datetime.
+        """Restore known timestamps while preserving unknown execution times.
 
         Returns {} if there's nothing persisted or the file is unreadable —
         the engine reconciles against live positions regardless.
@@ -382,21 +413,14 @@ class ConfigManager:
         except Exception:
             return {}
         for trade in trades.values():
-            entry_time = trade.get("entry_time")
-            if isinstance(entry_time, str):
+            for field in ("entry_time", "entry_observed_at", "last_reeval_time"):
+                if field not in trade:
+                    continue
+                timestamp = trade[field]
                 try:
-                    trade["entry_time"] = datetime.datetime.fromisoformat(entry_time)
-                except ValueError:
-                    trade["entry_time"] = datetime.datetime.now()
-
-            last_reeval_time = trade.get("last_reeval_time")
-            if isinstance(last_reeval_time, str):
-                try:
-                    trade["last_reeval_time"] = datetime.datetime.fromisoformat(
-                        last_reeval_time
-                    )
-                except ValueError:
-                    trade["last_reeval_time"] = trade["entry_time"]
+                    trade[field] = as_utc(timestamp) if timestamp is not None else None
+                except (TypeError, ValueError):
+                    trade[field] = None
         return trades
 
     def save_daily_risk_state(self, state: dict):

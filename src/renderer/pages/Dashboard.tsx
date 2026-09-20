@@ -4,10 +4,13 @@ import { useKiteAPI } from '../hooks/useKiteAPI';
 import PnLDisplay from '../components/PnLDisplay';
 import PositionCard from '../components/PositionCard';
 import { Activity } from 'lucide-react';
+import type { Position } from '@shared/types';
 
 const Dashboard: React.FC = () => {
   const { dashboard, positions, agentState, activityLog, setDashboard, setPositions } = useTradingStore();
   const { startAgent, stopAgent } = useKiteAPI();
+  const [positionQuality, setPositionQuality] = React.useState<string | null>(null);
+  const [summaryQuality, setSummaryQuality] = React.useState<string | null>(null);
 
   const handleToggleAgent = async () => {
     try {
@@ -26,16 +29,51 @@ const Dashboard: React.FC = () => {
   React.useEffect(() => {
     const fetchData = async () => {
       if (!useTradingStore.getState().auth.isLoggedIn) return;
-      try {
-        const summary = await window.electronAPI?.dashboard.summary();
-        if (summary) setDashboard(summary);
-        
-        const posResponse = await window.electronAPI?.portfolio.positions();
-        if (posResponse && posResponse.net) {
-           setPositions(posResponse.net);
+      const [summaryResult, positionsResult] = await Promise.allSettled([
+        window.electronAPI?.dashboard.summary() ?? Promise.reject(new Error('Dashboard summary API unavailable')),
+        window.electronAPI?.portfolio.positions() ?? Promise.reject(new Error('Positions API unavailable')),
+      ]);
+
+      if (summaryResult.status === 'fulfilled' && summaryResult.value) {
+        setDashboard(summaryResult.value);
+        setSummaryQuality(null);
+      } else {
+        setSummaryQuality('UNAVAILABLE');
+        if (summaryResult.status === 'rejected') {
+          console.error('Failed to fetch dashboard summary:', summaryResult.reason);
         }
-      } catch (err: any) {
-        console.error("Failed to fetch dashboard data:", err.message || JSON.stringify(err));
+      }
+
+      if (positionsResult.status !== 'fulfilled' || !positionsResult.value) {
+        setPositionQuality('UNAVAILABLE');
+        if (positionsResult.status === 'rejected') {
+          console.error('Failed to fetch positions:', positionsResult.reason);
+        }
+        return;
+      }
+
+      const posResponse: any = positionsResult.value;
+      const quality = posResponse.snapshotQuality ?? 'COMPLETE';
+      setPositionQuality(quality);
+      if (!Array.isArray(posResponse.net)) return;
+      if (quality === 'COMPLETE') {
+        // Only a complete empty snapshot proves the account is flat.
+        setPositions(posResponse.net);
+      } else if (posResponse.net.length > 0) {
+        // A partial response may omit rows.  Overlay the rows it did provide
+        // while retaining last-known rows instead of showing a false flat book.
+        const incoming = new Map<string, Position>(posResponse.net.map((p: any): [string, Position] => [
+          p.positionKey ?? `${p.namespace ?? ''}:${p.accountId ?? ''}:${p.exchange}:${p.tradingsymbol}:${p.product}`,
+          p as Position,
+        ]));
+        const retained: Position[] = useTradingStore.getState().positions.map((p) => {
+          const key = p.positionKey ?? `${p.namespace ?? ''}:${p.accountId ?? ''}:${p.exchange}:${p.tradingsymbol}:${p.product}`;
+          return incoming.get(key) ?? p;
+        });
+        const retainedKeys = new Set(retained.map((p) => p.positionKey ?? `${p.namespace ?? ''}:${p.accountId ?? ''}:${p.exchange}:${p.tradingsymbol}:${p.product}`));
+        setPositions([...retained, ...posResponse.net.filter((p: any) => !retainedKeys.has(
+          p.positionKey ?? `${p.namespace ?? ''}:${p.accountId ?? ''}:${p.exchange}:${p.tradingsymbol}:${p.product}`,
+        ))]);
       }
     };
     fetchData();
@@ -50,14 +88,20 @@ const Dashboard: React.FC = () => {
   return (
     <div className="p-6 space-y-6 h-full overflow-auto">
       <h1 className="text-2xl font-bold text-white">Dashboard</h1>
+      {((positionQuality && positionQuality !== 'COMPLETE') || summaryQuality ||
+        (dashboard?.reconciliationStatus && dashboard.reconciliationStatus !== 'RECONCILED')) && (
+        <div className="rounded border border-amber-700/60 bg-amber-900/20 p-3 text-sm text-amber-200">
+          Broker data is degraded or pending reconciliation. Risk and P&amp;L values may be unavailable.
+        </div>
+      )}
       
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
         <PnLDisplay 
-          amount={dashboard?.totalPnl || 0} 
+          amount={dashboard?.totalPnl ?? null}
           netAmount={dashboard?.netPnl}
           percentage={
-            ((dashboard?.availableMargin || 0) + (dashboard?.usedMargin || 0)) > 0 
-              ? ((dashboard?.netPnl ?? dashboard?.totalPnl ?? 0) / ((dashboard?.availableMargin || 0) + (dashboard?.usedMargin || 0))) * 100 
+            ((dashboard?.availableMargin ?? 0) + (dashboard?.usedMargin ?? 0)) > 0 && dashboard?.netPnl != null
+              ? (dashboard.netPnl / ((dashboard.availableMargin ?? 0) + (dashboard.usedMargin ?? 0))) * 100
               : undefined
           } 
         />
@@ -74,14 +118,19 @@ const Dashboard: React.FC = () => {
         
         <div className="bg-surface-800 p-4 rounded-xl border border-surface-700 flex flex-col justify-center">
           <span className="text-surface-400 text-sm mb-1">Available Margin</span>
-          <span className="text-3xl font-mono text-white font-bold">₹{(dashboard?.availableMargin || 0).toFixed(2)}</span>
+          <span className="text-3xl font-mono text-white font-bold">{dashboard?.availableMargin != null ? `₹${dashboard.availableMargin.toFixed(2)}` : 'Unavailable'}</span>
         </div>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <div className="lg:col-span-2 space-y-4">
           <h2 className="text-xl font-semibold text-white">Open Positions</h2>
-          {positions.filter(p => p.quantity !== 0).length === 0 ? (
+          {positions.filter(p => p.quantity !== 0).length === 0 && positionQuality !== 'COMPLETE' ? (
+            <div className="bg-surface-800 border border-amber-700/60 rounded-xl p-8 flex flex-col items-center justify-center text-amber-200 h-48">
+              <Activity size={48} className="mb-4 opacity-40" />
+              <p>Open positions unavailable</p>
+            </div>
+          ) : positions.filter(p => p.quantity !== 0).length === 0 ? (
             <div className="bg-surface-800 border border-surface-700 rounded-xl p-8 flex flex-col items-center justify-center text-surface-400 h-48">
               <Activity size={48} className="mb-4 opacity-20" />
               <p>No open positions</p>

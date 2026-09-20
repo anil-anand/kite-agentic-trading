@@ -1,24 +1,33 @@
+import math
 import uuid
+from dataclasses import replace
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from kiteconnect import KiteConnect
 
+from .broker_models import (
+    BrokerSnapshot,
+    ExecutionNamespace,
+    FillSnapshot,
+    OrderRole,
+    OrderSnapshot,
+    PositionSnapshot,
+    SnapshotQuality,
+    fill_snapshot_to_renderer_dto,
+    normalize_fills_response,
+    normalize_orders_response,
+    normalize_positions_response,
+    order_snapshot_to_renderer_dto,
+    order_to_backend_dict,
+    parse_broker_timestamp,
+    position_snapshot_to_renderer_dto,
+    unavailable_fill_snapshot,
+    unavailable_order_snapshot,
+    unavailable_position_snapshot,
+)
 from .request_policy import Priority, broker_gateway
-
-
-def to_camel(s):
-    parts = s.split("_")
-    return parts[0] + "".join(word.capitalize() for word in parts[1:])
-
-
-def convert_keys(obj):
-    if isinstance(obj, list):
-        return [convert_keys(i) for i in obj]
-    elif isinstance(obj, dict):
-        return {to_camel(k): convert_keys(v) for k, v in obj.items()}
-    else:
-        return obj
+from .time_utils import EXCHANGE_TIMEZONE
 
 
 class KiteClient:
@@ -30,15 +39,38 @@ class KiteClient:
             cls._instance.kite = None
             cls._instance.instruments_cache = None
             cls._instance.access_token = None
+            cls._instance.account_id = "UNKNOWN"
+            cls._instance.namespace = ExecutionNamespace.LIVE
         return cls._instance
 
     def init(self, api_key: str):
+        self.account_id = "UNKNOWN"
+        self.access_token = None
         self.kite = KiteConnect(api_key=api_key)
 
     def set_access_token(self, access_token: str):
+        if access_token != self.access_token:
+            self.account_id = "UNKNOWN"
         if self.kite:
             self.kite.set_access_token(access_token)
             self.access_token = access_token
+        else:
+            self.access_token = access_token
+
+    def refresh_account_id(self) -> str:
+        """Load the broker account identity after restoring an access token."""
+
+        if not self.kite or not self.access_token:
+            self.account_id = "UNKNOWN"
+            return self.account_id
+        try:
+            profile = broker_gateway.execute(
+                self.kite.profile, priority=Priority.RECONCILE
+            )
+            self.account_id = str(profile.get("user_id") or "UNKNOWN")
+        except Exception:
+            self.account_id = "UNKNOWN"
+        return self.account_id
 
     def login_url(self) -> str:
         if self.kite:
@@ -50,48 +82,200 @@ class KiteClient:
             raise Exception("Kite client not initialized")
         session = self.kite.generate_session(request_token, api_secret)
         self.set_access_token(session["access_token"])
+        self.account_id = "UNKNOWN"
+        self.refresh_account_id()
         return session
 
-    def get_positions(self) -> Dict[str, Any]:
+    def get_positions_snapshot(self) -> PositionSnapshot:
         if not self.kite:
-            return {"net": [], "day": []}
-        res = broker_gateway.execute(self.kite.positions, priority=Priority.RECONCILE)
-        return convert_keys(res)
+            return unavailable_position_snapshot("Kite client is not initialized")
+        try:
+            res = broker_gateway.execute(
+                self.kite.positions, priority=Priority.RECONCILE
+            )
+            snapshot = normalize_positions_response(
+                res,
+                namespace=self.namespace,
+                account_id=self.account_id,
+            )
+            return self._attach_timestamped_marks(snapshot)
+        except Exception as exc:
+            return unavailable_position_snapshot(exc)
 
-    def get_orders(self) -> List[Dict[str, Any]]:
+    def _attach_timestamped_marks(self, snapshot: PositionSnapshot) -> PositionSnapshot:
+        """Enrich positions with exchange/last-trade time from full quotes.
+
+        Kite position rows normally expose ``last_price`` but no mark time.
+        The position HTTP receipt time is not a market timestamp, so an
+        unavailable quote intentionally leaves the mark unknown and blocks new
+        risk while reductions remain possible.
+        """
+
+        positions = list(snapshot.net)
+        if not positions:
+            return snapshot
+        instruments = [
+            f"{position.key.exchange}:{position.key.tradingsymbol}"
+            for position in positions
+        ]
+        try:
+            quotes = self.get_quote(instruments)
+        except Exception:
+            return snapshot
+        enriched = []
+        for position in positions:
+            quote = quotes.get(
+                f"{position.key.exchange}:{position.key.tradingsymbol}", {}
+            )
+            if not isinstance(quote, dict):
+                enriched.append(position)
+                continue
+            try:
+                mark_time = parse_broker_timestamp(
+                    quote.get("last_trade_time")
+                    or quote.get("lastTradeTime")
+                    or quote.get("timestamp")
+                )
+            except (TypeError, ValueError):
+                mark_time = None
+            mark = quote.get("last_price", quote.get("lastPrice"))
+            try:
+                mark = float(mark)
+            except (TypeError, ValueError):
+                mark = None
+            # Price and timestamp are one observation.  Do not pair a fresh
+            # quote timestamp with a fallback position price: that would make
+            # an old/unknown mark look admission-fresh.  ``bool`` is numeric
+            # in Python but never a valid broker price.
+            if (
+                isinstance(quote.get("last_price", quote.get("lastPrice")), bool)
+                or mark is None
+                or not math.isfinite(mark)
+                or mark <= 0
+                or mark_time is None
+            ):
+                enriched.append(position)
+                continue
+            enriched.append(replace(position, last_price=mark, mark_time=mark_time))
+        return replace(snapshot, net=tuple(enriched))
+
+    def get_positions(self) -> Dict[str, Any]:
+        """Compatibility renderer DTO; domain code uses ``get_positions_snapshot``."""
+
+        return position_snapshot_to_renderer_dto(self.get_positions_snapshot())
+
+    def get_current_orders_snapshot(self) -> OrderSnapshot:
         from .config import config_manager
 
         if not self.kite:
-            return []
-
-        res = broker_gateway.execute(self.kite.orders, priority=Priority.RECONCILE)
-        app_orders = config_manager.get_app_order_ids()
-
-        historical = config_manager.get_historical_orders()
-        for o in res:
-            o_id = str(o.get("order_id"))
-            historical[o_id] = o
-
-        config_manager.save_historical_orders(historical)
-        all_orders = list(historical.values())
-
-        def get_ts(order):
-            return str(
-                order.get("order_timestamp") or order.get("exchange_timestamp") or ""
+            return unavailable_order_snapshot("Kite client is not initialized")
+        try:
+            res = broker_gateway.execute(self.kite.orders, priority=Priority.RECONCILE)
+            return normalize_orders_response(
+                res,
+                namespace=self.namespace,
+                account_id=self.account_id,
+                roles_by_order_id=config_manager.get_app_order_roles(),
             )
+        except Exception as exc:
+            return unavailable_order_snapshot(exc)
 
-        all_orders.sort(key=get_ts, reverse=True)
+    def get_orders(self) -> List[Dict[str, Any]]:
+        """Display history DTO; risk code uses only the current order snapshot."""
 
-        for o in all_orders:
-            o["is_app_order"] = str(o.get("order_id")) in app_orders
+        return order_snapshot_to_renderer_dto(self.get_order_history_snapshot())
 
-        return convert_keys(all_orders)
+    def get_order_history_snapshot(
+        self, current_snapshot: Optional[OrderSnapshot] = None
+    ) -> OrderSnapshot:
+        """Return display history without allowing it to become current truth."""
+
+        from .config import config_manager
+
+        current = current_snapshot or self.get_current_orders_snapshot()
+        roles = config_manager.get_app_order_roles()
+        historical = config_manager.get_historical_orders()
+
+        if current.quality is SnapshotQuality.COMPLETE:
+            for order in current.orders:
+                historical[order.broker_order_id] = order_to_backend_dict(order)
+            config_manager.save_historical_orders(historical)
+
+        archive = normalize_orders_response(
+            historical.values(),
+            namespace=self.namespace,
+            account_id=self.account_id,
+            roles_by_order_id=roles,
+        )
+        current_ids = {order.broker_order_id for order in current.orders}
+        current_orders = tuple(
+            replace(order, is_archived=False) for order in current.orders
+        )
+        archived_orders = tuple(
+            replace(order, is_archived=True)
+            for order in archive.orders
+            if order.broker_order_id not in current_ids
+        )
+        orders = sorted(
+            current_orders + archived_orders,
+            key=lambda order: (
+                order.order_time or order.exchange_time or current.fetched_at
+            ),
+            reverse=True,
+        )
+        errors = tuple(current.errors) + tuple(archive.errors)
+        if current.quality is SnapshotQuality.UNAVAILABLE:
+            quality = SnapshotQuality.STALE if orders else SnapshotQuality.UNAVAILABLE
+        elif current.quality is not SnapshotQuality.COMPLETE:
+            quality = current.quality
+        elif archive.quality is SnapshotQuality.PARTIAL:
+            quality = SnapshotQuality.PARTIAL
+        else:
+            quality = SnapshotQuality.COMPLETE
+        return OrderSnapshot(
+            orders=tuple(orders),
+            quality=quality,
+            fetched_at=current.fetched_at,
+            errors=errors,
+            snapshot_id=current.snapshot_id,
+        )
+
+    def get_fills_snapshot(self) -> FillSnapshot:
+        if not self.kite:
+            return unavailable_fill_snapshot("Kite client is not initialized")
+        try:
+            res = broker_gateway.execute(self.kite.trades, priority=Priority.RECONCILE)
+            return normalize_fills_response(
+                res,
+                namespace=self.namespace,
+                account_id=self.account_id,
+            )
+        except Exception as exc:
+            return unavailable_fill_snapshot(exc)
 
     def get_trades(self) -> List[Dict[str, Any]]:
-        if not self.kite:
-            return []
-        res = broker_gateway.execute(self.kite.trades, priority=Priority.RECONCILE)
-        return convert_keys(res)
+        return fill_snapshot_to_renderer_dto(self.get_fills_snapshot())
+
+    def get_broker_snapshot(self) -> BrokerSnapshot:
+        positions = self.get_positions_snapshot()
+        orders = self.get_current_orders_snapshot()
+        fills = self.get_fills_snapshot()
+        return BrokerSnapshot(
+            namespace=self.namespace,
+            account_id=self.account_id,
+            positions=positions.net,
+            day_positions=positions.day,
+            current_orders=orders.orders,
+            fills=fills.fills,
+            positions_quality=positions.quality,
+            orders_quality=orders.quality,
+            fills_quality=fills.quality,
+            fetched_at=max(positions.fetched_at, orders.fetched_at, fills.fetched_at),
+            errors=positions.errors + orders.errors + fills.errors,
+            positions_fetched_at=positions.fetched_at,
+            orders_fetched_at=orders.fetched_at,
+            fills_fetched_at=fills.fetched_at,
+        )
 
     def place_order(
         self,
@@ -102,6 +286,7 @@ class KiteClient:
         quantity,
         product,
         order_type,
+        order_role=OrderRole.UNKNOWN,
         **kwargs,
     ) -> str:
         from .config import config_manager
@@ -151,6 +336,14 @@ class KiteClient:
                     return str(o.get("order_id"))
             return None
 
+        try:
+            role = (
+                order_role
+                if isinstance(order_role, OrderRole)
+                else OrderRole(str(order_role).upper())
+            )
+        except ValueError:
+            role = OrderRole.UNKNOWN
         order_id = broker_gateway.execute(
             self.kite.place_order,
             priority=Priority.ORDER,
@@ -166,7 +359,8 @@ class KiteClient:
             tag=idempotency_tag,
             **kwargs,
         )
-        config_manager.add_app_order_id(order_id)
+        order_id = str(order_id)
+        config_manager.add_app_order_id(order_id, role.value)
         return order_id
 
     def cancel_order(self, variety, order_id, parent_order_id=None):
@@ -217,6 +411,12 @@ class KiteClient:
         if not self.kite:
             return []
 
+        # KiteConnect formats datetime objects with ``strftime`` and therefore
+        # discards their timezone offset.  Convert UTC/internal timestamps to
+        # exchange wall time at this shared broker boundary so every caller
+        # serializes the intended IST trading interval.
+        from_date = self._historical_boundary_in_exchange_time(from_date)
+        to_date = self._historical_boundary_in_exchange_time(to_date)
         return broker_gateway.execute(
             self.kite.historical_data,
             priority=Priority.ANALYTICS,
@@ -227,6 +427,22 @@ class KiteClient:
             continuous=continuous,
             oi=oi,
         )
+
+    @staticmethod
+    def _historical_boundary_in_exchange_time(value):
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                return value.replace(tzinfo=EXCHANGE_TIMEZONE)
+            return value.astimezone(EXCHANGE_TIMEZONE)
+        if isinstance(value, str):
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                return value
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=EXCHANGE_TIMEZONE)
+            return parsed.astimezone(EXCHANGE_TIMEZONE)
+        return value
 
     def get_instruments(self, exchange=None):
         if not self.instruments_cache:

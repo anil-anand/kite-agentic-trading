@@ -2,6 +2,8 @@ import sqlite3
 from pathlib import Path
 from typing import Optional, Tuple
 
+from .financial_eligibility import verified_outcome_sql
+
 
 class ProbabilityCalibrator:
     def __init__(self, db_path: str = None):
@@ -29,13 +31,16 @@ class ProbabilityCalibrator:
             bucket_min = (signal_score // 10) * 10
             bucket_max = bucket_min + 9
 
+            columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(trades)").fetchall()
+            }
             query = """
                 SELECT direction, entry_price, target, stop_loss, exit_price
                 FROM trades
-                WHERE status = 'CLOSED'
+                WHERE {eligible}
                   AND strategy = ?
                   AND confidence >= ? AND confidence <= ?
-            """
+            """.format(eligible=verified_outcome_sql(columns))
             rows = conn.execute(query, (strategy, bucket_min, bucket_max)).fetchall()
 
             sample_size = len(rows)

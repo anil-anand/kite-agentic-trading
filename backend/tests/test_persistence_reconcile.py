@@ -14,6 +14,7 @@ import pytest
 
 import backend.trading_engine as te
 from backend.config import config_manager
+from backend.time_utils import as_utc
 from backend.trading_engine import TradingEngine
 
 # ---------------------------------------------------------------------------
@@ -23,12 +24,81 @@ from backend.trading_engine import TradingEngine
 
 class FakeKiteClient:
     def __init__(self):
+        self.account_id = "dummy"
+        from backend.broker_models import ExecutionNamespace
+
+        self.namespace = ExecutionNamespace.LIVE
         self.positions = {"net": []}
         self.orders = []
         self.place_calls = []
         self.cancel_calls = []
         self.flatten_calls = []
         self._next_id = 1
+
+    def get_broker_snapshot(self):
+        import datetime
+
+        from backend.broker_models import (
+            BrokerSnapshot,
+            ExecutionNamespace,
+            SnapshotQuality,
+            normalize_orders_response,
+            normalize_positions_response,
+        )
+
+        positions = normalize_positions_response(
+            self.positions, namespace=ExecutionNamespace.LIVE, account_id="dummy"
+        )
+        orders = normalize_orders_response(
+            self.orders, namespace=ExecutionNamespace.LIVE, account_id="dummy"
+        )
+        return BrokerSnapshot(
+            namespace=ExecutionNamespace.LIVE,
+            account_id="dummy",
+            positions=positions.net,
+            day_positions=positions.day,
+            current_orders=orders.orders,
+            fills=tuple(),
+            positions_quality=SnapshotQuality.COMPLETE,
+            orders_quality=SnapshotQuality.COMPLETE,
+            fills_quality=SnapshotQuality.COMPLETE,
+            fetched_at=datetime.datetime.now(datetime.timezone.utc),
+            errors=[],
+        )
+
+    def get_positions_snapshot(self):
+        from backend.broker_models import (
+            normalize_positions_response,
+        )
+
+        payload = self.get_positions()
+        payload = {
+            "net": [
+                dict(
+                    row,
+                    instrument_token=111 if row["tradingsymbol"] == "RELIANCE" else 222,
+                )
+                for row in payload["net"]
+            ]
+        }
+        payload["day"] = list(payload["net"])
+        return normalize_positions_response(
+            payload, namespace=self.namespace, account_id=self.account_id
+        )
+
+    def get_current_orders_snapshot(self):
+        from backend.broker_models import ExecutionNamespace, normalize_orders_response
+
+        return normalize_orders_response(
+            self.orders, namespace=ExecutionNamespace.LIVE, account_id="dummy"
+        )
+
+    def get_fills_snapshot(self):
+        from backend.broker_models import ExecutionNamespace, normalize_fills_response
+
+        return normalize_fills_response(
+            [], namespace=ExecutionNamespace.LIVE, account_id="dummy"
+        )
 
     def place_order(self, **kwargs):
         self.place_calls.append(kwargs)
@@ -39,7 +109,18 @@ class FakeKiteClient:
         )
         qty = kwargs.get("quantity", 0) if status == "COMPLETE" else 0
         self.orders.append(
-            {"orderId": oid, "order_id": oid, "status": status, "filledQuantity": qty}
+            {
+                "orderId": oid,
+                "order_id": oid,
+                "status": status,
+                "quantity": kwargs.get("quantity", 0),
+                "filledQuantity": qty,
+                "tradingsymbol": kwargs.get("tradingsymbol", "RELIANCE"),
+                "exchange": kwargs.get("exchange", "NSE"),
+                "product": kwargs.get("product", "MIS"),
+                "transaction_type": kwargs.get("transaction_type", "SELL"),
+                "order_type": kwargs.get("order_type", "SL"),
+            }
         )
         return oid
 
@@ -84,9 +165,17 @@ class FakeRiskManager:
     def update_from_positions(self, positions):
         pass
 
+    def update_from_position_snapshot(self, snapshot):
+        pass
+
 
 def _trade(**over):
     base = {
+        "tradingsymbol": "RELIANCE",
+        "namespace": "LIVE",
+        "account_id": "dummy",
+        "instrument_id": "111",
+        "product": "MIS",
         "sl": 95.0,
         "target": 110.0,
         "direction": "BUY",
@@ -138,7 +227,7 @@ class TestConfigPersistence:
         assert r["stop_order_id"] == "STOP1"
         # entry_time restored as a datetime, equal to what we saved.
         assert isinstance(r["entry_time"], datetime.datetime)
-        assert r["entry_time"] == datetime.datetime(2026, 9, 2, 10, 0, 0)
+        assert r["entry_time"] == as_utc(datetime.datetime(2026, 9, 2, 10, 0, 0))
 
     def test_load_missing_file_returns_empty(self, isolated_config_dir):
         assert config_manager.load_active_trades() == {}
@@ -153,12 +242,44 @@ class TestConfigPersistence:
         loaded = config_manager.load_active_trades()
         assert loaded["RELIANCE"]["entry_time"] is None
 
-    def test_bad_entry_time_string_falls_back_to_now(self, isolated_config_dir):
+    def test_bad_entry_time_stays_unknown(self, isolated_config_dir):
         (isolated_config_dir / "active_trades.json").write_text(
             '{"RELIANCE": {"entry_time": "not-a-date", "direction": "BUY"}}'
         )
         loaded = config_manager.load_active_trades()
-        assert isinstance(loaded["RELIANCE"]["entry_time"], datetime.datetime)
+        assert loaded["RELIANCE"]["entry_time"] is None
+
+    def test_observation_time_survives_restart_without_inventing_execution_time(
+        self, isolated_config_dir
+    ):
+        observed = as_utc(datetime.datetime(2026, 9, 2, 10, 0))
+        config_manager.save_active_trades(
+            {"RELIANCE": _trade(entry_time=None, entry_observed_at=observed)}
+        )
+        loaded = config_manager.load_active_trades()["RELIANCE"]
+        assert loaded["entry_time"] is None
+        assert loaded["entry_observed_at"] == observed
+        assert (
+            observed.isoformat()
+            in (isolated_config_dir / "active_trades.json").read_text()
+        )
+
+    @pytest.mark.parametrize("bad_timestamp", ["not-a-date", True, 123, []])
+    def test_invalid_persisted_times_remain_unknown(
+        self, isolated_config_dir, bad_timestamp
+    ):
+        config_manager.save_active_trades(
+            {
+                "RELIANCE": _trade(
+                    entry_time=bad_timestamp,
+                    entry_observed_at=bad_timestamp,
+                    last_reeval_time=bad_timestamp,
+                )
+            }
+        )
+        loaded = config_manager.load_active_trades()["RELIANCE"]
+        for field in ("entry_time", "entry_observed_at", "last_reeval_time"):
+            assert loaded[field] is None
 
     def test_write_is_atomic_no_temp_file_left(self, isolated_config_dir):
         config_manager.save_active_trades({"RELIANCE": _trade()})
@@ -200,6 +321,21 @@ class TestConfigPersistence:
 
 def _setup_reconcile(monkeypatch, persisted, positions_net, orders):
     fake_client = FakeKiteClient()
+    for o in orders:
+        if "tradingsymbol" not in o:
+            o["tradingsymbol"] = "RELIANCE"
+        if "order_id" not in o:
+            o["order_id"] = o.get("orderId", "ORD1")
+        if "exchange" not in o:
+            o["exchange"] = "NSE"
+        if "product" not in o:
+            o["product"] = "MIS"
+        if "transaction_type" not in o:
+            o["transaction_type"] = "SELL"
+        if "order_type" not in o:
+            o["order_type"] = "SL"
+        if "quantity" not in o:
+            o["quantity"] = 10
     fake_client.positions = {"net": positions_net}
     fake_client.orders = orders
     monkeypatch.setattr(te, "execution_gateway", fake_client)
@@ -381,7 +517,7 @@ def test_reconcile_drops_on_direction_flip(monkeypatch):
 
 def test_reconcile_isolates_a_malformed_record(monkeypatch):
     # BAD is missing 'sl', which raises when re-placing its stop. It must be
-    # skipped without aborting reconciliation of GOOD.
+    # retained as an unresolved ownership obligation without aborting GOOD.
     good = _trade(stop_order_id="GOODSTOP")
     bad = _trade(stop_order_id=None)
     del bad["sl"]
@@ -396,12 +532,14 @@ def test_reconcile_isolates_a_malformed_record(monkeypatch):
     )
     engine.reconcile_active_trades()
     assert "GOOD" in engine.active_trades
-    assert "BAD" not in engine.active_trades
+    assert engine.active_trades["BAD"]["broker_reconciliation_pending"] is True
+    assert engine._reconciliation_pending is True
 
 
 def test_reconcile_flattens_trade_when_stop_replace_fails(monkeypatch):
-    # If re-placing the protective stop fails, it triggers emergency flatten
-    # and removes the trade from active_trades.
+    # If re-placing the protective stop fails before an order id is returned,
+    # it triggers emergency flatten but retains ownership until flatness is
+    # independently confirmed.
     engine, fake_client, _ = _setup_reconcile(
         monkeypatch,
         persisted={"RELIANCE": _trade(stop_order_id=None)},
@@ -415,7 +553,8 @@ def test_reconcile_flattens_trade_when_stop_replace_fails(monkeypatch):
     fake_client.place_order = boom
     engine.reconcile_active_trades()
 
-    assert "RELIANCE" not in engine.active_trades
+    assert engine.active_trades["RELIANCE"]["broker_reconciliation_pending"] is True
+    assert engine._reconciliation_pending is True
     assert fake_client.flatten_calls == ["RELIANCE"]
 
 

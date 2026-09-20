@@ -3,7 +3,7 @@ import { useTradingStore } from '../stores/trading-store';
 
 const StatusBar: React.FC = () => {
   const { auth, connectionStatus, agentState, dashboard } = useTradingStore();
-  const pnl = dashboard?.totalPnl || 0;
+  const pnl = dashboard?.totalPnl ?? null;
 
   // Simple IST check
   const isMarketOpen = () => {
@@ -51,8 +51,8 @@ const StatusBar: React.FC = () => {
       </div>
       <div className="flex items-center gap-2">
         <span className="text-surface-400">Today's P&L:</span>
-        <span className={`font-bold ${pnl >= 0 ? 'text-profit-light' : 'text-loss-light'}`}>
-          ₹{pnl.toFixed(2)}
+        <span className={`font-bold ${pnl == null ? 'text-surface-300' : pnl >= 0 ? 'text-profit-light' : 'text-loss-light'}`}>
+          {pnl == null ? 'Unavailable' : `₹${pnl.toFixed(2)}`}
         </span>
       </div>
     </div>

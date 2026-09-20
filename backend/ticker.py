@@ -1,4 +1,3 @@
-import datetime
 import json
 import random
 import sys
@@ -7,6 +6,7 @@ import time
 
 from .dev_mode import is_dev_mode
 from .kite_client import kite_client
+from .time_utils import now_utc
 from .utils import DateTimeEncoder
 from .utils import stdout_lock as _stdout_lock
 
@@ -31,7 +31,11 @@ class TickerManager:
         if self.running:
             return
 
-        self._dev = is_dev_mode()
+        # Tests and the dev session use explicit sentinel credentials.  Treat
+        # those as synthetic mode even when the module-level environment flag
+        # was imported before the test changed it; never open a websocket for
+        # the sentinel pair.
+        self._dev = is_dev_mode() or (api_key == "dev" and access_token == "dev")
         if self._dev:
             # No real websocket in dev mode — emit synthetic ticks for whatever
             # tokens get subscribed, using the mock client for base prices.
@@ -111,7 +115,7 @@ class TickerManager:
                 "lastPrice": round(last_price, 2),
                 "changePercent": round(change_percent, 2),
                 "volume": volume,
-                "timestamp": datetime.datetime.now().isoformat(),
+                "timestamp": now_utc().isoformat(),
             },
         }
         with _stdout_lock:

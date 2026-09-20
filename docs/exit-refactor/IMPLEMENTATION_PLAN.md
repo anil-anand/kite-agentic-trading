@@ -94,6 +94,31 @@ the same essential admission checks; contract tests cover Python-to-renderer DTO
 by actual risk limits. Entry indicator formulas and normal exit policy remain the
 comparison control while foundation defects are corrected.
 
+**Implementation evidence:** the canonical broker, accounting, journal, RPC,
+admission and lifecycle suites in `backend/tests/` exercise the production
+adapters through synthetic SDK records and temporary storage. They cover missing
+prices and timestamps, stale marks, partial/unknown executions, reducer exposure,
+durable ownership/linkage, transaction rollback, cooldowns and restart recovery.
+`test_execution_accounting_integrity.py` additionally checks that incomplete entry
+ledgers cannot become verified outcomes, actual fill prices replace signal-price
+fallbacks, late execution times repair the journal, and unknown execution time
+does not disable existing thesis timers. Renderer polling scenarios in `tests/`
+exercise complete, partial and unavailable snapshots through the real components.
+`test_session_accounting_admission.py` checks execution/turnover agreement,
+per-order fee grouping and daily-loss enforcement from the admission snapshot;
+`test_entry_boundary_contracts.py` covers malformed proposal prices. The DEV
+adapter tests use the same canonical identity and mark contracts.
+Normal entry indicators and exit thresholds remain the comparison control.
+
+**Final phase-1 validation:** 620 Python tests and both renderer polling tests
+passed. Ruff lint/format, frontend lint/typecheck, an isolated full frontend build,
+and `git diff --check` passed. Frontend lint retains four existing unused-symbol
+warnings. No real broker calls or orders were used.
+
+This phase does not authorize live promotion: the CRITICAL phase-2 stop-fill/cancel
+handoff and separate [F26 DEV/account storage isolation](REPOSITORY_AUDIT.md#f26--dev-trading-is-not-isolated-from-live-persistent-state)
+gates remain open.
+
 ## Phase 2 — Recoverable order intents, residual fills and protective-stop handoff
 
 **Responsibility:** an exit/protection action must not duplicate, reverse or abandon

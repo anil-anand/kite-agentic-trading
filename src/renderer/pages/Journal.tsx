@@ -137,7 +137,19 @@ const Journal: React.FC = () => {
                       {t.direction}
                     </span>
                   </td>
-                  <td className="p-4 text-surface-200">{t.strategy}</td>
+                  <td className="p-4 text-surface-200">
+                    {t.strategy}
+                    {t.status !== 'CLOSED' && (
+                      <span className="ml-2 rounded bg-amber-900/40 px-2 py-1 text-[10px] text-amber-200">
+                        {t.status.replace('_', ' ')}
+                      </span>
+                    )}
+                    {t.financial_quality && t.financial_quality !== 'RECONCILED' && (
+                      <span className="ml-2 rounded bg-surface-700 px-2 py-1 text-[10px] text-surface-300">
+                        {t.financial_quality}
+                      </span>
+                    )}
+                  </td>
                   <td className="p-4 text-surface-300">{new Date(t.entry_time).toLocaleString()}</td>
                   <td className="p-4 text-surface-200">₹{t.entry_price?.toFixed(2)}</td>
                   <td className="p-4 text-surface-200">{t.exit_price ? `₹${t.exit_price.toFixed(2)}` : '-'}</td>
