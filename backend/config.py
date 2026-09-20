@@ -135,6 +135,21 @@ class ConfigManager:
                 "policyVersion": "order-lifecycle-v1",
                 "workingAttemptTimeoutSeconds": 15,
             },
+            # Causal market-data semantics are versioned separately from entry
+            # formulas.  The zero availability delay preserves the current
+            # completed-bar boundary while still making a future operational
+            # delay explicit and replayable.
+            "marketContext": {
+                "policyVersion": "market-context-v1",
+                "primaryIntervalMinutes": 5,
+                "higherIntervalMinutes": 15,
+                "availabilityDelaySeconds": 0,
+                "maxPrimaryAgeSeconds": 600,
+                "maxHigherAgeSeconds": 1200,
+                "setupRangeBars": 20,
+                "swingConfirmationBars": 2,
+                "regimeTransitionConfirmBars": 2,
+            },
         }
 
         self.in_memory_credentials = {}
@@ -306,6 +321,11 @@ class ConfigManager:
 
     def get_order_lifecycle_config(self):
         return self.config.get("orderLifecycle", self.default_config["orderLifecycle"])
+
+    def get_market_context_config(self):
+        return deepcopy(
+            self.config.get("marketContext", self.default_config["marketContext"])
+        )
 
     def get_watchlist(self):
         return self.config.get("watchlist", self.default_config["watchlist"])

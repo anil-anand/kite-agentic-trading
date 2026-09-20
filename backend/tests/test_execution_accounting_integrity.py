@@ -152,7 +152,10 @@ def test_unknown_execution_time_does_not_disable_existing_thesis_reevaluation(
     monkeypatch.setattr(
         engine_module.scanner,
         "evaluate_position",
-        lambda *args: evaluated.append(args) or {"buy_signals": 0, "sell_signals": 2},
+        lambda *args: (
+            evaluated.append(args)
+            or {"assessment_available": True, "buy_signals": 0, "sell_signals": 2}
+        ),
     )
     monkeypatch.setattr(
         restarted,

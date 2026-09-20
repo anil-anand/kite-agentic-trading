@@ -264,6 +264,17 @@ existing entry calculation behavior is characterized for any intended semantic c
 **Expected behavior:** normal management waits for usable completed context.
 Hard supervision continues regardless. No new indicators are needed.
 
+**Implementation/review evidence:** [PHASE4_REVIEW.md](PHASE4_REVIEW.md) records the
+pre-commit findings, corrections and scope. `market-context-v1` supplies causal
+5m/15m bars, source availability/quality, revision identity, known-at structure and
+raw/persistent regime context. The existing scanner and legacy normal controls
+consume validated inputs; missing volume remains unknown separately from price.
+The intended common VWAP change is tagged `session_typical_price_v1`; mirrored
+entry characterization records its effect on the existing five-point breakout
+alignment bonus without changing signal geometry. Final offline validation:
+**875 Python tests**, Ruff lint/format and `git diff --check` passed. No commit,
+broker order, or candidate-policy promotion was performed by the review.
+
 ## Phase 5 — Immutable thesis, lifecycle state and replayable journal
 
 **Responsibility:** make the position remember its premise and history; implement

@@ -4221,18 +4221,43 @@ class TradingEngine:
             if not token:
                 return False
 
-            # Fetch recent candles (use cache where available)
-            df, _ = scanner._fetch_candles(token, symbol)
-            if df is None or df.empty or len(df) < lookback + 2:
+            # The legacy rejection control shares the same causal boundary as
+            # other normal decisions. A raw penultimate row can be stale,
+            # incomplete, or a rejection that happened before this trade.
+            context = scanner.get_market_context(token, symbol)
+            if not context.normal_decision_eligible:
                 return False
-
-            # We calculate resistance/support from the lookback window *prior* to the last completed candle.
-            # Then we check if the last completed candle tested that level but failed to close beyond it.
-            past_candles = df.iloc[-(lookback + 2) : -2]
-            last_candle = df.iloc[-2]
-
-            if len(past_candles) < 5:
+            df = context.primary_frame()
+            if len(df) < lookback + 1:
                 return False
+            bar = context.primary_bar
+            with self._trade_lock:
+                trade = self.active_trades.get(symbol, {})
+                entered_at = as_utc(
+                    trade.get("entry_time") or trade.get("entry_observed_at")
+                )
+                last_review = as_utc(trade.get("last_resistance_bar_start"))
+                if (
+                    not trade
+                    or entered_at is None
+                    or bar.start < entered_at
+                    or (last_review is not None and bar.start <= last_review)
+                    or trade.get("direction") != direction
+                    or trade.get("exit_pending")
+                    or trade.get("entry_state") == "RECOVERY_REQUIRED"
+                    or trade.get("execution_linkage_pending")
+                    or trade.get("ownership_quarantined")
+                    or self._hard_flatten_reason
+                ):
+                    return False
+                # Use chronological bar identity: a later correction to the
+                # same interval is not a second live trading opportunity.
+                trade["last_resistance_bar_start"] = bar.start.isoformat()
+                target = trade.get("target", 0)
+                entry_price = trade.get("entry_price", 0)
+
+            past_candles = df.iloc[-(lookback + 1) : -1]
+            last_candle = df.iloc[-1]
 
             if direction == "BUY":
                 # Resistance = highest high over lookback
@@ -4243,12 +4268,8 @@ class TradingEngine:
                 last_close = last_candle["close"]
 
                 if last_high >= resistance and last_close < resistance:
-                    with self._trade_lock:
-                        trade = self.active_trades.get(symbol, {})
-                        target = trade.get("target", 0)
                     # Only trigger if resistance is between entry and target
                     # (don't exit prematurely if resistance is below entry)
-                    entry_price = trade.get("entry_price", 0)
                     if (
                         entry_price > 0
                         and resistance > entry_price
@@ -4267,10 +4288,6 @@ class TradingEngine:
                 last_close = last_candle["close"]
 
                 if last_low <= support and last_close > support:
-                    with self._trade_lock:
-                        trade = self.active_trades.get(symbol, {})
-                        target = trade.get("target", 0)
-                    entry_price = trade.get("entry_price", 0)
                     if entry_price > 0 and support < entry_price and support > target:
                         self._push_log(
                             f"Support exit check for {symbol}: support ₹{support:.2f}, "
@@ -4446,6 +4463,24 @@ class TradingEngine:
                 evaluation = scanner.evaluate_position(symbol, token)
             except Exception as e:
                 self._push_log(f"Error evaluating {symbol}: {e}")
+                continue
+
+            # A failed/stale/incomplete market-context response is not an
+            # opposing strategy vote.  Protective stops and the independent
+            # hard-risk supervisor continue to manage the position; only the
+            # legacy discretionary re-evaluation waits for a usable completed
+            # context. Availability must be affirmative, including when an
+            # enabled strategy failed to calculate its evidence.
+            if evaluation.get("assessment_available") is not True:
+                context = evaluation.get("market_context", {})
+                self._push_log(
+                    f"Skipping normal re-evaluation for {symbol}: market context "
+                    f"{context.get('primary_quality', 'UNAVAILABLE')}.",
+                    level="warning",
+                )
+                # An outage is not a completed review. Retry on the next
+                # management cycle instead of postponing recovered evidence by
+                # the ordinary (potentially 30-minute) review interval.
                 continue
 
             with self._trade_lock:

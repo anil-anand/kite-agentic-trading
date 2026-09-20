@@ -1,5 +1,7 @@
 """Tests for KITE_DEV_MODE: the flag, the mock client, and the session bypass."""
 
+import pandas as pd
+
 import backend.kite_client as kc
 import backend.main as m
 from backend.broker_models import OrderRole
@@ -379,6 +381,10 @@ class TestCoversScanUniverse:
         # what the random-walk mock candles happen to produce.
         first_sym = watchlist[0]
         uptrend_df = build_candles(np.linspace(100, 140, 60))
+        decision = (
+            uptrend_df["date"].iloc[-1] + pd.Timedelta(minutes=5)
+        ).to_pydatetime()
+        monkeypatch.setattr(sc, "now_utc", lambda: decision)
 
         _original_fetch = sc.scanner._fetch_candles
 
