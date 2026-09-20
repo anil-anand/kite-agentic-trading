@@ -1,7 +1,7 @@
 import math
 import uuid
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from kiteconnect import KiteConnect
@@ -12,6 +12,8 @@ from .broker_models import (
     FillSnapshot,
     OrderRole,
     OrderSnapshot,
+    OrderSubmissionRejected,
+    OrderSubmissionUnknown,
     PositionSnapshot,
     SnapshotQuality,
     fill_snapshot_to_renderer_dto,
@@ -291,49 +293,30 @@ class KiteClient:
     ) -> str:
         from .config import config_manager
 
-        # A short client-side idempotency tag lets the reconciler distinguish
-        # this order from previous orders with the same symbol/side/qty.
-        # Kite's `tag` field is free-form; we use the last 8 chars of a UUID.
-        idempotency_tag = f"ag{uuid.uuid4().hex[-6:]}"
-        placed_at = datetime.now(timezone.utc)
+        # The lifecycle coordinator supplies one durable tag per attempt.  A
+        # direct legacy caller still receives a fresh tag, but it must not be
+        # used to retry a prior unknown submission.
+        idempotency_tag = kwargs.pop("attempt_tag", None) or kwargs.pop("tag", None)
+        if not isinstance(idempotency_tag, str) or not idempotency_tag.strip():
+            idempotency_tag = f"ol{uuid.uuid4().hex[:18]}"
+        idempotency_tag = idempotency_tag.strip()
+        if len(idempotency_tag) > 20:
+            raise OrderSubmissionRejected(
+                "broker attempt tag must be at most 20 characters"
+            )
 
         def reconciler():
-            # Check if order was placed despite timeout.
-            # Narrow by tag first; fall back to attribute match + time window.
+            # Attribute/time matching can select another strategy or a prior
+            # manual order.  An exact durable tag is the only safe automatic
+            # reconciliation key; a missing tag remains UNKNOWN for recovery.
             orders = broker_gateway.execute(
                 self.kite.orders, priority=Priority.RECONCILE
             )
             for o in orders:
                 if str(o.get("tag", "")) == idempotency_tag:
-                    return str(o.get("order_id"))
-
-            # Tag may not be echoed by all Kite environments; fall back to
-            # attribute match restricted to orders placed in the last 60 s.
-            cutoff = placed_at
-            for o in orders:
-                ts_str = str(
-                    o.get("order_timestamp") or o.get("exchange_timestamp") or ""
-                )
-                try:
-                    ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                    if ts.tzinfo is None:
-                        # Kite returns IST-naive strings; treat as IST (+05:30)
-                        from datetime import timedelta
-
-                        ts = ts.replace(tzinfo=timezone(timedelta(hours=5, minutes=30)))
-                    if (ts - cutoff).total_seconds() < -60:
-                        continue  # order is too old to be ours
-                except (ValueError, TypeError):
-                    pass  # can't parse timestamp — skip time-window guard
-
-                if (
-                    o.get("tradingsymbol") == tradingsymbol
-                    and o.get("transaction_type") == transaction_type
-                    and o.get("quantity") == quantity
-                    and o.get("product") == product
-                    and o.get("order_type") == order_type
-                ):
-                    return str(o.get("order_id"))
+                    order_id = o.get("order_id") or o.get("orderId")
+                    if order_id:
+                        return str(order_id)
             return None
 
         try:
@@ -359,6 +342,8 @@ class KiteClient:
             tag=idempotency_tag,
             **kwargs,
         )
+        if isinstance(order_id, bool) or order_id is None or not str(order_id).strip():
+            raise OrderSubmissionUnknown("broker acknowledgement has no order ID")
         order_id = str(order_id)
         config_manager.add_app_order_id(order_id, role.value)
         return order_id
@@ -367,6 +352,7 @@ class KiteClient:
         return broker_gateway.execute(
             self.kite.cancel_order,
             priority=Priority.CRITICAL,
+            is_order=True,
             variety=variety,
             order_id=order_id,
             parent_order_id=parent_order_id,
@@ -376,6 +362,7 @@ class KiteClient:
         return broker_gateway.execute(
             self.kite.modify_order,
             priority=Priority.CRITICAL,
+            is_order=True,
             variety=variety,
             order_id=order_id,
             **kwargs,

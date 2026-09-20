@@ -124,6 +124,13 @@ class ConfigManager:
                 "maxTokens": 1024,
             },
             "mode": "auto",
+            # Execution recovery is independent of discretionary exit policy.
+            # Pinning this value makes lifecycle traces interpretable across
+            # future broker-capability changes.
+            "orderLifecycle": {
+                "policyVersion": "order-lifecycle-v1",
+                "workingAttemptTimeoutSeconds": 15,
+            },
         }
 
         self.in_memory_credentials = {}
@@ -189,8 +196,12 @@ class ConfigManager:
                 pass
 
     def save(self):
-        with open(self.config_file, "w") as f:
-            json.dump(self.config, f, indent=4)
+        # Settings and lifecycle metadata can be updated by independent
+        # recovery/control paths.  A complete JSON file is not the lifecycle
+        # source of truth (SQLite is), but it must never be torn or partially
+        # overwrite a compatible checkpoint on process interruption.
+        with self._state_file_lock:
+            self._atomic_write_json(self.config_file, self.config)
 
     def get_legacy_credentials(self):
         """Extract credentials from legacy encrypted config.json."""
@@ -288,6 +299,9 @@ class ConfigManager:
 
     def get_screener_config(self):
         return self.config.get("screener", self.default_config.get("screener", {}))
+
+    def get_order_lifecycle_config(self):
+        return self.config.get("orderLifecycle", self.default_config["orderLifecycle"])
 
     def get_watchlist(self):
         return self.config.get("watchlist", self.default_config["watchlist"])

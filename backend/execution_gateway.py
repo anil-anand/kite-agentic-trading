@@ -1,6 +1,10 @@
 import threading
 
-from .broker_models import OrderRole, OrderSubmissionUnknown
+from .broker_models import (
+    OrderRole,
+    OrderSubmissionRejected,
+    OrderSubmissionUnknown,
+)
 from .config import config_manager
 from .journal import journal
 from .kite_client import kite_client
@@ -83,6 +87,16 @@ class ExecutionGateway:
                 order_id = self._submit_order(symbol, OrderRole.ENTRY, kwargs)
                 risk_manager.bind_entry_order(reservation_id, order_id)
                 return order_id
+            except OrderSubmissionRejected:
+                # The broker/gateway established a definite rejection.  It is
+                # safe for the lifecycle coordinator to retain the intent and
+                # decide whether a corrected replacement is appropriate.
+                risk_manager.release_entry_reservation(reservation_id)
+                raise
+            except OrderSubmissionUnknown:
+                # Do not wrap or retry an explicitly ambiguous broker
+                # submission.  Its durable attempt tag is the recovery key.
+                raise
             except Exception as exc:
                 if not broker_call_started:
                     risk_manager.release_entry_reservation(reservation_id)
@@ -94,7 +108,7 @@ class ExecutionGateway:
                     raise OrderSubmissionUnknown(
                         f"Entry submission outcome is unknown for {symbol}: {exc}"
                     ) from exc
-                raise
+                raise OrderSubmissionRejected(str(exc)) from exc
             finally:
                 self._pending_entries.discard(symbol)
 

@@ -65,10 +65,17 @@ def test_admitted_numeric_prices_and_legacy_bad_target_do_not_strand_hard_stops(
         name: {"last_price": 90, "timestamp": now_utc()} for name in instruments
     }
     exits = []
+
+    def latch_exit(position, symbol, reason):
+        exits.append((symbol, reason))
+        # Match the real submission boundary's synchronous latch so recovery
+        # and price policy cannot issue competing decisions in one monitor pass.
+        e.engine.active_trades[symbol]["exit_pending"] = True
+
     monkeypatch.setattr(
         e.engine,
         "_place_exit_order",
-        lambda p, symbol, reason: exits.append((symbol, reason)),
+        latch_exit,
     )
     e.engine.monitor_positions()
     assert exits == [("RELIANCE", "Stop Loss"), ("INFY", "Stop Loss")]
@@ -301,7 +308,9 @@ def test_entry_execution_time_is_consistent_or_explicitly_unknown(
     assert as_utc(restarted.active_trades["RELIANCE"]["entry_time"]) == expected
 
 
-def mixed_exit(e, monkeypatch, *, missing_time=False, predecessors=False):
+def mixed_exit(
+    e, monkeypatch, *, missing_time=False, predecessors=False, missing_entry_time=False
+):
     first = (
         now_utc()
         .astimezone(EXCHANGE_TIMEZONE)
@@ -309,7 +318,9 @@ def mixed_exit(e, monkeypatch, *, missing_time=False, predecessors=False):
     )
     e.sdk.after_entry = lambda: (
         e.sdk.fill_entry(),
-        e.sdk.executions[0].update(fill_timestamp=first),
+        e.sdk.executions[0].update(
+            fill_timestamp=None if missing_entry_time else first
+        ),
     )
     assert e.engine.execute_signal(e.signal)
     e.sdk.position_rows[0].update(quantity=6, day_sell_quantity=4)
@@ -476,14 +487,13 @@ def test_unlinked_fills_still_require_a_known_entry_window(
     lifecycle, monkeypatch, unlinked_time
 ):
     e = lifecycle
-    first = mixed_exit(e, monkeypatch)
+    first = mixed_exit(
+        e, monkeypatch, missing_entry_time=unlinked_time == "unknown_entry"
+    )
     if unlinked_time == "before_entry":
         e.sdk.executions[1]["fill_timestamp"] = first - timedelta(minutes=1)
     elif unlinked_time == "missing":
         e.sdk.executions[1]["fill_timestamp"] = None
-    else:
-        e.sdk.executions[0]["fill_timestamp"] = None
-        e.engine.active_trades["RELIANCE"]["entry_time"] = None
     result = e.engine._reconcile_execution(
         "RELIANCE", e.engine.active_trades["RELIANCE"]
     )

@@ -237,6 +237,20 @@ class TestJournalExternalClose:
         j = FakeJournal()
         kite = FakeKite(
             ltp=95.0,
+            orders=[
+                {
+                    "order_id": "STOP1",
+                    "tradingsymbol": "RELIANCE",
+                    "exchange": "NSE",
+                    "product": "MIS",
+                    "transaction_type": "SELL",
+                    "order_type": "SL",
+                    "quantity": 10,
+                    "filled_quantity": 10,
+                    "pending_quantity": 0,
+                    "status": "COMPLETE",
+                }
+            ],
             trades=[
                 {
                     "tradingsymbol": "RELIANCE",
@@ -277,6 +291,20 @@ class TestJournalExternalClose:
             def __init__(self):
                 super().__init__(
                     ltp=95.0,
+                    orders=[
+                        {
+                            "order_id": "STOP1",
+                            "tradingsymbol": "RELIANCE",
+                            "exchange": "NSE",
+                            "product": "MIS",
+                            "transaction_type": "SELL",
+                            "order_type": "SL",
+                            "quantity": 10,
+                            "filled_quantity": 10,
+                            "pending_quantity": 0,
+                            "status": "COMPLETE",
+                        }
+                    ],
                     trades=[
                         {
                             "tradingsymbol": "RELIANCE",

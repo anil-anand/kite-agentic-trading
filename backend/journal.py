@@ -171,7 +171,95 @@ class TradeJournal:
                     details TEXT,
                     FOREIGN KEY(trade_id) REFERENCES trades(id)
                 );
+
+                -- ``order_lifecycle_v1`` is deliberately additive.  Trade
+                -- rows remain the financial journal; these records are the
+                -- durable execution obligation which exists *before* a trade
+                -- can have a verified fill or trade id.
+                CREATE TABLE IF NOT EXISTS journal_schema_migrations (
+                    version TEXT PRIMARY KEY,
+                    applied_at TIMESTAMP NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS order_intents (
+                    intent_id TEXT PRIMARY KEY,
+                    position_key TEXT NOT NULL,
+                    trade_id TEXT,
+                    intent_type TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    quantity INTEGER NOT NULL CHECK(quantity > 0),
+                    reason TEXT,
+                    payload TEXT NOT NULL DEFAULT '{}',
+                    state TEXT NOT NULL,
+                    state_version INTEGER NOT NULL,
+                    latched INTEGER NOT NULL DEFAULT 0,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    created_at TIMESTAMP NOT NULL,
+                    updated_at TIMESTAMP NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS order_attempts (
+                    attempt_id TEXT PRIMARY KEY,
+                    intent_id TEXT NOT NULL,
+                    attempt_tag TEXT NOT NULL UNIQUE,
+                    broker_order_id TEXT,
+                    state TEXT NOT NULL,
+                    state_version INTEGER NOT NULL,
+                    payload TEXT NOT NULL DEFAULT '{}',
+                    error TEXT,
+                    created_at TIMESTAMP NOT NULL,
+                    updated_at TIMESTAMP NOT NULL,
+                    FOREIGN KEY(intent_id) REFERENCES order_intents(intent_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_order_attempts_intent
+                    ON order_attempts(intent_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_order_attempts_broker_order
+                    ON order_attempts(broker_order_id);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_reduction_per_position
+                    ON order_intents(position_key)
+                    WHERE active = 1 AND intent_type IN ('EXIT', 'FLATTEN');
+
+                CREATE TABLE IF NOT EXISTS order_fill_ledger (
+                    broker_fill_id TEXT PRIMARY KEY,
+                    intent_id TEXT,
+                    attempt_id TEXT,
+                    broker_order_id TEXT NOT NULL,
+                    position_key TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    quantity INTEGER NOT NULL CHECK(quantity > 0),
+                    fill_price REAL,
+                    exchange_time TIMESTAMP,
+                    recorded_at TIMESTAMP NOT NULL,
+                    raw_fill TEXT NOT NULL DEFAULT '{}',
+                    FOREIGN KEY(intent_id) REFERENCES order_intents(intent_id),
+                    FOREIGN KEY(attempt_id) REFERENCES order_attempts(attempt_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_order_fill_ledger_order
+                    ON order_fill_ledger(broker_order_id);
+
+                CREATE TABLE IF NOT EXISTS order_lifecycle_events (
+                    id TEXT PRIMARY KEY,
+                    intent_id TEXT NOT NULL,
+                    attempt_id TEXT,
+                    timestamp TIMESTAMP NOT NULL,
+                    event_type TEXT NOT NULL,
+                    details TEXT NOT NULL,
+                    FOREIGN KEY(intent_id) REFERENCES order_intents(intent_id),
+                    FOREIGN KEY(attempt_id) REFERENCES order_attempts(attempt_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_lifecycle_events_attempt_time
+                    ON order_lifecycle_events(attempt_id, timestamp);
             """)
+
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO journal_schema_migrations(version, applied_at)
+                VALUES ('order_lifecycle_v1', ?)
+                """,
+                (now_utc().isoformat(),),
+            )
 
             # Backwards compatibility for existing DBs
             try:
@@ -255,6 +343,75 @@ class TradeJournal:
                   AND (exit_price IS NULL OR exit_price <= 0
                        OR exit_reason = 'UNRECONCILED')
                 """
+            )
+
+        self._migrate_lifecycle_fill_identity(conn)
+
+    @staticmethod
+    def _lifecycle_account_identity(position_key: str) -> tuple[str, str]:
+        """Extract the broker account scope without discarding the position epoch."""
+
+        parts = str(position_key).split(":", 2)
+        if len(parts) != 3 or any(value in {"", "UNKNOWN"} for value in parts[:2]):
+            raise ValueError("canonical namespace/account position key is required")
+        return parts[0], parts[1]
+
+    def _migrate_lifecycle_fill_identity(self, conn) -> None:
+        """Atomically retain v1 fills while scoping broker IDs to their account."""
+
+        with self._transaction(conn):
+            columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(order_fill_ledger)")
+            }
+            if "namespace" not in columns:
+                conn.execute(
+                    """
+                    CREATE TABLE order_fill_ledger_v2 (
+                        namespace TEXT NOT NULL,
+                        account_id TEXT NOT NULL,
+                        broker_fill_id TEXT NOT NULL,
+                        intent_id TEXT,
+                        attempt_id TEXT,
+                        broker_order_id TEXT NOT NULL,
+                        position_key TEXT NOT NULL,
+                        side TEXT NOT NULL,
+                        quantity INTEGER NOT NULL CHECK(quantity > 0),
+                        fill_price REAL,
+                        exchange_time TIMESTAMP,
+                        recorded_at TIMESTAMP NOT NULL,
+                        raw_fill TEXT NOT NULL DEFAULT '{}',
+                        PRIMARY KEY(namespace, account_id, broker_fill_id),
+                        FOREIGN KEY(intent_id) REFERENCES order_intents(intent_id),
+                        FOREIGN KEY(attempt_id) REFERENCES order_attempts(attempt_id)
+                    )
+                    """
+                )
+                cursor = conn.execute("SELECT * FROM order_fill_ledger")
+                names = [column[0] for column in cursor.description]
+                for values in cursor.fetchall():
+                    row = dict(zip(names, values))
+                    namespace, account_id = self._lifecycle_account_identity(
+                        row["position_key"]
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO order_fill_ledger_v2
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (namespace, account_id, *[row[name] for name in names]),
+                    )
+                conn.execute("DROP TABLE order_fill_ledger")
+                conn.execute(
+                    "ALTER TABLE order_fill_ledger_v2 RENAME TO order_fill_ledger"
+                )
+                conn.execute(
+                    "CREATE INDEX idx_order_fill_ledger_order "
+                    "ON order_fill_ledger(namespace, account_id, broker_order_id)"
+                )
+            conn.execute(
+                "INSERT OR IGNORE INTO journal_schema_migrations(version, applied_at) "
+                "VALUES ('order_lifecycle_fill_identity_v2', ?)",
+                (now_utc().isoformat(),),
             )
 
     def open_trade(
@@ -646,6 +803,948 @@ class TradeJournal:
             VALUES (?, ?, ?, ?, ?)
         """
         conn.execute(query, (event_id, trade_id, timestamp, event_type, details_str))
+
+    # Order-lifecycle persistence -------------------------------------------------
+    #
+    # The methods below intentionally use explicit state versions instead of
+    # treating an order acknowledgement as a trade close.  They are used by the
+    # phase-2 coordinator and are kept separate from ``trade_events`` because
+    # an entry intent can exist before there is a verified trade row to attach
+    # it to.
+
+    _ACTIVE_ATTEMPT_STATES = {
+        "PREPARED",
+        "SUBMITTING",
+        "ACKNOWLEDGED",
+        "WORKING",
+        "PARTIALLY_FILLED",
+        "CANCEL_PENDING",
+        "UNKNOWN",
+    }
+
+    def _lifecycle_event_inner(
+        self,
+        conn,
+        intent_id: str,
+        event_type: str,
+        details: Dict[str, Any],
+        attempt_id: Optional[str] = None,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO order_lifecycle_events
+                (id, intent_id, attempt_id, timestamp, event_type, details)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(uuid.uuid4()),
+                intent_id,
+                attempt_id,
+                now_utc().isoformat(),
+                event_type,
+                json.dumps(details, default=str, sort_keys=True),
+            ),
+        )
+
+    @staticmethod
+    def _lifecycle_row(row) -> Optional[Dict[str, Any]]:
+        if row is None:
+            return None
+        result = dict(row)
+        for field in ("payload",):
+            try:
+                result[field] = json.loads(result[field] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                result[field] = {}
+        result["latched"] = bool(result.get("latched"))
+        result["active"] = bool(result.get("active"))
+        return result
+
+    def create_order_intent(
+        self,
+        *,
+        intent_id: str,
+        position_key: str,
+        intent_type: str,
+        role: str,
+        side: str,
+        quantity: int,
+        trade_id: Optional[str] = None,
+        reason: Optional[str] = None,
+        payload: Optional[Dict[str, Any]] = None,
+        latched: bool = False,
+    ) -> Dict[str, Any]:
+        """Durably create an obligation before its first broker attempt.
+
+        Repeating the exact call is an idempotent crash-recovery operation;
+        changing any immutable identity/quantity field is rejected rather than
+        silently merging two broker obligations.
+        """
+
+        if not intent_id or not position_key:
+            raise ValueError("intent_id and position_key are required")
+        if isinstance(quantity, bool) or not isinstance(quantity, int) or quantity <= 0:
+            raise ValueError("intent quantity must be a positive integer")
+        intent_type = str(intent_type).upper()
+        role = str(role).upper()
+        side = str(side).upper()
+        if intent_type not in {"ENTER", "PROTECT", "TIGHTEN", "EXIT", "FLATTEN"}:
+            raise ValueError(f"unsupported intent type: {intent_type}")
+        if side not in {"BUY", "SELL"}:
+            raise ValueError("intent side must be BUY or SELL")
+        now = now_utc().isoformat()
+        payload_json = json.dumps(payload or {}, default=str, sort_keys=True)
+        conn = self._get_conn()
+        conn.row_factory = sqlite3.Row
+        with self._transaction(conn):
+            existing = conn.execute(
+                "SELECT * FROM order_intents WHERE intent_id = ?", (intent_id,)
+            ).fetchone()
+            if existing is not None:
+                immutable = {
+                    "position_key": position_key,
+                    "intent_type": intent_type,
+                    "role": role,
+                    "side": side,
+                    "quantity": quantity,
+                }
+                for field, expected in immutable.items():
+                    if str(existing[field]) != str(expected):
+                        raise ValueError(
+                            f"conflicting duplicate order intent {intent_id}: {field}"
+                        )
+                return self._lifecycle_row(existing)
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO order_intents(
+                        intent_id, position_key, trade_id, intent_type, role, side,
+                        quantity, reason, payload, state, state_version, latched,
+                        active, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PREPARED', 1, ?, 1, ?, ?)
+                    """,
+                    (
+                        intent_id,
+                        position_key,
+                        trade_id,
+                        intent_type,
+                        role,
+                        side,
+                        quantity,
+                        reason,
+                        payload_json,
+                        int(latched),
+                        now,
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                # The partial unique reduction index is the cross-process
+                # serialization primitive.  A concurrent creator receives the
+                # existing latched intent and must reconcile it rather than
+                # racing a new full-size reduction.
+                if intent_type not in {"EXIT", "FLATTEN"}:
+                    raise
+                winner = conn.execute(
+                    """
+                    SELECT * FROM order_intents
+                    WHERE position_key = ? AND active = 1
+                      AND intent_type IN ('EXIT', 'FLATTEN')
+                    ORDER BY created_at DESC LIMIT 1
+                    """,
+                    (position_key,),
+                ).fetchone()
+                if winner is None:
+                    raise
+                return self._lifecycle_row(winner)
+            self._lifecycle_event_inner(
+                conn,
+                intent_id,
+                "intent_prepared",
+                {
+                    "position_key": position_key,
+                    "intent_type": intent_type,
+                    "role": role,
+                    "side": side,
+                    "quantity": quantity,
+                    "latched": latched,
+                },
+            )
+            row = conn.execute(
+                "SELECT * FROM order_intents WHERE intent_id = ?", (intent_id,)
+            ).fetchone()
+        return self._lifecycle_row(row)
+
+    def get_order_intent(self, intent_id: str) -> Optional[Dict[str, Any]]:
+        conn = self._get_conn()
+        conn.row_factory = sqlite3.Row
+        return self._lifecycle_row(
+            conn.execute(
+                "SELECT * FROM order_intents WHERE intent_id = ?", (intent_id,)
+            ).fetchone()
+        )
+
+    def escalate_order_intent(self, intent_id: str, reason: str) -> Dict[str, Any]:
+        """Latch hard-exit urgency without losing the original exit decision."""
+
+        if not reason:
+            raise ValueError("hard-exit escalation requires a reason")
+        conn = self._get_conn()
+        conn.row_factory = sqlite3.Row
+        with self._transaction(conn):
+            row = conn.execute(
+                "SELECT * FROM order_intents WHERE intent_id = ?", (intent_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"unknown lifecycle intent {intent_id}")
+            intent = self._lifecycle_row(row)
+            if intent["intent_type"] not in {"EXIT", "FLATTEN"}:
+                raise ValueError("only a reduction intent can become a hard exit")
+            if not intent["active"]:
+                return intent
+            payload = intent["payload"]
+            if (
+                intent["intent_type"] == "FLATTEN"
+                and intent["latched"]
+                and intent["reason"] == reason
+                and payload.get("hard_exit_required")
+            ):
+                return intent
+            payload.setdefault("initiating_reason", intent["reason"])
+            payload["hard_exit_required"] = True
+            recovery = payload.get("recovery_trade")
+            if isinstance(recovery, dict):
+                recovery["exit_market_required"] = True
+                recovery["exit_reason"] = reason
+            conn.execute(
+                "UPDATE order_intents SET intent_type = 'FLATTEN', latched = 1, "
+                "reason = ?, payload = ?, state_version = state_version + 1, updated_at = ? "
+                "WHERE intent_id = ? AND state_version = ?",
+                (
+                    reason,
+                    json.dumps(payload, default=str, sort_keys=True),
+                    now_utc().isoformat(),
+                    intent_id,
+                    intent["state_version"],
+                ),
+            )
+            self._lifecycle_event_inner(
+                conn,
+                intent_id,
+                "hard_exit_escalated",
+                {"previous_reason": intent["reason"], "reason": reason},
+            )
+            return self._lifecycle_row(
+                conn.execute(
+                    "SELECT * FROM order_intents WHERE intent_id = ?", (intent_id,)
+                ).fetchone()
+            )
+
+    def update_protection_trigger(
+        self, intent_id: str, trigger_price: float, confirmed: bool = False
+    ) -> Dict[str, Any]:
+        """Persist modification uncertainty separately from confirmed protection."""
+
+        if (
+            isinstance(trigger_price, bool)
+            or not isinstance(trigger_price, (int, float))
+            or not math.isfinite(trigger_price)
+            or trigger_price <= 0
+        ):
+            raise ValueError("protection trigger must be finite and positive")
+        conn = self._get_conn()
+        conn.row_factory = sqlite3.Row
+        with self._transaction(conn):
+            row = conn.execute(
+                "SELECT * FROM order_intents WHERE intent_id = ?", (intent_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"unknown lifecycle intent {intent_id}")
+            intent = self._lifecycle_row(row)
+            if not intent["active"] or intent["intent_type"] not in {
+                "PROTECT",
+                "TIGHTEN",
+            }:
+                raise ValueError("trigger changes require an active protection intent")
+            payload = intent["payload"]
+            recovery = payload.setdefault("recovery_trade", {})
+            confirmed_trigger = recovery.get("sl") or payload.get("trigger_price")
+            requested_trigger = recovery.get("requested_stop_trigger")
+            for baseline in (confirmed_trigger, requested_trigger):
+                if baseline is None:
+                    continue
+                if (
+                    isinstance(baseline, bool)
+                    or not isinstance(baseline, (int, float))
+                    or not math.isfinite(baseline)
+                    or baseline <= 0
+                ):
+                    raise ValueError("persisted protection trigger is invalid")
+                loosens = (
+                    trigger_price < baseline
+                    if intent["side"] == "SELL"
+                    else trigger_price > baseline
+                )
+                if loosens:
+                    raise ValueError(
+                        "protection modification cannot loosen its trigger"
+                    )
+            if confirmed:
+                recovery["sl"] = trigger_price
+                recovery.pop("requested_stop_trigger", None)
+                payload["trigger_price"] = trigger_price
+            else:
+                recovery["requested_stop_trigger"] = trigger_price
+            conn.execute(
+                "UPDATE order_intents SET payload = ?, "
+                "state_version = state_version + 1, updated_at = ? "
+                "WHERE intent_id = ? AND state_version = ?",
+                (
+                    json.dumps(payload, default=str, sort_keys=True),
+                    now_utc().isoformat(),
+                    intent_id,
+                    intent["state_version"],
+                ),
+            )
+            self._lifecycle_event_inner(
+                conn,
+                intent_id,
+                "protection_trigger_confirmed"
+                if confirmed
+                else "protection_trigger_requested",
+                {"trigger_price": trigger_price, "previous_trigger": confirmed_trigger},
+            )
+            return self._lifecycle_row(
+                conn.execute(
+                    "SELECT * FROM order_intents WHERE intent_id = ?", (intent_id,)
+                ).fetchone()
+            )
+
+    def find_active_order_intent(
+        self, position_key: str, intent_types: Optional[set[str]] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Return the newest active intent for a broker-position key.
+
+        EXIT/FLATTEN are additionally protected by a partial unique index, so
+        this projection is safe across process restarts as well as threads.
+        """
+
+        conn = self._get_conn()
+        conn.row_factory = sqlite3.Row
+        params: list[Any] = [position_key]
+        where = "position_key = ? AND active = 1"
+        if intent_types:
+            normalized = sorted(str(value).upper() for value in intent_types)
+            where += " AND intent_type IN (%s)" % ", ".join("?" * len(normalized))
+            params.extend(normalized)
+        row = conn.execute(
+            f"SELECT * FROM order_intents WHERE {where} "
+            "ORDER BY created_at DESC LIMIT 1",
+            params,
+        ).fetchone()
+        return self._lifecycle_row(row)
+
+    def prepare_order_attempt(
+        self,
+        *,
+        intent_id: str,
+        attempt_id: str,
+        attempt_tag: str,
+        payload: Optional[Dict[str, Any]] = None,
+        enforce_previous_attempt: bool = False,
+        expected_previous_attempt_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Persist a unique attempt tag before asking the broker to mutate.
+
+        An active/unknown attempt is returned unchanged.  Callers must
+        reconcile it, not generate another tag and submit duplicate exposure.
+        """
+
+        if not attempt_id or not attempt_tag:
+            raise ValueError("attempt_id and attempt_tag are required")
+        now = now_utc().isoformat()
+        payload_json = json.dumps(payload or {}, default=str, sort_keys=True)
+        conn = self._get_conn()
+        conn.row_factory = sqlite3.Row
+        with self._transaction(conn):
+            intent = conn.execute(
+                "SELECT * FROM order_intents WHERE intent_id = ?", (intent_id,)
+            ).fetchone()
+            if intent is None:
+                raise ValueError(f"unknown order intent {intent_id}")
+            if not intent["active"]:
+                raise ValueError(f"order intent {intent_id} is terminal")
+            existing = conn.execute(
+                "SELECT * FROM order_attempts WHERE intent_id = ? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (intent_id,),
+            ).fetchone()
+            if (
+                enforce_previous_attempt
+                and (existing["attempt_id"] if existing is not None else None)
+                != expected_previous_attempt_id
+            ):
+                if existing is None:
+                    raise ValueError("the expected previous attempt is missing")
+                return dict(existing)
+            if (
+                existing is not None
+                and existing["state"] in self._ACTIVE_ATTEMPT_STATES
+            ):
+                return dict(existing)
+            by_id = conn.execute(
+                "SELECT * FROM order_attempts WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone()
+            if by_id is not None:
+                if (
+                    by_id["intent_id"] != intent_id
+                    or by_id["attempt_tag"] != attempt_tag
+                ):
+                    raise ValueError(
+                        f"conflicting duplicate order attempt {attempt_id}"
+                    )
+                return dict(by_id)
+            conn.execute(
+                """
+                INSERT INTO order_attempts(
+                    attempt_id, intent_id, attempt_tag, broker_order_id, state,
+                    state_version, payload, error, created_at, updated_at
+                ) VALUES (?, ?, ?, NULL, 'SUBMITTING', 1, ?, NULL, ?, ?)
+                """,
+                (attempt_id, intent_id, attempt_tag, payload_json, now, now),
+            )
+            next_version = int(intent["state_version"]) + 1
+            conn.execute(
+                """
+                UPDATE order_intents
+                SET state = 'SUBMITTING', state_version = ?, updated_at = ?
+                WHERE intent_id = ? AND state_version = ?
+                """,
+                (next_version, now, intent_id, intent["state_version"]),
+            )
+            self._lifecycle_event_inner(
+                conn,
+                intent_id,
+                "attempt_submitting",
+                {"attempt_tag": attempt_tag, "state_version": next_version},
+                attempt_id,
+            )
+            return dict(
+                conn.execute(
+                    "SELECT * FROM order_attempts WHERE attempt_id = ?", (attempt_id,)
+                ).fetchone()
+            )
+
+    def record_order_attempt_state(
+        self,
+        attempt_id: str,
+        state: str,
+        *,
+        broker_order_id: Optional[str] = None,
+        error: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Record an acknowledgement, observation, rejection or UNKNOWN state."""
+
+        state = str(state).upper()
+        allowed = {
+            "PREPARED",
+            "SUBMITTING",
+            "ACKNOWLEDGED",
+            "WORKING",
+            "PARTIALLY_FILLED",
+            "FILLED",
+            "CANCEL_PENDING",
+            "CANCELLED",
+            "REJECTED",
+            "UNKNOWN",
+        }
+        if state not in allowed:
+            raise ValueError(f"unsupported order attempt state: {state}")
+        now = now_utc().isoformat()
+        conn = self._get_conn()
+        conn.row_factory = sqlite3.Row
+        with self._transaction(conn):
+            attempt = conn.execute(
+                "SELECT * FROM order_attempts WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone()
+            if attempt is None:
+                raise ValueError(f"unknown order attempt {attempt_id}")
+            intent = conn.execute(
+                "SELECT * FROM order_intents WHERE intent_id = ?",
+                (attempt["intent_id"],),
+            ).fetchone()
+            if intent is None:
+                raise ValueError(f"attempt {attempt_id} has no intent")
+            if (
+                broker_order_id
+                and attempt["broker_order_id"]
+                and str(broker_order_id) != str(attempt["broker_order_id"])
+            ):
+                raise ValueError("a broker order cannot be reassigned to an attempt")
+            previous_state = attempt["state"]
+            if (
+                (
+                    previous_state in {"FILLED", "CANCELLED", "REJECTED"}
+                    and state in self._ACTIVE_ATTEMPT_STATES
+                )
+                or (
+                    previous_state in {"WORKING", "PARTIALLY_FILLED"}
+                    and state in {"PREPARED", "SUBMITTING", "ACKNOWLEDGED", "UNKNOWN"}
+                )
+                or (previous_state == "PARTIALLY_FILLED" and state == "WORKING")
+            ):
+                state = previous_state
+            if previous_state == "FILLED":
+                state = previous_state
+            next_attempt_version = int(attempt["state_version"]) + 1
+            attempt_update = conn.execute(
+                """
+                UPDATE order_attempts
+                SET state = ?, state_version = ?,
+                    broker_order_id = COALESCE(?, broker_order_id),
+                    error = ?, updated_at = ?
+                WHERE attempt_id = ? AND state_version = ?
+                """,
+                (
+                    state,
+                    next_attempt_version,
+                    str(broker_order_id) if broker_order_id else None,
+                    error,
+                    now,
+                    attempt_id,
+                    attempt["state_version"],
+                ),
+            )
+            if attempt_update.rowcount == 0:
+                raise RuntimeError(f"concurrent lifecycle update for {attempt_id}")
+            next_intent_version = int(intent["state_version"]) + 1
+            newest_attempt = conn.execute(
+                "SELECT attempt_id FROM order_attempts WHERE intent_id = ? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (intent["intent_id"],),
+            ).fetchone()
+            if intent["active"] and newest_attempt["attempt_id"] == attempt_id:
+                conn.execute(
+                    """
+                    UPDATE order_intents
+                    SET state = ?, state_version = ?, updated_at = ?
+                    WHERE intent_id = ? AND state_version = ?
+                    """,
+                    (
+                        state,
+                        next_intent_version,
+                        now,
+                        intent["intent_id"],
+                        intent["state_version"],
+                    ),
+                )
+            self._lifecycle_event_inner(
+                conn,
+                intent["intent_id"],
+                f"attempt_{state.lower()}",
+                {
+                    "broker_order_id": broker_order_id,
+                    "error": error,
+                    **(details or {}),
+                },
+                attempt_id,
+            )
+            resolved_order_id = broker_order_id or attempt["broker_order_id"]
+            if resolved_order_id:
+                self._allocate_order_fills_inner(
+                    conn, intent, attempt_id, str(resolved_order_id)
+                )
+            row = conn.execute(
+                "SELECT * FROM order_attempts WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone()
+        return dict(row)
+
+    def _allocate_order_fills_inner(
+        self, conn, intent, attempt_id: str, broker_order_id: str
+    ) -> None:
+        """Attach fills that arrived before the attempt's broker acknowledgement."""
+
+        namespace, account_id = self._lifecycle_account_identity(intent["position_key"])
+        rows = conn.execute(
+            "SELECT * FROM order_fill_ledger "
+            "WHERE namespace = ? AND account_id = ? AND broker_order_id = ?",
+            (namespace, account_id, broker_order_id),
+        ).fetchall()
+        for row in rows:
+            if row["side"] != intent["side"] or (
+                row["intent_id"] not in (None, intent["intent_id"])
+                or row["attempt_id"] not in (None, attempt_id)
+            ):
+                raise ValueError("broker fill conflicts with its lifecycle owner")
+            if row["intent_id"] is not None and row["attempt_id"] is not None:
+                continue
+            conn.execute(
+                "UPDATE order_fill_ledger "
+                "SET intent_id = ?, attempt_id = ?, position_key = ? "
+                "WHERE namespace = ? AND account_id = ? AND broker_fill_id = ?",
+                (
+                    intent["intent_id"],
+                    attempt_id,
+                    intent["position_key"],
+                    namespace,
+                    account_id,
+                    row["broker_fill_id"],
+                ),
+            )
+            self._lifecycle_event_inner(
+                conn,
+                intent["intent_id"],
+                "fill_allocated",
+                {"broker_fill_id": row["broker_fill_id"]},
+                attempt_id,
+            )
+
+    def record_order_fill(
+        self,
+        *,
+        broker_fill_id: str,
+        broker_order_id: str,
+        position_key: str,
+        side: str,
+        quantity: int,
+        fill_price: Optional[float] = None,
+        exchange_time: Optional[datetime | str] = None,
+        intent_id: Optional[str] = None,
+        attempt_id: Optional[str] = None,
+        raw_fill: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Idempotently retain every broker fill exactly once.
+
+        Broker fill IDs are scoped to namespace/account. Replayed observations
+        may repair missing linkage or execution metadata, but cannot overwrite
+        conflicting execution facts.
+        """
+
+        if not broker_fill_id or not broker_order_id or not position_key:
+            raise ValueError("fill id, order id and position key are required")
+        if isinstance(quantity, bool) or not isinstance(quantity, int) or quantity <= 0:
+            raise ValueError("fill quantity must be a positive integer")
+        side = str(side).upper()
+        if side not in {"BUY", "SELL"}:
+            raise ValueError("fill side must be BUY or SELL")
+        if fill_price is not None and (
+            isinstance(fill_price, bool)
+            or not isinstance(fill_price, (int, float))
+            or not math.isfinite(fill_price)
+            or fill_price <= 0
+        ):
+            raise ValueError("fill price must be finite and positive when known")
+        namespace, account_id = self._lifecycle_account_identity(position_key)
+        try:
+            normalized_exchange_time = as_utc(exchange_time)
+        except (TypeError, ValueError):
+            normalized_exchange_time = None
+        exchange_timestamp = (
+            normalized_exchange_time.isoformat()
+            if normalized_exchange_time is not None
+            else None
+        )
+        conn = self._get_conn()
+        conn.row_factory = sqlite3.Row
+        with self._transaction(conn):
+            owner = self._order_attempt_by_broker_order_inner(
+                conn, str(broker_order_id), position_key
+            )
+            if owner:
+                if intent_id not in (None, owner["intent_id"]) or attempt_id not in (
+                    None,
+                    owner["attempt_id"],
+                ):
+                    raise ValueError("broker fill conflicts with its lifecycle owner")
+                if side != owner["intent_side"]:
+                    raise ValueError(
+                        "broker fill side conflicts with its lifecycle owner"
+                    )
+                intent_id = owner["intent_id"]
+                attempt_id = owner["attempt_id"]
+                position_key = owner["owner_position_key"]
+            elif intent_id is not None or attempt_id is not None:
+                raise ValueError(
+                    "broker fill allocation requires a known broker attempt"
+                )
+            existing = conn.execute(
+                "SELECT * FROM order_fill_ledger "
+                "WHERE namespace = ? AND account_id = ? AND broker_fill_id = ?",
+                (namespace, account_id, str(broker_fill_id)),
+            ).fetchone()
+            if existing is not None:
+                facts = {
+                    "broker_order_id": str(broker_order_id),
+                    "side": side,
+                    "quantity": quantity,
+                    "fill_price": fill_price,
+                    "exchange_time": exchange_timestamp,
+                    "intent_id": intent_id,
+                    "attempt_id": attempt_id,
+                }
+                for field, value in facts.items():
+                    if (
+                        existing[field] is not None
+                        and value is not None
+                        and existing[field] != value
+                    ):
+                        raise ValueError(
+                            f"conflicting broker fill observation: {field}"
+                        )
+                conn.execute(
+                    "UPDATE order_fill_ledger SET "
+                    "intent_id = COALESCE(intent_id, ?), "
+                    "attempt_id = COALESCE(attempt_id, ?), "
+                    "fill_price = COALESCE(fill_price, ?), "
+                    "exchange_time = COALESCE(exchange_time, ?), "
+                    "position_key = CASE WHEN ? IS NOT NULL THEN ? ELSE position_key END "
+                    "WHERE namespace = ? AND account_id = ? AND broker_fill_id = ?",
+                    (
+                        intent_id,
+                        attempt_id,
+                        fill_price,
+                        exchange_timestamp,
+                        intent_id,
+                        position_key,
+                        namespace,
+                        account_id,
+                        str(broker_fill_id),
+                    ),
+                )
+                return False
+            cursor = conn.execute(
+                """
+                INSERT INTO order_fill_ledger(
+                    namespace, account_id, broker_fill_id, intent_id, attempt_id, broker_order_id,
+                    position_key, side, quantity, fill_price, exchange_time,
+                    recorded_at, raw_fill
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    namespace,
+                    account_id,
+                    str(broker_fill_id),
+                    intent_id,
+                    attempt_id,
+                    str(broker_order_id),
+                    position_key,
+                    side,
+                    quantity,
+                    fill_price,
+                    exchange_timestamp,
+                    now_utc().isoformat(),
+                    json.dumps(raw_fill or {}, default=str, sort_keys=True),
+                ),
+            )
+            inserted = cursor.rowcount == 1
+            if inserted and intent_id:
+                self._lifecycle_event_inner(
+                    conn,
+                    intent_id,
+                    "fill_recorded",
+                    {
+                        "broker_fill_id": broker_fill_id,
+                        "broker_order_id": broker_order_id,
+                        "quantity": quantity,
+                        "fill_price": fill_price,
+                    },
+                    attempt_id,
+                )
+        return inserted
+
+    def get_order_intent_projection(self, intent_id: str) -> Optional[Dict[str, Any]]:
+        """Return the current intent, newest attempt and idempotent fill total."""
+
+        intent = self.get_order_intent(intent_id)
+        if intent is None:
+            return None
+        conn = self._get_conn()
+        conn.row_factory = sqlite3.Row
+        attempt = conn.execute(
+            "SELECT * FROM order_attempts WHERE intent_id = ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (intent_id,),
+        ).fetchone()
+        fill_row = conn.execute(
+            "SELECT COALESCE(SUM(quantity), 0) AS filled_quantity "
+            "FROM order_fill_ledger WHERE intent_id = ?",
+            (intent_id,),
+        ).fetchone()
+        intent["latest_attempt"] = dict(attempt) if attempt is not None else None
+        intent["filled_quantity"] = int(fill_row["filled_quantity"] or 0)
+        intent["residual_quantity"] = max(
+            0, intent["quantity"] - intent["filled_quantity"]
+        )
+        return intent
+
+    def _order_attempt_by_broker_order_inner(
+        self, conn, broker_order_id: str, position_key: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        rows = conn.execute(
+            "SELECT a.*, i.position_key AS owner_position_key, i.side AS intent_side "
+            "FROM order_attempts a JOIN order_intents i ON a.intent_id = i.intent_id "
+            "WHERE a.broker_order_id = ?",
+            (str(broker_order_id),),
+        ).fetchall()
+        if position_key is not None:
+            identity = self._lifecycle_account_identity(position_key)
+            rows = [
+                row
+                for row in rows
+                if self._lifecycle_account_identity(row["owner_position_key"])
+                == identity
+            ]
+        # An unscoped/ambiguous identity never selects whichever account wrote last.
+        return self._lifecycle_row(rows[0]) if len(rows) == 1 else None
+
+    def get_order_attempt_by_broker_order(
+        self, broker_order_id: str, *, position_key: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        conn = self._get_conn()
+        conn.row_factory = sqlite3.Row
+        return self._order_attempt_by_broker_order_inner(
+            conn, broker_order_id, position_key
+        )
+
+    def get_position_order_ids(self, position_key: str) -> set[str]:
+        """Include terminal predecessor attempts belonging to this exact epoch."""
+
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT a.broker_order_id FROM order_attempts a "
+            "JOIN order_intents i ON i.intent_id = a.intent_id "
+            "WHERE i.position_key = ? AND a.broker_order_id IS NOT NULL",
+            (position_key,),
+        ).fetchall()
+        return {str(row[0]) for row in rows}
+
+    def get_terminal_order_fact(
+        self, broker_order_id: str, *, namespace: str, account_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return a scoped broker terminal observation retained before rollover."""
+
+        if namespace in (None, "", "UNKNOWN") or account_id in (None, "", "UNKNOWN"):
+            return None
+        conn = self._get_conn()
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT e.details, i.position_key FROM order_lifecycle_events e "
+            "JOIN order_attempts a ON a.attempt_id = e.attempt_id "
+            "JOIN order_intents i ON i.intent_id = a.intent_id "
+            "WHERE a.broker_order_id = ? AND a.state IN ('FILLED', 'CANCELLED', 'REJECTED') "
+            "ORDER BY e.timestamp DESC, e.rowid DESC",
+            (str(broker_order_id),),
+        ).fetchall()
+        for row in rows:
+            if self._lifecycle_account_identity(row["position_key"]) != (
+                str(namespace),
+                str(account_id),
+            ):
+                continue
+            order = json.loads(row["details"]).get("order")
+            if (
+                isinstance(order, dict)
+                and str(order.get("order_id", order.get("orderId")))
+                == str(broker_order_id)
+                and str(order.get("status", "")).upper()
+                in {"COMPLETE", "CANCELLED", "REJECTED", "EXPIRED", "REJECTED AMO"}
+            ):
+                return order
+        return None
+
+    def get_position_fills(
+        self, position_key: str, *, broker_order_ids: set[str]
+    ) -> List[Dict[str, Any]]:
+        """Read retained execution facts, never a claim about current broker state.
+
+        Both epoch and explicit owned-order linkage are required. This also
+        excludes unallocated v1 symbol-history observations from a new epoch.
+        """
+
+        namespace, account_id = self._lifecycle_account_identity(position_key)
+        if not broker_order_ids:
+            return []
+        order_ids = sorted(str(order_id) for order_id in broker_order_ids)
+        placeholders = ", ".join("?" for _ in order_ids)
+        conn = self._get_conn()
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM order_fill_ledger WHERE namespace = ? AND account_id = ? "
+            "AND position_key = ? "
+            f"AND broker_order_id IN ({placeholders}) ORDER BY recorded_at, broker_fill_id",
+            (namespace, account_id, position_key, *order_ids),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_order_intent_event(
+        self,
+        intent_id: str,
+        event_type: str,
+        details: Dict[str, Any],
+        attempt_id: Optional[str] = None,
+    ) -> None:
+        """Append non-mutating handoff/recovery evidence to an intent trace."""
+
+        conn = self._get_conn()
+        with self._transaction(conn):
+            exists = conn.execute(
+                "SELECT 1 FROM order_intents WHERE intent_id = ?", (intent_id,)
+            ).fetchone()
+            if exists is None:
+                raise ValueError(f"unknown order intent {intent_id}")
+            self._lifecycle_event_inner(
+                conn, intent_id, event_type, details, attempt_id
+            )
+
+    def list_unresolved_order_intents(self) -> List[Dict[str, Any]]:
+        conn = self._get_conn()
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT intent_id FROM order_intents WHERE active = 1 "
+            "ORDER BY created_at ASC"
+        ).fetchall()
+        return [
+            projection
+            for row in rows
+            if (projection := self.get_order_intent_projection(row["intent_id"]))
+            is not None
+        ]
+
+    def complete_order_intent(
+        self,
+        intent_id: str,
+        state: str = "CLOSED",
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Mark an obligation terminal only after the coordinator proves it."""
+
+        now = now_utc().isoformat()
+        conn = self._get_conn()
+        conn.row_factory = sqlite3.Row
+        with self._transaction(conn):
+            intent = conn.execute(
+                "SELECT * FROM order_intents WHERE intent_id = ?", (intent_id,)
+            ).fetchone()
+            if intent is None:
+                raise ValueError(f"unknown order intent {intent_id}")
+            if not intent["active"]:
+                return
+            next_version = int(intent["state_version"]) + 1
+            conn.execute(
+                """
+                UPDATE order_intents
+                SET state = ?, active = 0, state_version = ?, updated_at = ?
+                WHERE intent_id = ? AND state_version = ?
+                """,
+                (state, next_version, now, intent_id, intent["state_version"]),
+            )
+            self._lifecycle_event_inner(
+                conn,
+                intent_id,
+                "intent_completed",
+                {"state": state, **(details or {})},
+            )
 
     def close_trade(
         self,

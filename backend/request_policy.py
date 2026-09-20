@@ -4,6 +4,7 @@ import threading
 import time
 from typing import Any, Callable, Optional
 
+from .broker_models import OrderSubmissionRejected, OrderSubmissionUnknown
 from .utils import push_log
 
 
@@ -186,8 +187,15 @@ class BrokerGateway:
         backoff = 0.5
 
         while True:
-            self._check_circuit(priority)
-            self._acquire_token(priority)
+            try:
+                self._check_circuit(priority)
+                self._acquire_token(priority)
+            except Exception as exc:
+                if is_order:
+                    # Admission failed before action was called. There is no
+                    # possible broker side effect to reconcile.
+                    raise OrderSubmissionRejected(str(exc)) from exc
+                raise
 
             start_time = time.time()
             try:
@@ -205,6 +213,20 @@ class BrokerGateway:
                 latency = time.time() - start_time
 
                 classification = self._classify_error(e)
+                if is_order:
+                    # SDK DataException can mean an accepted request returned
+                    # malformed JSON. Message substrings describe retry policy,
+                    # not proof that a mutation was rejected by the broker.
+                    definite_rejection = isinstance(e, OrderSubmissionRejected) or (
+                        type(e).__module__ == "kiteconnect.exceptions"
+                        and type(e).__name__
+                        in {"TokenException", "PermissionException", "InputException"}
+                    )
+                    classification = (
+                        ErrorClassification.NON_RETRYABLE
+                        if definite_rejection
+                        else ErrorClassification.AMBIGUOUS
+                    )
                 if classification != ErrorClassification.NON_RETRYABLE:
                     self._record_failure()
 
@@ -230,7 +252,25 @@ class BrokerGateway:
                             f"Order reconciliation failed: {rec_err}", level="error"
                         )
 
-                    classification = ErrorClassification.RETRYABLE
+                    # A timeout after a mutation can have reached the broker.
+                    # A failed immediate lookup is not evidence that it did
+                    # not; the lifecycle coordinator must retain this exact
+                    # attempt tag for later reconciliation.
+                    raise OrderSubmissionUnknown(
+                        "Broker submission outcome is unknown after reconciliation"
+                    ) from e
+
+                if is_order:
+                    # A broker mutation is never retried by this generic
+                    # transport layer.  Retrying a request after a 5xx or a
+                    # connection error can duplicate/reverse exposure just as
+                    # surely as a timeout.  Only a classified validation/auth
+                    # failure is a definite rejection.
+                    if classification == ErrorClassification.NON_RETRYABLE:
+                        raise OrderSubmissionRejected(str(e)) from e
+                    raise OrderSubmissionUnknown(
+                        "Broker submission outcome is unknown"
+                    ) from e
 
                 if (
                     classification == ErrorClassification.NON_RETRYABLE

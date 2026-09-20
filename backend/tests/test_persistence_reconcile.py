@@ -105,7 +105,9 @@ class FakeKiteClient:
         oid = f"OID{self._next_id}"
         self._next_id += 1
         status = (
-            "COMPLETE" if kwargs.get("order_type") in ["LIMIT", "MARKET"] else "OPEN"
+            "COMPLETE"
+            if kwargs.get("order_type") in ["LIMIT", "MARKET"]
+            else "TRIGGER PENDING"
         )
         qty = kwargs.get("quantity", 0) if status == "COMPLETE" else 0
         self.orders.append(
@@ -120,6 +122,9 @@ class FakeKiteClient:
                 "product": kwargs.get("product", "MIS"),
                 "transaction_type": kwargs.get("transaction_type", "SELL"),
                 "order_type": kwargs.get("order_type", "SL"),
+                "instrument_token": 111,
+                "trigger_price": kwargs.get("trigger_price", 0),
+                "price": kwargs.get("price", 0),
             }
         )
         return oid
@@ -336,6 +341,28 @@ def _setup_reconcile(monkeypatch, persisted, positions_net, orders):
             o["order_type"] = "SL"
         if "quantity" not in o:
             o["quantity"] = 10
+        o.setdefault("instrument_token", 111)
+        o.setdefault("trigger_price", 95)
+        o.setdefault("price", 94.05)
+        o.setdefault("filled_quantity", 10 if o["status"] == "COMPLETE" else 0)
+    for symbol, trade in persisted.items():
+        entry_id = trade.get("entry_order_id")
+        if entry_id and not any(o.get("order_id") == entry_id for o in orders):
+            orders.append(
+                {
+                    "order_id": entry_id,
+                    "status": "COMPLETE",
+                    "tradingsymbol": symbol,
+                    "exchange": "NSE",
+                    "product": "MIS",
+                    "instrument_token": trade.get("instrument_id", 111),
+                    "transaction_type": trade.get("direction", "BUY"),
+                    "order_type": "LIMIT",
+                    "quantity": trade.get("quantity", 10),
+                    "filled_quantity": trade.get("quantity", 10),
+                    "pending_quantity": 0,
+                }
+            )
     fake_client.positions = {"net": positions_net}
     fake_client.orders = orders
     monkeypatch.setattr(te, "execution_gateway", fake_client)
@@ -352,7 +379,7 @@ def _setup_reconcile(monkeypatch, persisted, positions_net, orders):
     return engine, fake_client, saved
 
 
-def test_reconcile_drops_closed_trade_and_cancels_live_stop(monkeypatch):
+def test_reconcile_retains_closed_trade_until_stop_cancellation_confirmed(monkeypatch):
     engine, fake_client, _ = _setup_reconcile(
         monkeypatch,
         persisted={"RELIANCE": _trade(stop_order_id="STOP1")},
@@ -361,8 +388,11 @@ def test_reconcile_drops_closed_trade_and_cancels_live_stop(monkeypatch):
     )
     engine.reconcile_active_trades()
 
-    assert engine.active_trades == {}
+    assert engine.active_trades["RELIANCE"]["cleanup_pending"] is True
     assert fake_client.cancel_calls[0]["order_id"] == "STOP1"
+    fake_client.orders[0]["status"] = "CANCELLED"
+    engine.reconcile_active_trades()
+    assert engine.active_trades == {}
 
 
 def test_reconcile_drops_closed_trade_no_cancel_when_stop_gone(monkeypatch):
@@ -498,10 +528,8 @@ def test_reconcile_preserves_entry_time(monkeypatch):
     assert engine.active_trades["RELIANCE"]["entry_time"] == et
 
 
-def test_reconcile_drops_on_direction_flip(monkeypatch):
-    # Persisted as BUY, but the live position is now short -> the record is
-    # stale; drop it (and cancel a lingering live stop) rather than protect a
-    # position with a wrong-side stop.
+def test_reconcile_quarantines_direction_flip_until_orders_are_resolved(monkeypatch):
+    # A reversed position cannot erase ownership of the still-live old stop.
     engine, fake_client, _ = _setup_reconcile(
         monkeypatch,
         persisted={"RELIANCE": _trade(direction="BUY", stop_order_id="STOP1")},
@@ -510,7 +538,7 @@ def test_reconcile_drops_on_direction_flip(monkeypatch):
     )
     engine.reconcile_active_trades()
 
-    assert "RELIANCE" not in engine.active_trades
+    assert engine.active_trades["RELIANCE"]["ownership_quarantined"] is True
     assert fake_client.cancel_calls[0]["order_id"] == "STOP1"
     assert fake_client.place_calls == []  # no wrong-side stop placed
 
@@ -537,9 +565,9 @@ def test_reconcile_isolates_a_malformed_record(monkeypatch):
 
 
 def test_reconcile_flattens_trade_when_stop_replace_fails(monkeypatch):
-    # If re-placing the protective stop fails before an order id is returned,
-    # it triggers emergency flatten but retains ownership until flatness is
-    # independently confirmed.
+    # If re-placing a protective stop fails before an order id is returned,
+    # it latches a recoverable emergency intent.  An ambiguous/failed attempt
+    # never claims flatness or issues an untracked second market order.
     engine, fake_client, _ = _setup_reconcile(
         monkeypatch,
         persisted={"RELIANCE": _trade(stop_order_id=None)},
@@ -555,7 +583,9 @@ def test_reconcile_flattens_trade_when_stop_replace_fails(monkeypatch):
 
     assert engine.active_trades["RELIANCE"]["broker_reconciliation_pending"] is True
     assert engine._reconciliation_pending is True
-    assert fake_client.flatten_calls == ["RELIANCE"]
+    assert fake_client.flatten_calls == []
+    assert engine.active_trades["RELIANCE"]["exit_pending"] is True
+    assert engine.active_trades["RELIANCE"]["exit_intent_id"]
 
 
 # ---------------------------------------------------------------------------

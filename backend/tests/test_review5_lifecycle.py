@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from backend.broker_models import ExecutionNamespace
+from backend.broker_models import ExecutionNamespace, OrderSubmissionRejected
 from backend.config import config_manager
 from backend.execution_gateway import ExecutionGateway
 from backend.journal import TradeJournal
@@ -125,24 +125,26 @@ class ScriptedSDK:
                 "unrealised": 0,
             }
         ]
-        self.executions = (
-            [
+        prior_quantity = sum(
+            fill["quantity"]
+            for fill in self.executions
+            if fill["order_id"] == "O1" and fill["transaction_type"] == "BUY"
+        )
+        if quantity > prior_quantity:
+            self.executions.append(
                 {
-                    "trade_id": "F1",
+                    "trade_id": f"F{len(self.executions) + 1}",
                     "order_id": "O1",
                     "tradingsymbol": "RELIANCE",
                     "exchange": "NSE",
                     "product": "MIS",
                     "instrument_token": 111,
                     "transaction_type": "BUY",
-                    "quantity": quantity,
+                    "quantity": quantity - prior_quantity,
                     "average_price": 101,
                     "fill_timestamp": now_utc().replace(microsecond=0),
                 }
-            ]
-            if quantity
-            else []
-        )
+            )
 
 
 @pytest.fixture
@@ -532,7 +534,7 @@ def test_fill_outage_retains_financial_owner_after_emergency_reduction(
 
     def fail_stop(**kwargs):
         if kwargs["order_type"] == "SL":
-            raise ValueError("definitively rejected stop")
+            raise OrderSubmissionRejected("definitively rejected stop")
         return submit(**kwargs)
 
     monkeypatch.setattr(e.sdk, "place_order", fail_stop)

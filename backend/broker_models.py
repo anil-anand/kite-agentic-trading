@@ -54,6 +54,10 @@ class OrderSubmissionUnknown(RuntimeError):
     """The broker call failed after submission may have reached the broker."""
 
 
+class OrderSubmissionRejected(RuntimeError):
+    """The broker definitively rejected a mutation before accepting an order."""
+
+
 @dataclass(frozen=True)
 class BrokerPositionKey:
     namespace: ExecutionNamespace

@@ -2,6 +2,7 @@ import datetime
 
 import pytest
 
+from backend.broker_models import OrderSubmissionRejected
 from backend.execution_gateway import execution_gateway
 
 
@@ -58,7 +59,9 @@ def test_gateway_rejects_if_risk_manager_fails(monkeypatch):
     )
     monkeypatch.setattr("backend.execution_gateway.kite_client", FakeKite())
 
-    with pytest.raises(Exception, match="Risk check failed: Max Loss Reached"):
+    with pytest.raises(
+        OrderSubmissionRejected, match="Risk check failed: Max Loss Reached"
+    ):
         execution_gateway.place_order(
             tradingsymbol="RELIANCE", is_entry=True, entry_reservation_id="res1"
         )
