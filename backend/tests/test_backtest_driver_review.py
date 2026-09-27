@@ -167,4 +167,4 @@ def test_backtest_rpc_pins_settings_and_excludes_current_incomplete_candle(monke
     result = response["result"]
     assert result["manifest"]["risk_config"]["defaultStopLossPercent"] == 2
     assert len(result["equity_curve"]) == 2
-    assert result["metrics_basis"] == "COMPLETED_TRADES_ONLY"
+    assert result["metrics_basis"] == "FULL_MARK_TO_MARKET_EQUITY"

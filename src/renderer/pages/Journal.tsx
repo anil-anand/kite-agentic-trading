@@ -6,30 +6,28 @@ import {
   ConfluenceValidation,
   SignalScoreCalibration,
   ExitReasonEffectiveness,
-  TradeReplayData,
-  WhatIfAnalysis,
-  LLMPostMortem
+  ExitDecisionReplay,
+  ExitQualityRecord,
+  ExitQualityReport
 } from '../../shared/types';
-import { ChevronDown, ChevronRight, Activity, PieChart, BarChart3, Clock, AlertTriangle, LineChart, Cpu, Lightbulb } from 'lucide-react';
-import TradeReplayChart from '../components/TradeReplayChart';
+import { ChevronDown, ChevronRight, Activity, PieChart, BarChart3, Clock, AlertTriangle, LineChart, Lightbulb } from 'lucide-react';
+import ExitReplayPanel from '../components/ExitReplayPanel';
 
-export const renderAnalysisLine = (line: string) => line.split(/(\*\*.*?\*\*)/g).map((part, index) =>
-  part.startsWith('**') && part.endsWith('**')
-    ? <strong key={index}>{part.slice(2, -2)}</strong>
-    : part
-);
+const formatR = (value: number | null) => value == null || !Number.isFinite(value) ? 'Unavailable' : `${value.toFixed(2)}R`;
+const retainedJSON = (value: string) => { try { return JSON.parse(value); } catch { return { quality: 'CORRUPT_RETAINED_JSON', raw: value }; } };
 
 const Journal: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'trades' | 'analytics'>('trades');
   const [trades, setTrades] = useState<JournalTrade[]>([]);
   const [expandedTradeId, setExpandedTradeId] = useState<string | null>(null);
-  const [activeTradeTab, setActiveTradeTab] = useState<'overview' | 'replay' | 'whatif' | 'ai'>('overview');
+  const [activeTradeTab, setActiveTradeTab] = useState<'overview' | 'replay' | 'quality'>('overview');
 
   // Per-trade data
   const [tradeEvents, setTradeEvents] = useState<Record<string, TradeEvent[]>>({});
-  const [tradeReplays, setTradeReplays] = useState<Record<string, TradeReplayData>>({});
-  const [whatIfs, setWhatIfs] = useState<Record<string, WhatIfAnalysis>>({});
-  const [llmPostMortems, setLlmPostMortems] = useState<Record<string, LLMPostMortem>>({});
+  const [exitReplays, setExitReplays] = useState<Record<string, ExitDecisionReplay>>({});
+  const [exitQuality, setExitQuality] = useState<Record<string, ExitQualityRecord>>({});
+  const [detailErrors, setDetailErrors] = useState<Record<string, string>>({});
+  const [loadError, setLoadError] = useState<string | null>(null);
 
 
   // Analytics State
@@ -37,6 +35,7 @@ const Journal: React.FC = () => {
   const [confluence, setConfluence] = useState<ConfluenceValidation[]>([]);
   const [calibration, setCalibration] = useState<SignalScoreCalibration[]>([]);
   const [exitReasons, setExitReasons] = useState<ExitReasonEffectiveness[]>([]);
+  const [qualityReport, setQualityReport] = useState<ExitQualityReport | null>(null);
 
   const [loading, setLoading] = useState(false);
 
@@ -47,6 +46,7 @@ const Journal: React.FC = () => {
   const loadData = async () => {
     if (!window.electronAPI) return;
     setLoading(true);
+    setLoadError(null);
     try {
       const fetchedTrades = await window.electronAPI.journal.getTrades();
       setTrades(fetchedTrades || []);
@@ -55,12 +55,21 @@ const Journal: React.FC = () => {
       const conf = await window.electronAPI.analytics.getConfluenceValidation();
       const calib = await window.electronAPI.analytics.getSignalScoreCalibration();
       const exitR = await window.electronAPI.analytics.getExitReasonEffectiveness();
+      const quality = await window.electronAPI.analytics.getExitQualityReport();
 
       setExpectancy(exp || []);
       setConfluence(conf || []);
       setCalibration(calib || []);
       setExitReasons(exitR || []);
+      setQualityReport(quality || null);
+      // Cached detail rows can change as fills and reconciliation arrive.
+      setTradeEvents({});
+      setExitReplays({});
+      setExitQuality({});
+      setDetailErrors({});
+      setExpandedTradeId(null);
     } catch (e) {
+      setLoadError('Journal refresh failed. Previously displayed values may be stale.');
       console.error('Error loading journal data', e);
     } finally {
       setLoading(false);
@@ -75,33 +84,33 @@ const Journal: React.FC = () => {
     setExpandedTradeId(tradeId);
     setActiveTradeTab('overview');
 
-    if (window.electronAPI) {
-      try {
-        if (!tradeEvents[tradeId]) {
-          const events = await window.electronAPI.journal.getEvents(tradeId);
+    const api = window.electronAPI;
+    if (api) {
+      const jobs: Array<[string, () => Promise<void>]> = [
+        ['events', async () => { if (!tradeEvents[tradeId]) {
+          const events = await api.journal.getEvents(tradeId);
           setTradeEvents(prev => ({ ...prev, [tradeId]: events }));
-        }
-        if (!tradeReplays[tradeId]) {
-          const replay = await window.electronAPI.analytics.getTradeReplay(tradeId);
+        } }],
+        ['replay', async () => { if (!exitReplays[tradeId]) {
+          const replay = await api.analytics.getExitManagementReplay(tradeId);
           if (replay && !replay.error) {
-            setTradeReplays(prev => ({ ...prev, [tradeId]: replay }));
-          }
+            setExitReplays(prev => ({ ...prev, [tradeId]: replay }));
+          } else throw new Error('Replay unavailable');
+        } }],
+        ['quality', async () => { if (!exitQuality[tradeId]) {
+          const quality = await api.analytics.getExitQualityForTrade(tradeId);
+          if (quality && !quality.error) {
+            setExitQuality(prev => ({ ...prev, [tradeId]: quality }));
+          } else throw new Error('Quality metrics unavailable');
+        } }],
+      ];
+      await Promise.allSettled(jobs.map(async ([kind, job]) => {
+        const key = `${tradeId}:${kind}`;
+        setDetailErrors(prev => ({ ...prev, [key]: '' }));
+        try { await job(); } catch {
+          setDetailErrors(prev => ({ ...prev, [key]: `${kind} unavailable. Reopen the trade to retry.` }));
         }
-        if (!whatIfs[tradeId]) {
-          const whatif = await window.electronAPI.analytics.getWhatIfAnalysis(tradeId);
-          if (whatif && !whatif.error) {
-            setWhatIfs(prev => ({ ...prev, [tradeId]: whatif }));
-          }
-        }
-        if (!llmPostMortems[tradeId]) {
-          const llm = await window.electronAPI.analytics.getLlmPostMortem(tradeId);
-          if (llm) {
-            setLlmPostMortems(prev => ({ ...prev, [tradeId]: llm }));
-          }
-        }
-      } catch (e) {
-        console.error('Error fetching trade details', e);
-      }
+      }));
     }
   };
 
@@ -183,18 +192,11 @@ const Journal: React.FC = () => {
                           {activeTradeTab === 'replay' && <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-accent-light" />}
                         </button>
                         <button
-                          onClick={() => setActiveTradeTab('whatif')}
-                          className={`pb-3 mr-6 text-sm font-semibold transition-all relative ${activeTradeTab === 'whatif' ? 'text-accent-light' : 'text-surface-400 hover:text-white'}`}
+                          onClick={() => setActiveTradeTab('quality')}
+                          className={`pb-3 mr-6 text-sm font-semibold transition-all relative ${activeTradeTab === 'quality' ? 'text-accent-light' : 'text-surface-400 hover:text-white'}`}
                         >
-                          <div className="flex items-center"><Lightbulb size={14} className="mr-1" /> What-If</div>
-                          {activeTradeTab === 'whatif' && <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-accent-light" />}
-                        </button>
-                        <button
-                          onClick={() => setActiveTradeTab('ai')}
-                          className={`pb-3 mr-6 text-sm font-semibold transition-all relative ${activeTradeTab === 'ai' ? 'text-accent-light' : 'text-surface-400 hover:text-white'}`}
-                        >
-                          <div className="flex items-center"><Cpu size={14} className="mr-1" /> AI Post-Mortem</div>
-                          {activeTradeTab === 'ai' && <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-accent-light" />}
+                          <div className="flex items-center"><Lightbulb size={14} className="mr-1" /> Exit Quality</div>
+                          {activeTradeTab === 'quality' && <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-accent-light" />}
                         </button>
                       </div>
 
@@ -207,7 +209,7 @@ const Journal: React.FC = () => {
                               </h4>
                               <div className="space-y-4 pl-2 border-l-2 border-surface-700/50">
                                 {(tradeEvents[t.id] || []).map(e => {
-                                  const details = JSON.parse(e.details || '{}');
+                                  const details = retainedJSON(e.details || '{}');
                                   return (
                                     <div key={e.id} className="relative pl-6">
                                       <div className="absolute w-3 h-3 bg-accent-light rounded-full -left-[23px] top-1.5 shadow-[0_0_8px_rgba(var(--color-accent-light),0.5)]" />
@@ -220,7 +222,7 @@ const Journal: React.FC = () => {
                                   );
                                 })}
                                 {(!tradeEvents[t.id] || tradeEvents[t.id].length === 0) && (
-                                  <div className="text-sm text-surface-400 pl-4">Loading events...</div>
+                                  <div className="text-sm text-surface-400 pl-4">{detailErrors[`${t.id}:events`] || (tradeEvents[t.id] ? 'No retained trade events.' : 'Loading events...')}</div>
                                 )}
                               </div>
                             </div>
@@ -232,9 +234,9 @@ const Journal: React.FC = () => {
                                 <div className="bg-surface-800 p-4 rounded-lg border border-surface-700 text-sm text-surface-200 space-y-3">
                                   <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Reasoning</span> {t.reasoning || 'N/A'}</p>
                                     <div className="grid grid-cols-2 gap-4 pt-2 border-t border-surface-700/50">
-                                      <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Confidence</span> {(t.signal_score ?? (t as any).signalScore) != null ? `${t.signal_score ?? (t as any).signalScore}%` : 'N/A'}</p>
+                                        <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Entry Signal Score</span> {(t.signal_score ?? (t as any).signalScore) != null ? `${t.signal_score ?? (t as any).signalScore} / 100` : 'N/A'}</p>
                                       {(t.estimated_probability != null || (t as any).estimatedProbability != null) && (
-                                        <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Calibrated Prob</span> {((t.estimated_probability ?? (t as any).estimatedProbability) * 100).toFixed(1)}% <span className="text-[10px] text-surface-400 opacity-80">(n={t.calibration_sample_size ?? (t as any).calibrationSampleSize})</span></p>
+                                        <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Historical Score-Bucket Estimate</span> {((t.estimated_probability ?? (t as any).estimatedProbability) * 100).toFixed(1)}% <span className="text-[10px] text-surface-400 opacity-80">(not an exit probability; n={t.calibration_sample_size ?? (t as any).calibrationSampleSize})</span></p>
                                       )}
                                     </div>
                                     {(t.market_regime || t.strategy_family || t.production_playbook || t.screener_score != null) && (
@@ -249,14 +251,14 @@ const Journal: React.FC = () => {
                                       <div className="grid grid-cols-3 gap-4 pt-2 border-t border-surface-700/50">
                                         {t.target_distance != null && <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Target Dist</span> {t.target_distance.toFixed(2)}</p>}
                                         {t.stop_distance != null && <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Stop Dist</span> {t.stop_distance.toFixed(2)}</p>}
-                                        {t.initial_r != null && <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Initial R</span> {t.initial_r.toFixed(2)}</p>}
+                                        {t.initial_r != null && <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Legacy initial R (unit unverified)</span> {t.initial_r.toFixed(2)}</p>}
                                       </div>
                                     )}
                                     {(t.realized_r != null || t.mae != null || t.mfe != null || t.holding_time_seconds != null) && (
                                       <div className="grid grid-cols-4 gap-2 pt-2 border-t border-surface-700/50">
                                         {t.realized_r != null && <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Realized R</span> <span className={t.realized_r >= 0 ? 'text-profit-light' : 'text-loss-light'}>{t.realized_r.toFixed(2)}</span></p>}
-                                        {t.mae != null && <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">MAE</span> {t.mae.toFixed(2)}</p>}
-                                        {t.mfe != null && <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">MFE</span> {t.mfe.toFixed(2)}</p>}
+                                        {t.mae != null && <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Legacy MAE (unit unverified)</span> {t.mae.toFixed(2)}</p>}
+                                        {t.mfe != null && <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Legacy MFE (unit unverified)</span> {t.mfe.toFixed(2)}</p>}
                                         {t.holding_time_seconds != null && <p><span className="text-surface-400 block text-xs mb-1 uppercase tracking-wider">Hold Time</span> {(t.holding_time_seconds / 60).toFixed(1)}m</p>}
                                       </div>
                                     )}
@@ -291,7 +293,7 @@ const Journal: React.FC = () => {
                                     <AlertTriangle size={16} className="mr-2 text-warning-light" /> Confluence Snapshot
                                   </h4>
                                   <pre className="bg-surface-800 p-4 rounded-lg border border-surface-700 text-xs text-surface-300 overflow-x-auto">
-                                    {JSON.stringify(JSON.parse(t.confluence_snapshot), null, 2)}
+                                    {JSON.stringify(retainedJSON(t.confluence_snapshot), null, 2)}
                                   </pre>
                                 </div>
                               )}
@@ -301,80 +303,51 @@ const Journal: React.FC = () => {
 
                         {activeTradeTab === 'replay' && (
                           <div className="animate-in fade-in duration-300">
-                            {tradeReplays[t.id] ? (
-                              <TradeReplayChart trade={t} candles={tradeReplays[t.id].candles} />
+                            {exitReplays[t.id] ? (
+                              <ExitReplayPanel replay={exitReplays[t.id]} />
                             ) : (
-                              <div className="text-surface-400 text-sm py-12 text-center">Loading chart data...</div>
+                              <div className="text-surface-400 text-sm py-12 text-center">{detailErrors[`${t.id}:replay`] || 'Loading retained decision trace...'}</div>
                             )}
                           </div>
                         )}
 
-                        {activeTradeTab === 'whatif' && (
+                        {activeTradeTab === 'quality' && (
                           <div className="animate-in fade-in duration-300">
-                            {whatIfs[t.id] ? (
-                              <div className="grid grid-cols-3 gap-6">
+                            {exitQuality[t.id] ? (
+                              <div className="space-y-4">
+                                {!exitQuality[t.id].eligible && <p className="rounded border border-amber-700/50 bg-amber-950/20 p-3 text-sm text-amber-200">Excluded from aggregate research: {exitQuality[t.id].exclusion_reason || 'unavailable execution facts'}.</p>}
+                                <p className="text-xs text-surface-400">Accounting: {exitQuality[t.id].quality} · Replay: {exitQuality[t.id].replay_status} · Metric coverage: {exitQuality[t.id].coverage.available_count}/{exitQuality[t.id].coverage.total_count}</p>
+                                <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
                                 <div className="bg-surface-800 p-5 rounded-lg border border-surface-700 shadow-md">
-                                  <h4 className="text-sm font-semibold text-surface-300 mb-2">Held to End of Day</h4>
-                                  <div className={`text-2xl font-bold ${whatIfs[t.id].eod_pnl > 0 ? 'text-profit-light' : 'text-loss-light'}`}>
-                                    {whatIfs[t.id].eod_pnl > 0 ? '+' : ''}₹{whatIfs[t.id].eod_pnl.toFixed(2)}
-                                  </div>
-                                  <p className="text-xs text-surface-400 mt-2">Vs Actual: ₹{t.pnl?.toFixed(2) || 0}</p>
+                                  <h4 className="text-sm font-semibold text-surface-300 mb-2">Captured R</h4>
+                                  <div className="text-2xl font-bold text-white">{formatR(exitQuality[t.id]!.metrics.captured_net_r)} net</div>
+                                  <p className="text-xs text-surface-400 mt-2">Gross: {formatR(exitQuality[t.id]!.metrics.captured_gross_r)}</p>
                                 </div>
                                 <div className="bg-surface-800 p-5 rounded-lg border border-surface-700 shadow-md">
-                                  <h4 className="text-sm font-semibold text-surface-300 mb-2">If Held to Target</h4>
-                                  {whatIfs[t.id].target_hit ? (
-                                    <>
-                                      <div className="text-2xl font-bold text-profit-light">Hit Target</div>
-                                      <p className="text-xs text-surface-400 mt-2">At {new Date(whatIfs[t.id].target_hit_time || '').toLocaleTimeString()}</p>
-                                    </>
-                                  ) : (
-                                    <div className="text-2xl font-bold text-surface-400">Target Not Hit</div>
-                                  )}
+                                  <h4 className="text-sm font-semibold text-surface-300 mb-2">MFE / MAE</h4>
+                                  <div className="text-xl font-bold text-white">{formatR(exitQuality[t.id]!.metrics.mfe_r)} / {formatR(exitQuality[t.id]!.metrics.mae_r)}</div>
+                                  <p className="text-xs text-surface-400 mt-2">{exitQuality[t.id].coverage.extrema_quality}</p>
                                 </div>
                                 <div className="bg-surface-800 p-5 rounded-lg border border-surface-700 shadow-md">
-                                  <h4 className="text-sm font-semibold text-surface-300 mb-2">1.5x Wider Stop Loss</h4>
-                                  <div className="text-sm text-surface-200 mb-1">Stop: ₹{whatIfs[t.id].wider_stop_price.toFixed(2)}</div>
-                                  <div className={`text-xl font-bold ${whatIfs[t.id].wider_stop_pnl > 0 ? 'text-profit-light' : 'text-loss-light'}`}>
-                                    {whatIfs[t.id].wider_stop_pnl > 0 ? '+' : ''}₹{whatIfs[t.id].wider_stop_pnl.toFixed(2)}
-                                  </div>
+                                  <h4 className="text-sm font-semibold text-surface-300 mb-2">Price-path giveback</h4>
+                                  <div className="text-xl font-bold text-white">{formatR(exitQuality[t.id]!.metrics.r_given_back)}</div>
+                                  <p className="text-xs text-surface-400 mt-2">MFE capture: {exitQuality[t.id]!.metrics.mfe_capture_pct == null ? 'Unavailable' : `${exitQuality[t.id]!.metrics.mfe_capture_pct?.toFixed(1)}%`}</p>
+                                  <p className="text-xs text-surface-400 mt-2">Initial-quantity opportunity proxy.</p>
+                                </div>
+                                <div className="bg-surface-800 p-5 rounded-lg border border-surface-700 shadow-md">
+                                  <h4 className="text-sm font-semibold text-surface-300 mb-2">Exposure-aware giveback</h4>
+                                  <div className="text-xl font-bold text-white">{formatR(exitQuality[t.id].metrics.exposure_aware_r_given_back)}</div>
+                                  <p className="text-xs text-surface-400 mt-2">Peak trade P&amp;L: {formatR(exitQuality[t.id].metrics.exposure_peak_r)}</p>
                                 </div>
                               </div>
-                            ) : (
-                              <div className="text-surface-400 text-sm py-12 text-center">Loading scenarios...</div>
-                            )}
-                          </div>
-                        )}
-
-                        {activeTradeTab === 'ai' && (
-                          <div className="animate-in fade-in duration-300">
-                            {llmPostMortems[t.id] ? (
-                              llmPostMortems[t.id].error ? (
-                                <div className="bg-red-500/10 border border-red-500/20 text-red-400 p-4 rounded-lg flex items-center">
-                                  <AlertTriangle className="mr-3" size={20} />
-                                  {llmPostMortems[t.id].error}
-                                </div>
-                              ) : (
-                                <div className="bg-surface-800 p-6 rounded-lg border border-surface-700 shadow-md">
-                                  <h4 className="flex items-center text-sm font-semibold text-accent-light mb-4 uppercase tracking-widest">
-                                    <Cpu size={16} className="mr-2" /> AI Analysis
-                                  </h4>
-                                  <div className="prose prose-invert prose-sm max-w-none prose-p:leading-relaxed prose-headings:text-white prose-a:text-accent-light">
-                                    {/* Using a simple replace for markdown since we don't have react-markdown */}
-                                    {llmPostMortems[t.id].analysis?.split('\n').map((line, i) => {
-                                      if (line.startsWith('## ')) return <h3 key={i} className="text-lg mt-4 mb-2">{line.replace('## ', '')}</h3>;
-                                      if (line.startsWith('# ')) return <h2 key={i} className="text-xl mt-4 mb-2">{line.replace('# ', '')}</h2>;
-                                      if (line.startsWith('* ') || line.startsWith('- ')) return <li key={i} className="ml-4">{line.substring(2)}</li>;
-                                      if (line.trim() === '') return <br key={i} />;
-                                      return <p key={i}>{renderAnalysisLine(line)}</p>;
-                                    })}
-                                  </div>
-                                </div>
-                              )
-                            ) : (
-                              <div className="text-surface-400 text-sm py-12 flex flex-col items-center justify-center">
-                                <div className="animate-spin h-6 w-6 border-2 border-surface-600 border-t-accent-light rounded-full mb-4" />
-                                Analyzing trade with AI...
+                              <div className="rounded border border-surface-700 bg-surface-800 p-4 text-sm text-surface-300">
+                                <strong className="text-white">Risk-constrained hold-N:</strong> {exitQuality[t.id].hold_n?.message || exitQuality[t.id].hold_n?.censor_reason || 'Unavailable'}
+                                <p className="mt-2 text-xs">Status: {exitQuality[t.id].hold_n?.status || 'Unavailable'}. Forward research diagnostics are separate from the original decision.</p>
                               </div>
+                              <details className="rounded border border-surface-700 p-4 text-xs text-surface-300"><summary className="cursor-pointer">Metrics, timing, units and research assumptions</summary><pre className="mt-3 overflow-x-auto whitespace-pre-wrap">{JSON.stringify(exitQuality[t.id], null, 2)}</pre></details>
+                              </div>
+                            ) : (
+                              <div className="text-surface-400 text-sm py-12 text-center">{detailErrors[`${t.id}:quality`] || 'Loading quality metrics...'}</div>
                             )}
                           </div>
                         )}
@@ -470,16 +443,16 @@ const Journal: React.FC = () => {
           </div>
         </div>
 
-        {/* Signal Score Calibration */}
+        {/* Entry score outcome frequency; this is not a probability forecast. */}
         <div className="bg-surface-800 rounded-xl p-6 border border-surface-700 shadow-lg transition-transform hover:-translate-y-1 duration-300">
           <h3 className="text-lg font-semibold text-white mb-6 flex items-center">
-            <Activity className="mr-2 text-accent-light" size={20} /> Signal Score Calibration
+            <Activity className="mr-2 text-accent-light" size={20} /> Entry Score Outcome Frequency
           </h3>
           <div className="space-y-5">
             {calibration.map((c, idx) => (
               <div key={c.signal_score_bucket} className="flex flex-col space-y-2">
                 <div className="flex justify-between text-sm">
-                  <span className="text-surface-300 font-medium">Predicted: {c.signal_score_bucket}%</span>
+                  <span className="text-surface-300 font-medium">Entry score: {c.signal_score_bucket}</span>
                   <span className="font-semibold text-white">Actual: {c.actual_win_rate_pct}% <span className="text-surface-400 font-normal">({c.total_trades} trades)</span></span>
                 </div>
                 <div className="h-3 w-full bg-surface-900 rounded-full overflow-hidden shadow-inner">
@@ -490,6 +463,32 @@ const Journal: React.FC = () => {
           </div>
         </div>
       </div>
+
+      {qualityReport && (
+        <div className="bg-surface-800 rounded-xl p-6 border border-surface-700 shadow-lg">
+          <h3 className="text-lg font-semibold text-white mb-2">Exit Quality Coverage</h3>
+          <p className="text-xs text-surface-400 mb-5">{qualityReport.research_label}</p>
+          <div className="grid grid-cols-3 gap-4 text-sm">
+            <div><span className="block text-surface-400">Eligible</span><span className="text-white text-xl">{qualityReport.records_eligible}</span></div>
+            <div><span className="block text-surface-400">Excluded</span><span className="text-white text-xl">{qualityReport.records_excluded}</span></div>
+            <div><span className="block text-surface-400">Avg net R</span><span className="text-white text-xl">{qualityReport.averages.captured_net_r == null ? 'Unavailable' : `${qualityReport.averages.captured_net_r.toFixed(2)}R`}</span></div>
+          </div>
+          {qualityReport.reason_distribution.length > 0 && <div className="mt-5 text-xs text-surface-300">Reason distribution: {qualityReport.reason_distribution.map(item => `${item.initiating_reason_code} → ${item.execution_outcome_code} (${item.count})`).join(', ')}</div>}
+          <details className="mt-5 text-sm text-surface-300">
+            <summary className="cursor-pointer">Metric denominators and cohort comparisons</summary>
+            <table className="mt-3 w-full text-left text-xs"><thead><tr><th>Metric</th><th>Available / eligible</th><th>Mean</th></tr></thead><tbody>
+              {Object.entries(qualityReport.coverage).map(([metric, coverage]) => <tr key={metric}><td className="py-1">{metric}</td><td>{coverage.available} / {coverage.eligible}</td><td>{qualityReport.averages[metric] == null ? 'Unavailable' : qualityReport.averages[metric]?.toFixed(3)}</td></tr>)}
+            </tbody></table>
+            <table className="mt-4 w-full text-left text-xs"><thead><tr><th>Dimension</th><th>Cohort</th><th>Trades</th><th>Average net R</th></tr></thead><tbody>
+              {qualityReport.cohorts.map(cohort => <tr key={`${cohort.dimension}:${cohort.value}`}><td className="py-1">{cohort.dimension}</td><td>{cohort.value}</td><td>{cohort.count}</td><td>{formatR(cohort.average_net_r)}</td></tr>)}
+            </tbody></table>
+          </details>
+          <details className="mt-4 text-xs text-surface-300">
+            <summary className="cursor-pointer">Action distributions, censoring and quality diagnostics</summary>
+            <pre className="mt-3 overflow-x-auto whitespace-pre-wrap">{JSON.stringify({ ...qualityReport, records: undefined }, null, 2)}</pre>
+          </details>
+        </div>
+      )}
 
       {/* Exit Reasons */}
       <div className="bg-surface-800 rounded-xl p-6 border border-surface-700 shadow-lg">
@@ -562,6 +561,7 @@ const Journal: React.FC = () => {
         </button>
       </div>
 
+      {loadError && <p role="alert" className="mb-4 text-sm text-amber-200">{loadError}</p>}
       <div className="relative">
         {loading && trades.length === 0 ? (
           <div className="absolute inset-0 z-10 flex items-center justify-center py-20 bg-surface-900/50 backdrop-blur-sm rounded-lg">

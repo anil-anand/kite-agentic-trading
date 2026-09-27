@@ -4,7 +4,8 @@ import { useKiteAPI } from '../hooks/useKiteAPI';
 import PnLDisplay from '../components/PnLDisplay';
 import PositionCard from '../components/PositionCard';
 import { Activity } from 'lucide-react';
-import type { Position } from '@shared/types';
+import type { ActivePositionExplanation, Position } from '@shared/types';
+import { matchPositionExplanation } from '../utils/position-explanations';
 
 const Dashboard: React.FC = () => {
   const { dashboard, positions, agentState, activityLog, setDashboard, setPositions } = useTradingStore();
@@ -15,6 +16,7 @@ const Dashboard: React.FC = () => {
   const [flattenSubmitting, setFlattenSubmitting] = React.useState(false);
   const [controlPending, setControlPending] = React.useState(false);
   const [operatorError, setOperatorError] = React.useState<string | null>(null);
+  const [positionExplanations, setPositionExplanations] = React.useState<Record<string, ActivePositionExplanation>>({});
 
   const handleToggleAgent = async () => {
     if (controlPending) return;
@@ -37,12 +39,33 @@ const Dashboard: React.FC = () => {
   };
 
   React.useEffect(() => {
+    let active = true;
+    let fetching = false;
     const fetchData = async () => {
-      if (!useTradingStore.getState().auth.isLoggedIn) return;
-      const [summaryResult, positionsResult] = await Promise.allSettled([
+      if (!active || fetching) return;
+      if (!useTradingStore.getState().auth.isLoggedIn) {
+        setPositionExplanations({});
+        return;
+      }
+      fetching = true;
+      const [summaryResult, positionsResult, explanationsResult] = await Promise.allSettled([
         window.electronAPI?.dashboard.summary() ?? Promise.reject(new Error('Dashboard summary API unavailable')),
         window.electronAPI?.portfolio.positions() ?? Promise.reject(new Error('Positions API unavailable')),
+        window.electronAPI?.analytics?.getActivePositionExplanations?.() ?? Promise.resolve([]),
       ]);
+      fetching = false;
+      if (!active) return;
+      if (!useTradingStore.getState().auth.isLoggedIn) {
+        setPositionExplanations({});
+        return;
+      }
+
+      if (explanationsResult.status === 'fulfilled' && Array.isArray(explanationsResult.value)) {
+        setPositionExplanations(Object.fromEntries(explanationsResult.value.map((item: ActivePositionExplanation) => [item.position_key, item])));
+      } else {
+        // A failed refresh cannot leave a healthy thesis/confirmed stop on screen.
+        setPositionExplanations({});
+      }
 
       if (summaryResult.status === 'fulfilled' && summaryResult.value) {
         setDashboard(summaryResult.value);
@@ -88,7 +111,7 @@ const Dashboard: React.FC = () => {
     };
     fetchData();
     const interval = setInterval(fetchData, 10000); // refresh every 10s
-    return () => clearInterval(interval);
+    return () => { active = false; clearInterval(interval); };
   }, [setDashboard, setPositions]);
 
   const handleExit = async (position: Position) => {
@@ -181,6 +204,7 @@ const Dashboard: React.FC = () => {
                 <PositionCard
                   key={p.positionKey ?? p.tradingsymbol}
                   position={p}
+                  explanation={matchPositionExplanation(p, Object.values(positionExplanations))}
                   onExit={handleExit}
                   exitPending={operatorPending === p.positionKey || Boolean(p.positionKey && agentState.pendingClosePositionKeys?.includes(p.positionKey)) || agentState.hardFlattenPending}
                 />
@@ -202,6 +226,12 @@ const Dashboard: React.FC = () => {
               <span className="text-surface-300">Mode</span>
               <span className="text-white capitalize">{agentState.effectiveMode ?? agentState.mode}</span>
             </div>
+            <dl className="mb-4 space-y-2 text-xs text-surface-300">
+              <div className="flex justify-between"><dt>Position supervision</dt><dd>{agentState.supervisionActive ? 'ACTIVE' : 'UNVERIFIED'}</dd></div>
+              <div className="flex justify-between"><dt>Broker data</dt><dd>{positionQuality || 'UNKNOWN'}</dd></div>
+              <div className="flex justify-between"><dt>Reconciliation</dt><dd>{agentState.reconciliationPending || agentState.lifecycleRecoveryPending ? 'PENDING' : dashboard?.reconciliationStatus || 'UNKNOWN'}</dd></div>
+              <div className="flex justify-between"><dt>Daily-loss latch</dt><dd>{summaryQuality || dashboard?.killSwitchActive == null ? 'UNKNOWN' : dashboard.killSwitchActive ? 'LATCHED' : 'CLEAR'}</dd></div>
+            </dl>
             <button 
               onClick={handleToggleAgent}
               disabled={controlPending}

@@ -3,7 +3,7 @@ import { useTradingStore } from '../stores/trading-store';
 
 const StatusBar: React.FC = () => {
   const { auth, connectionStatus, agentState, dashboard } = useTradingStore();
-  const pnl = dashboard?.totalPnl ?? null;
+  const pnl = dashboard?.netPnl ?? null;
 
   // Simple IST check
   const isMarketOpen = () => {
@@ -21,8 +21,8 @@ const StatusBar: React.FC = () => {
 
   const marketOpen = isMarketOpen();
   
-  // If we are logged in, assume connected to Kite unless explicitly disconnected
-  const isConnected = auth.isLoggedIn && connectionStatus !== 'disconnected';
+  const isConnected = auth.isLoggedIn && connectionStatus === 'connected';
+  const entriesBlocked = agentState.reconciliationPending || agentState.lifecycleRecoveryPending || agentState.controlStateInvalid || agentState.protectionFailureHalt || agentState.hardFlattenPending || dashboard?.killSwitchActive;
 
   return (
     <div className="h-8 bg-surface-950 border-t border-surface-800 flex items-center justify-between px-4 text-xs font-mono">
@@ -38,21 +38,20 @@ const StatusBar: React.FC = () => {
         )}
         <div className="flex items-center gap-2">
           <div className={`w-2 h-2 rounded-full ${isConnected ? 'bg-profit-light' : 'bg-loss-light'}`} />
-          <span className="text-surface-300 capitalize">{isConnected ? 'connected' : 'disconnected'}</span>
+          <span className="text-surface-300 capitalize">{isConnected ? 'connected' : connectionStatus}</span>
         </div>
         <div className={`text-surface-400 ${marketOpen ? 'text-profit-light' : ''}`}>
-          Market: {marketOpen ? 'OPEN' : 'CLOSED'}
+          Weekday session window: {marketOpen ? 'IN HOURS' : 'OUT OF HOURS'}
         </div>
       </div>
       <div className="flex items-center gap-2 text-surface-400">
-        Agent Status: <span className="text-white">
-          {!agentState.running ? 'STOPPED' : agentState.status === 'idle' ? 'SCANNING' : agentState.status.toUpperCase()}
-        </span>
+        Entries: <span className="text-white">{entriesBlocked ? 'BLOCKED' : agentState.running && !agentState.entryPaused ? 'ENABLED' : 'PAUSED'}</span>
+        · Supervision: <span className={agentState.supervisionActive ? 'text-white' : 'text-amber-200'}>{agentState.supervisionActive ? 'ACTIVE' : 'UNVERIFIED'}</span>
       </div>
       <div className="flex items-center gap-2">
-        <span className="text-surface-400">Today's P&L:</span>
+        <span className="text-surface-400">Today's net P&L:</span>
         <span className={`font-bold ${pnl == null ? 'text-surface-300' : pnl >= 0 ? 'text-profit-light' : 'text-loss-light'}`}>
-          {pnl == null ? 'Unavailable' : `₹${pnl.toFixed(2)}`}
+          {pnl == null ? 'Unavailable' : `${pnl >= 0 ? '+' : '-'}₹${Math.abs(pnl).toFixed(2)}`}
         </span>
       </div>
     </div>

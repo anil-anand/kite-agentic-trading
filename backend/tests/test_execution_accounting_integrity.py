@@ -98,7 +98,7 @@ def test_incomplete_entry_allocation_cannot_become_verified_outcome(
 
 @pytest.mark.parametrize("already_closed", [False, True])
 def test_late_entry_time_repairs_active_and_journal_before_verified_close(
-    lifecycle, already_closed
+    lifecycle, already_closed, monkeypatch
 ):
     e = lifecycle
     actual_time = now_utc() - timedelta(minutes=5)
@@ -126,6 +126,10 @@ def test_late_entry_time_repairs_active_and_journal_before_verified_close(
     if not already_closed:
         assert e.engine.active_trades["RELIANCE"]["entry_time"] == actual_time
     assert verified_outcome(row)
+    # Query the repaired execution session explicitly. Subtracting five minutes
+    # from wall time can cross exchange midnight; that trade correctly belongs
+    # to yesterday and must not make this repair test fail near midnight.
+    monkeypatch.setattr("backend.journal.now_utc", lambda: actual_time)
     assert e.journal.get_verified_todays_outcomes()[0]["id"] == row["id"]
 
 

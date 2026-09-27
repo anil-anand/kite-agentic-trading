@@ -132,10 +132,10 @@ def serialize_replay_artifact(value: Any) -> Any:
     """Detach typed replay inputs into deterministic JSON-compatible values."""
     if hasattr(value, "to_dict"):
         return serialize_replay_artifact(value.to_dict())
-    if hasattr(value, "value"):
-        return serialize_replay_artifact(value.value)
     if hasattr(value, "isoformat"):
         return value.isoformat()
+    if hasattr(value, "value"):
+        return serialize_replay_artifact(value.value)
     if isinstance(value, tzinfo):
         return str(value)
     if isinstance(value, (set, frozenset)):

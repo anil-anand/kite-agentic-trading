@@ -12,6 +12,8 @@ test('Dashboard overlays partial polls on the latest store until verified empty'
   let cleared = false;
   let nextResponse;
   let requests = 0;
+  let explanationState = {};
+  let explanationUnavailable = false;
   const state = {
     positions: [], dashboard: null, agentState: {}, activityLog: [],
     auth: { isLoggedIn: true },
@@ -44,13 +46,17 @@ test('Dashboard overlays partial polls on the latest store until verified empty'
     module: { exports: {} }, console, Map, Set, Promise,
     fixtureStore: store,
     fixtureReact: {
-      useState: (initial) => [initial, () => {}],
+      useState: (initial) => [initial, (next) => { if (initial && typeof initial === 'object') explanationState = next; }],
       useEffect: (callback) => { effect = callback; },
       createElement: () => null,
     },
     window: { electronAPI: {
       dashboard: { summary: async () => ({ totalPnl: 10 }) },
       portfolio: { positions: async () => { requests++; return nextResponse; } },
+      analytics: { getActivePositionExplanations: async () => {
+        if (explanationUnavailable) throw new Error('explanation transport unavailable');
+        return [{ position_key: 'LIVE:A:NSE:A:MIS', health: 'VALID', protection: { confirmed_stop: 98 } }];
+      } },
     } },
     setInterval: (callback) => { poll = callback; return 1; },
     clearInterval: () => { cleared = true; },
@@ -62,6 +68,8 @@ test('Dashboard overlays partial polls on the latest store until verified empty'
   const cleanup = effect();
   await new Promise(setImmediate);
   assert.deepEqual(state.positions.map(p => [p.tradingsymbol, p.quantity]), [['A', 10], ['B', 20]]);
+  assert.equal(explanationState['LIVE:A:NSE:A:MIS'].health, 'VALID');
+  explanationUnavailable = true;
   for (const [response, expected] of [
     [{ snapshotQuality: 'PARTIAL', net: [row('A', 4)] }, [['A', 4], ['B', 20]]],
     [{ snapshotQuality: 'PARTIAL', net: [row('C', 5)] }, [['A', 4], ['B', 20], ['C', 5]]],
@@ -74,6 +82,7 @@ test('Dashboard overlays partial polls on the latest store until verified empty'
     nextResponse = response;
     await poll();
     assert.deepEqual(Array.from(state.positions, p => [p.tradingsymbol, p.quantity]), expected);
+    assert.equal(Object.keys(explanationState).length, 0, 'failed explanation refresh cannot retain a healthy thesis or a confirmed stop');
   }
   assert.equal(requests, 8);
   cleanup();

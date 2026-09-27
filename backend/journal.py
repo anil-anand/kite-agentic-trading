@@ -1281,6 +1281,97 @@ class TradeJournal:
             result.append(item)
         return result
 
+    def get_managed_position_for_trade(self, trade_id: str) -> Optional[Dict[str, Any]]:
+        """Resolve the durable exit-management owner for a journal trade."""
+
+        if not isinstance(trade_id, str) or not trade_id:
+            return None
+        conn = self._get_conn()
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM managed_positions WHERE trade_id = ?", (trade_id,)
+        ).fetchone()
+        return self._managed_position_row(row)
+
+    def get_latest_exit_decision(self, position_key: str) -> Optional[Dict[str, Any]]:
+        """Read the latest assessment without loading a position's entire history."""
+
+        conn = self._get_conn()
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM exit_decision_records WHERE position_key = ? "
+            "ORDER BY state_after_version DESC, state_before_version DESC, "
+            "decision_id DESC LIMIT 1",
+            (position_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["payload"] = self._decode_exit_payload(row["payload"])
+        result["payload_corrupt"] = not isinstance(result["payload"], dict)
+        if result["payload_corrupt"]:
+            result["payload"] = None
+        return result
+
+    def get_position_order_intents(self, position_key: str) -> List[Dict[str, Any]]:
+        """Return intent projections for explanation/replay, never broker facts."""
+
+        conn = self._get_conn()
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT intent_id FROM order_intents WHERE position_key = ? "
+            "ORDER BY created_at ASC, intent_id ASC",
+            (position_key,),
+        ).fetchall()
+        return [
+            projection
+            for row in rows
+            if (projection := self.get_order_intent_projection(row["intent_id"]))
+            is not None
+        ]
+
+    def get_exit_management_replay(self, trade_id: str) -> Optional[Dict[str, Any]]:
+        """Read only the retained inputs needed to explain a managed trade.
+
+        This deliberately does not retrieve today's historical candles.  A
+        record either has its immutable candidate inputs or is represented as a
+        legacy/unavailable record; changing market history cannot rewrite an
+        earlier decision explanation.
+        """
+
+        position = self.get_managed_position_for_trade(trade_id)
+        if position is None:
+            return None
+        position_key = position["position_key"]
+        conn = self._get_conn()
+        conn.row_factory = sqlite3.Row
+        attempts = conn.execute(
+            "SELECT a.* FROM order_attempts a JOIN order_intents i "
+            "ON i.intent_id = a.intent_id WHERE i.position_key = ? "
+            "ORDER BY a.created_at, a.attempt_id",
+            (position_key,),
+        ).fetchall()
+        events = conn.execute(
+            "SELECT e.* FROM order_lifecycle_events e JOIN order_intents i "
+            "ON i.intent_id = e.intent_id WHERE i.position_key = ? "
+            "ORDER BY e.timestamp, e.id",
+            (position_key,),
+        ).fetchall()
+        return {
+            "trade": self.get_trade(trade_id),
+            "position": position,
+            "thesis": self.get_position_thesis(position_key),
+            "decisions": self.get_exit_decisions(position_key),
+            "intents": self.get_position_order_intents(position_key),
+            "checkpoints": self.get_position_checkpoints(position_key),
+            "attempts": [dict(row) for row in attempts],
+            "execution_events": [dict(row) for row in events],
+            "fills": self.get_position_fills(
+                position_key,
+                broker_order_ids=self.get_position_order_ids(position_key),
+            ),
+        }
+
     def import_legacy_active_snapshot(
         self, trades: Mapping[str, Any], *, source: str = "active_trades.json"
     ) -> List[str]:

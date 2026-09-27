@@ -269,12 +269,12 @@ const AgentControl: React.FC = () => {
                         : !isCalibrated
                           ? 'Exploring (Uncalibrated)'
                           : !isProbHigh
-                            ? `Prob < 60% (${(prob * 100).toFixed(1)}%)`
+                          ? `Historical score-bucket estimate < 60% (${(prob * 100).toFixed(1)}%)`
                             : 'Meets criteria';
 
                       return (
                         <div className="flex items-center justify-between mt-1 p-2 bg-surface-900 rounded border border-surface-700">
-                          <span className="text-xs text-surface-400">Will Auto-Enter:</span>
+                          <span className="text-xs text-surface-400">Preliminary entry eligibility:</span>
                           <div className="flex items-center gap-1.5">
                             <span className={`text-xs font-bold ${willAutoEnter ? 'text-profit-light' : 'text-surface-400'}`}>
                               {willAutoEnter ? 'YES' : 'NO'}

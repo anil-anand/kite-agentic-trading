@@ -35,6 +35,10 @@ _RESEARCH_METHODS = {
     "discover_models",
     "analytics_llm_post_mortem",
     "analytics_what_if",
+    "analytics_exit_quality_report",
+    "analytics_exit_quality_trade",
+    "analytics_exit_management_replay",
+    "analytics_active_position_explanations",
     "run_backtest",
     "scan_now",
     "get_historical",
@@ -536,6 +540,18 @@ def _handle_request(req):
         elif method == "analytics_exit_reason_effectiveness":
             return success(analytics.get_exit_reason_effectiveness())
 
+        elif method == "analytics_exit_quality_report":
+            return success(analytics.get_exit_quality_report())
+
+        elif method == "analytics_exit_quality_trade":
+            return success(analytics.get_exit_quality_for_trade(params.get("trade_id")))
+
+        elif method == "analytics_exit_management_replay":
+            return success(analytics.get_exit_management_replay(params.get("trade_id")))
+
+        elif method == "analytics_active_position_explanations":
+            return success(analytics.get_active_position_explanations())
+
         elif method == "analytics_trade_replay":
             return success(analytics.get_trade_replay(params.get("trade_id")))
 
@@ -603,7 +619,11 @@ def _handle_request(req):
             engine.load_data(symbol, df)
             engine.run()
 
-            metrics = MetricsEvaluator.evaluate(engine.broker.trades, initial_capital)
+            metrics = MetricsEvaluator.evaluate(
+                engine.broker.trades,
+                initial_capital,
+                equity_curve=engine.equity_curve,
+            )
             # This RPC intentionally remains the historical raw-strategy lab.
             # Candidate exit research uses fixed/replayable opportunities through
             # the phase-8 adapter and is not presented as production parity.
@@ -615,7 +635,7 @@ def _handle_request(req):
                     "trades": engine.broker.trades,
                     "censored_positions": engine.broker.censored_positions,
                     "equity_curve": engine.equity_curve,
-                    "metrics_basis": "COMPLETED_TRADES_ONLY",
+                    "metrics_basis": metrics["metrics_basis"],
                 }
             )
 

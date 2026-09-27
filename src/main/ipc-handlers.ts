@@ -233,6 +233,22 @@ export function setupIpcHandlers() {
     return await pythonBridge.call('analytics_exit_reason_effectiveness');
   });
 
+  ipcMain.handle(channels.ANALYTICS_EXIT_QUALITY_REPORT, async () => {
+    return await pythonBridge.call('analytics_exit_quality_report');
+  });
+
+  ipcMain.handle(channels.ANALYTICS_EXIT_QUALITY_TRADE, async (_, trade_id: string) => {
+    return await pythonBridge.call('analytics_exit_quality_trade', { trade_id });
+  });
+
+  ipcMain.handle(channels.ANALYTICS_EXIT_MANAGEMENT_REPLAY, async (_, trade_id: string) => {
+    return await pythonBridge.call('analytics_exit_management_replay', { trade_id });
+  });
+
+  ipcMain.handle(channels.ANALYTICS_ACTIVE_POSITION_EXPLANATIONS, async () => {
+    return await pythonBridge.call('analytics_active_position_explanations');
+  });
+
   ipcMain.handle(channels.ANALYTICS_TRADE_REPLAY, async (_, trade_id: string) => {
     return await pythonBridge.call('analytics_trade_replay', { trade_id });
   });

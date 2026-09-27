@@ -1,7 +1,7 @@
 import { useEffect } from 'react';
 import { useTradingStore } from '../stores/trading-store';
 import * as IPC from '@shared/ipc-channels';
-import { OrderRequest, KiteCredentials, StrategyName, OrderVariety } from '@shared/types';
+import { OrderRequest, KiteCredentials, StrategyName, OrderVariety, ExitQualityReport, ExitQualityRecord, ExitDecisionReplay, ActivePositionExplanation } from '@shared/types';
 
 export interface ElectronAPI {
   isDevMode?: boolean;
@@ -48,6 +48,10 @@ export interface ElectronAPI {
     getConfluenceValidation(): Promise<any>;
     getSignalScoreCalibration(): Promise<any>;
     getExitReasonEffectiveness(): Promise<any>;
+    getExitQualityReport(): Promise<ExitQualityReport>;
+    getExitQualityForTrade(tradeId: string): Promise<ExitQualityRecord & { error?: string }>;
+    getExitManagementReplay(tradeId: string): Promise<ExitDecisionReplay & { error?: string }>;
+    getActivePositionExplanations(): Promise<ActivePositionExplanation[]>;
     getTradeReplay(tradeId: string): Promise<any>;
     getWhatIfAnalysis(tradeId: string): Promise<any>;
     getLlmPostMortem(tradeId: string): Promise<any>;

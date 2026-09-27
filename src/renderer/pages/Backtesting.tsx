@@ -1,6 +1,9 @@
 import React, { useState } from 'react';
 import { Play, TrendingUp, DollarSign, Activity, ListOrdered } from 'lucide-react';
 
+const metricValue = (value: unknown, unit = '') => typeof value !== 'number' || !Number.isFinite(value) ? 'Unavailable' : `${value.toFixed(2)}${unit}`;
+const currencyValue = (value: unknown) => typeof value !== 'number' || !Number.isFinite(value) ? 'Unavailable' : `${value < 0 ? '-' : ''}₹${Math.abs(value).toFixed(2)}`;
+
 // Hardcoded strategies list for now (matching backend scanner.py mapping)
 const STRATEGIES = [
   { id: 'ema_crossover', name: 'EMA Crossover' },
@@ -55,7 +58,7 @@ const Backtesting: React.FC = () => {
             Backtesting Lab
           </h1>
           <p className="text-sm text-surface-400 mt-1">
-            Simulate strategies over historical intraday data
+            Raw-strategy research lab with declared simulation assumptions; it is not live-policy parity.
           </p>
         </div>
       </div>
@@ -132,15 +135,17 @@ const Backtesting: React.FC = () => {
 
       {results && results.metrics && (
         <div className="flex-1 overflow-auto flex flex-col gap-6">
+          <p className="rounded border border-amber-700/50 bg-amber-950/20 p-3 text-xs text-amber-200">Metrics basis: {results.metrics_basis || results.metrics.metrics_basis || 'Unavailable'}. Candidate exit studies require retained replay artifacts and are reported separately.</p>
           <div className="grid grid-cols-4 gap-4">
-            <MetricCard title="Net PnL" value={`₹${results.metrics.net_profit?.toFixed(2)}`} icon={<DollarSign className="w-5 h-5" />} trend={results.metrics.net_profit >= 0 ? 'up' : 'down'} />
-            <MetricCard title="Win Rate" value={`${(results.metrics.win_rate * 100)?.toFixed(1)}%`} icon={<TrendingUp className="w-5 h-5" />} />
+            <MetricCard title="Net PnL" value={currencyValue(results.metrics.net_profit)} icon={<DollarSign className="w-5 h-5" />} trend={results.metrics.net_profit == null ? undefined : results.metrics.net_profit >= 0 ? 'up' : 'down'} />
+            <MetricCard title="Win Rate" value={metricValue(results.metrics.win_rate == null ? null : results.metrics.win_rate * 100, '%')} icon={<TrendingUp className="w-5 h-5" />} />
             <MetricCard title="Total Trades" value={results.metrics.trade_count} icon={<ListOrdered className="w-5 h-5" />} />
-            <MetricCard title="Expectancy" value={`₹${results.metrics.expectancy?.toFixed(2)}`} icon={<Activity className="w-5 h-5" />} />
-            <MetricCard title="Profit Factor" value={results.metrics.profit_factor?.toFixed(2)} icon={<Activity className="w-5 h-5" />} />
-            <MetricCard title="Max Drawdown" value={`₹${results.metrics.max_drawdown?.toFixed(2)}`} icon={<TrendingUp className="w-5 h-5 text-red-400" />} />
-            <MetricCard title="Avg R-Multiple" value={`${results.metrics.avg_r?.toFixed(2)} R`} icon={<Activity className="w-5 h-5" />} />
-            <MetricCard title="Fees & Taxes" value={`₹${results.metrics.total_fees_paid?.toFixed(2)}`} icon={<DollarSign className="w-5 h-5" />} />
+            <MetricCard title="Expectancy" value={currencyValue(results.metrics.expectancy)} icon={<Activity className="w-5 h-5" />} />
+            <MetricCard title="Profit Factor" value={metricValue(results.metrics.profit_factor)} icon={<Activity className="w-5 h-5" />} />
+            <MetricCard title="Portfolio MTM Drawdown" value={currencyValue(results.metrics.max_drawdown)} icon={<TrendingUp className="w-5 h-5 text-red-400" />} />
+            <MetricCard title="Avg R-Multiple" value={metricValue(results.metrics.avg_r, ' R')} icon={<Activity className="w-5 h-5" />} />
+            <MetricCard title="Fees & Taxes" value={currencyValue(results.metrics.total_fees_paid)} icon={<DollarSign className="w-5 h-5" />} />
+            <MetricCard title="Completed-trade Drawdown" value={currencyValue(results.metrics.completed_trade_drawdown)} icon={<TrendingUp className="w-5 h-5" />} />
           </div>
 
           <div className="bg-surface-800 border border-surface-700 rounded-lg flex-1 flex flex-col overflow-hidden">

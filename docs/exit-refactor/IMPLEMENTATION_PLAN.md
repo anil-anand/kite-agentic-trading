@@ -524,6 +524,16 @@ loss. User sees actual confirmed risk/execution state rather than only P&L.
 **Expected behavior:** actionable explanations and honest research diagnostics.
 LLM commentary remains optional, trace-linked and outside order authority.
 
+**Implementation/review evidence:** [PHASE9_REVIEW.md](PHASE9_REVIEW.md) records
+the adversarial findings, corrections, scenario coverage and validation. Reports
+use frozen fill-bound risk, verified financial eligibility, explicit metric
+coverage and execution-linked attribution. Retained replay and active panels
+separate shadow recommendations from actual protection/residual obligations.
+Hold-N diagnoses reachable price paths with censoring; paired alternative
+execution uses the isolated shared simulator with retained hard risk and costs.
+Missing historical observations remain unavailable. No commit, real broker
+operation or candidate live activation was performed by this review.
+
 ## Phase 10 — Robustness validation, controlled activation and legacy retirement
 
 **Responsibility:** establish evidence for promotion and retire conflicting normal

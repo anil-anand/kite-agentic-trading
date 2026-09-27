@@ -538,6 +538,102 @@ export interface WhatIfAnalysis {
   actual_pnl: number;
 }
 
+export interface ExitQualityMetrics {
+  risk_per_share_price: number | null;
+  initial_risk_currency: number | null;
+  mfe_price: number | null;
+  mae_price: number | null;
+  mfe_r: number | null;
+  mae_r: number | null;
+  captured_gross: number | null;
+  captured_net: number | null;
+  captured_gross_r: number | null;
+  captured_net_r: number | null;
+  mfe_capture_pct: number | null;
+  r_given_back: number | null;
+  exposure_peak_r: number | null;
+  exposure_aware_r_given_back: number | null;
+  holding_time_seconds: number | null;
+  decision_to_intent_seconds: number | null;
+  intent_to_fill_seconds: number | null;
+}
+
+export interface ExitQualityRecord {
+  trade_id: string;
+  eligible: boolean;
+  exclusion_reason: string | null;
+  quality: string;
+  reason_code: string | null;
+  execution_outcome_code: string | null;
+  replay_status: string;
+  retained_input_available: boolean;
+  metrics: ExitQualityMetrics;
+  coverage: {
+    available: Record<string, boolean>;
+    available_count: number;
+    total_count: number;
+    extrema_quality: string;
+  };
+  hold_n?: {
+    status: string;
+    censor_reason?: string;
+    message?: string;
+  };
+}
+
+export interface ExitDecisionReplay {
+  trade_id?: string;
+  available: boolean;
+  reason?: string;
+  thesis?: { payload?: Record<string, unknown> | null; payload_corrupt?: boolean } | null;
+  position?: { position_key?: string; state?: Record<string, unknown>; state_corrupt?: boolean };
+  decisions: Array<{ decision_id: string; payload: Record<string, unknown> | null; payload_corrupt?: boolean }>;
+  intents?: Array<Record<string, unknown>>;
+  checkpoints?: Array<Record<string, unknown>>;
+  attempts?: Array<Record<string, unknown>>;
+  fills?: Array<Record<string, unknown>>;
+  execution_events?: Array<Record<string, unknown>>;
+  exact_replay_complete?: boolean;
+  verification?: Array<{ decision_id: string; status: string; action?: string; reason_code?: string; message?: string }>;
+  replayability?: { reproduced: number; total: number; uses_current_market_data: boolean };
+}
+
+export interface ActivePositionExplanation {
+  position_key: string;
+  broker_position_key?: string;
+  namespace?: string | null;
+  account_id?: string | null;
+  exchange?: string | null;
+  product?: string | null;
+  instrument_id?: string | number | null;
+  symbol: string | null;
+  state_corrupt: boolean;
+  policy_mode?: string | null;
+  thesis: { strategy?: string | null; playbook?: string | null; setup_variant?: string | null; reasoning?: string | null; expected_behavior?: string | null; original_boundary?: number | null; initial_stop?: number | null; entry_price?: number | null };
+  health: string | null;
+  development: string | null;
+  exposure: string | null;
+  protection: { quality?: string | null; confirmed_stop?: number | null; requested_stop?: number | null; protected_quantity?: number | null; confirmed_stop_order_id?: string | null };
+  residual_quantity?: number | null;
+  pending_intent?: { intent_id?: string; intent_type?: string; status?: string; quantity?: number; reason?: string } | null;
+  context?: Record<string, unknown> | null;
+  quality?: Record<string, unknown> | null;
+  management: { u_r?: number | null; mfe_r?: number | null; mae_r?: number | null; giveback_r?: number | null; session_remaining_minutes?: number | null; last_bar_end?: string | null };
+  latest_decision: Record<string, unknown> | null;
+}
+
+export interface ExitQualityReport {
+  records_total: number;
+  records_eligible: number;
+  records_excluded: number;
+  records: ExitQualityRecord[];
+  averages: Record<string, number | null>;
+  coverage: Record<string, { available: number; eligible: number }>;
+  reason_distribution: Array<{ initiating_reason_code: string; execution_outcome_code: string; count: number }>;
+  cohorts: Array<{ dimension: string; value: string; count: number; average_net_r: number | null }>;
+  research_label: string;
+}
+
 export interface LLMPostMortem {
   analysis?: string;
   error?: string;

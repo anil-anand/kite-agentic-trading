@@ -7,13 +7,13 @@ interface Props {
 }
 
 const PnLDisplay: React.FC<Props> = ({ amount, netAmount, percentage }) => {
-  const value = netAmount;
+  const value = netAmount != null && Number.isFinite(netAmount) ? netAmount : null;
   const isProfit = value != null && value >= 0;
   
   return (
-    <div className={`flex flex-col items-center justify-center p-6 rounded-xl border border-surface-700 bg-surface-800 ${isProfit ? 'shadow-[0_0_15px_rgba(16,185,129,0.1)]' : 'shadow-[0_0_15px_rgba(244,63,94,0.1)]'}`}>
+    <div className={`flex flex-col items-center justify-center p-6 rounded-xl border border-surface-700 bg-surface-800 ${value == null ? '' : isProfit ? 'shadow-[0_0_15px_rgba(16,185,129,0.1)]' : 'shadow-[0_0_15px_rgba(244,63,94,0.1)]'}`}>
       <span className="text-surface-400 text-sm font-medium mb-1">Net P&L</span>
-      <div className={`text-4xl font-mono font-bold animate-count-up ${isProfit ? 'text-profit-light' : 'text-loss-light'}`}>
+      <div className={`text-4xl font-mono font-bold animate-count-up ${value == null ? 'text-surface-300' : isProfit ? 'text-profit-light' : 'text-loss-light'}`}>
         {value == null ? 'Unavailable' : `${isProfit ? '+' : '-'}₹${Math.abs(value).toFixed(2)}`}
       </div>
       <div className="flex flex-row space-x-4 mt-2">
