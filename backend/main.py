@@ -25,7 +25,7 @@ from .request_policy import Priority, broker_gateway
 from .risk_manager import risk_manager
 from .scanner import scanner
 from .ticker import ticker_manager
-from .time_utils import now_utc
+from .time_utils import as_utc, now_utc
 from .trading_engine import trading_engine
 from .utils import DateTimeEncoder
 
@@ -585,16 +585,39 @@ def _handle_request(req):
                 return error(-32000, "No historical data found for backtest")
 
             df = pd.DataFrame(records)
+            df["date"] = df["date"].map(as_utc)
+            df = df[df["date"] + timedelta(minutes=5) <= now].copy()
+            if df.empty:
+                return error(
+                    -32000, "No completed historical candles found for backtest"
+                )
             for col in ["open", "high", "low", "close"]:
                 if col in df.columns:
                     df[col] = df[col].astype(float)
 
-            engine = BacktestEngine(strategy, initial_capital=initial_capital)
+            engine = BacktestEngine(
+                strategy,
+                initial_capital=initial_capital,
+                risk_config=config_manager.get_risk_config(),
+            )
             engine.load_data(symbol, df)
             engine.run()
 
             metrics = MetricsEvaluator.evaluate(engine.broker.trades, initial_capital)
-            return success({"metrics": metrics, "trades": engine.broker.trades})
+            # This RPC intentionally remains the historical raw-strategy lab.
+            # Candidate exit research uses fixed/replayable opportunities through
+            # the phase-8 adapter and is not presented as production parity.
+            return success(
+                {
+                    "mode": engine.mode,
+                    "manifest": engine.run_manifest,
+                    "metrics": metrics,
+                    "trades": engine.broker.trades,
+                    "censored_positions": engine.broker.censored_positions,
+                    "equity_curve": engine.equity_curve,
+                    "metrics_basis": "COMPLETED_TRADES_ONLY",
+                }
+            )
 
         else:
             return error(-32601, f"Method '{method}' not found")

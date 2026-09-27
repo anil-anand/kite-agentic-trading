@@ -469,6 +469,16 @@ separate decision rules. Dataset/execution/cost versions recorded per run.
 **Expected behavior:** realistic, reproducible exit-only and full-stack comparisons,
 with conservative ambiguity and honest uncertainty rather than ideal fills.
 
+**Implementation/review evidence:** [PHASE8_REVIEW.md](PHASE8_REVIEW.md) records
+the hostile pre-commit findings, corrections, declared execution assumptions and
+phase boundaries. The fixed-admission candidate runner executes the shared
+policy/coordinator/reducer with partial fills, independent session deadlines,
+synchronized marked risk, retained exact-replay artifacts and explicit censoring.
+Production entry evaluation uses injected risk/config/time inputs; the raw lab
+remains separately labelled. Full portfolio selection/admission and promotion
+claims require the later research gates. Validation results are in the review.
+No commit, real broker order or candidate live activation was performed.
+
 ## Phase 9 — Exit-quality analytics and operator explanation
 
 **Responsibility:** answer why HOLD/weakening/exit and distinguish missed continuation

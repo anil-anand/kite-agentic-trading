@@ -19,7 +19,7 @@ import threading
 import uuid
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional, Protocol
 
 from .broker_models import OrderRole, OrderSubmissionRejected, OrderSubmissionUnknown
 
@@ -62,6 +62,17 @@ _TERMINAL_ORDER_STATUSES = {
     "REJECTED AMO",
 }
 _ANY_PREVIOUS_ATTEMPT = object()
+
+
+class CoordinatorBrokerAdapter(Protocol):
+    """Small common execution surface for live, paper and replay brokers.
+
+    The coordinator owns durable intent/attempt state; adapters only expose
+    broker facts and one mutation callback.  Keeping this protocol here stops
+    the simulator from growing a parallel handoff implementation.
+    """
+
+    def coordinator_callbacks(self, position_key: str) -> Mapping[str, Callable]: ...
 
 
 @dataclass(frozen=True)
@@ -671,4 +682,56 @@ class OrderLifecycleCoordinator:
             latched=True,
             existing_intent_id=intent_id,
             expected_previous_attempt_id=(latest or {}).get("attempt_id"),
+        )
+
+    def handoff_with_broker_adapter(
+        self,
+        *,
+        broker: CoordinatorBrokerAdapter,
+        position_key: str,
+        role: OrderRole | str,
+        side: str,
+        requested_quantity: int,
+        payload: dict[str, Any],
+        stop_order_id: Optional[str],
+        trade_id: Optional[str] = None,
+        reason: Optional[str] = None,
+        hard: bool = False,
+        existing_intent_id: Optional[str] = None,
+    ) -> SubmissionResult:
+        """Use the same cancel-confirm-reread protocol through an adapter.
+
+        It is intentionally a convenience wrapper only: all durable state and
+        race protection remain in :meth:`handoff_protection_and_submit_reduction`.
+        """
+
+        callbacks = dict(broker.coordinator_callbacks(position_key))
+        required = {"cancel_stop", "read_order", "read_residual", "submit_order"}
+        missing = required.difference(callbacks)
+        if missing:
+            raise ValueError(
+                "coordinator broker adapter lacks callbacks: "
+                + ", ".join(sorted(missing))
+            )
+        if any(not callable(callbacks[name]) for name in required):
+            raise ValueError("coordinator broker adapter callbacks must be callable")
+        adapter_payload = dict(payload)
+        adapter_payload["role"] = self._as_role(role)
+        if reason is not None:
+            adapter_payload["reason"] = reason
+        return self.handoff_protection_and_submit_reduction(
+            position_key=position_key,
+            role=role,
+            side=side,
+            requested_quantity=requested_quantity,
+            payload=adapter_payload,
+            stop_order_id=stop_order_id,
+            cancel_stop=callbacks["cancel_stop"],
+            read_order=callbacks["read_order"],
+            read_residual=callbacks["read_residual"],
+            submit_order=callbacks["submit_order"],
+            trade_id=trade_id,
+            reason=reason,
+            hard=hard,
+            existing_intent_id=existing_intent_id,
         )

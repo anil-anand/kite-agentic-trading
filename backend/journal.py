@@ -3355,4 +3355,32 @@ class TradeJournal:
         return max(normalized) if normalized else None
 
 
-journal = TradeJournal()
+class _LazyLiveJournal:
+    """Keep importing the journal class safe for isolated research adapters.
+
+    Existing live consumers still share one lazily constructed TradeJournal.
+    Merely importing TradeJournal to open an explicit research database cannot
+    create, migrate, or read the default live database.
+    """
+
+    def __init__(self):
+        object.__setattr__(self, "_instance", None)
+        object.__setattr__(self, "_instance_lock", threading.Lock())
+
+    def _live_instance(self):
+        with self._instance_lock:
+            if self._instance is None:
+                object.__setattr__(self, "_instance", TradeJournal())
+            return self._instance
+
+    def __getattr__(self, name):
+        return getattr(self._live_instance(), name)
+
+    def __setattr__(self, name, value):
+        setattr(self._live_instance(), name, value)
+
+    def __delattr__(self, name):
+        delattr(self._live_instance(), name)
+
+
+journal = _LazyLiveJournal()

@@ -1,7 +1,6 @@
 import datetime
-import hashlib
-import json
 import threading
+import uuid
 from collections import OrderedDict
 from copy import deepcopy
 from typing import Any, Dict, List, Mapping, Tuple
@@ -10,10 +9,10 @@ import pandas as pd
 
 from .calibration import calibrator
 from .config import config_manager
+from .entry_decisions import evaluate_production_entries
 from .kite_client import kite_client
 from .market_context import ContextPolicy, MarketContext, MarketContextService
 from .playbooks import BreakoutPlaybook, MeanReversionPlaybook, TrendPullbackPlaybook
-from .regime_classifier import regime_classifier
 from .session_clock import SessionPolicy
 from .strategies.adx_momentum import ADXMomentumStrategy
 from .strategies.awesome_oscillator import AwesomeOscillatorStrategy
@@ -289,6 +288,7 @@ class Scanner:
         # Confirmation may occur after Settings are edited.  Keep the actual
         # selection inputs detached before any symbol starts calculating.
         strategy_config = deepcopy(config_manager.get_strategy_config())
+        risk_config = deepcopy(config_manager.get_risk_config())
         entry_family_mapping = dict(self.family_mapping)
 
         instruments = kite_client.get_instruments("NSE")
@@ -306,22 +306,16 @@ class Scanner:
                 return []
 
             context = self._market_context(token, df)
-            completed_df = context.primary_frame()
             if (
                 not context.normal_decision_eligible
                 or "VOLUME_UNAVAILABLE" in context.primary_quality.issues
-                or completed_df.empty
+                or context.primary_frame().empty
             ):
                 return []
 
             evaluate_on_incomplete = strategy_config.get(
                 "evaluateOnIncompleteCandle", False
             )
-            if not evaluate_on_incomplete:
-                df = completed_df
-
-            if df.empty:
-                return []
 
             if not evaluate_on_incomplete and context.primary_bar:
                 # Corrections change provenance, not the decision event. Never
@@ -331,101 +325,23 @@ class Scanner:
                 if last_scanned is not None and latest_candle_id <= last_scanned:
                     return []
 
-            # 1. Classify Regime
-            # Keep entry gating on the raw stateless classifier so this phase
-            # does not silently change existing strategy selection.  The
-            # legacy entry-only incomplete-candle experiment retains its old
-            # regime input; position assessment never uses that path.
-            if evaluate_on_incomplete:
-                regime_state = regime_classifier.classify(df)
-            else:
-                regime_state = {
-                    "regime": context.raw_regime,
-                    "features": dict(context.raw_regime_features),
-                }
-            regime = regime_state["regime"]
-
-            raw_signals = []
-            for strat_id, strategy in self.strategies.items():
-                config = strategy_config.get(strat_id, {})
-                if config.get("enabled", False):
-                    signals = strategy.calculate_signals(df.copy(deep=True), symbol)
-                    for s in signals:
-                        s["strategy_id"] = strat_id
-                        s["family"] = entry_family_mapping.get(strat_id)
-                    raw_signals.extend(signals)
-
-            from .strategies.breakout_evidence import BreakoutEvidence
-            from .strategies.oscillator_evidence import OscillatorEvidence
-
-            raw_signals = OscillatorEvidence.aggregate(raw_signals)
-            raw_signals = BreakoutEvidence.aggregate(raw_signals, df)
-
-            # 2. Gating and Aggregation
-            symbol_aggregated_signals = []
-            for playbook in self.playbooks:
-                if regime not in playbook.applicable_regimes():
-                    continue
-
-                decision = playbook.evaluate_entry(raw_signals, regime_state)
-                if decision:
-                    est_prob, sample_size = calibrator.get_probability(
-                        playbook.get_name(), decision["signal_score"]
-                    )
-
-                    raw = decision.get("raw_signals", raw_signals)
-                    strategy_ids = {
-                        s.get("strategy_id")
-                        for s in raw
-                        if s.get("strategy_id")
-                        and s.get("strategy_id")
-                        not in ("breakout_evidence", "oscillator_evidence")
-                    }
-
-                    for s in raw:
-                        if s.get("strategy_id") in (
-                            "breakout_evidence",
-                            "oscillator_evidence",
-                        ):
-                            strategy_ids.add(s["strategy_id"])
-
-                    decision.update(
-                        {
-                            "estimated_probability": est_prob,
-                            "calibration_sample_size": sample_size,
-                            "indicators": regime_state["features"],
-                            "raw_signals": raw_signals,
-                            "regime": regime,
-                            "strategy_count": len(strategy_ids),
-                            "market_context": context.summary(),
-                            "entry_selection_config": {
-                                "strategies": deepcopy(strategy_config),
-                                "family_mapping": dict(entry_family_mapping),
-                                "context_policy": context.summary().get("policy"),
-                                "entry_policy_version": "playbooks-v1",
-                            },
-                            "entry_input": {
-                                "mode": "INCOMPLETE_CANDLE"
-                                if evaluate_on_incomplete
-                                else "COMPLETED_CANDLES",
-                                "last_input_bar": json.loads(
-                                    df.tail(1).to_json(
-                                        orient="records", date_format="iso"
-                                    )
-                                )[0],
-                                "frame_hash": hashlib.sha256(
-                                    df.to_json(
-                                        orient="split",
-                                        date_format="iso",
-                                        double_precision=15,
-                                    ).encode()
-                                ).hexdigest(),
-                                "hash_format": "pandas-split-iso-v1",
-                                "decision_at": context.decision_event_time.isoformat(),
-                            },
-                        }
-                    )
-                    symbol_aggregated_signals.append(decision)
+            symbol_aggregated_signals = evaluate_production_entries(
+                symbol=symbol,
+                raw_frame=df,
+                market_context=context,
+                strategies=self.strategies,
+                playbooks=self.playbooks,
+                strategy_config=strategy_config,
+                risk_config=risk_config,
+                family_mapping=entry_family_mapping,
+                calibration_lookup=calibrator.get_probability,
+                decision_at=context.decision_event_time,
+                evaluate_on_incomplete_candle=bool(evaluate_on_incomplete),
+            )
+            # IDs belong to the live delivery/UI boundary; research decisions
+            # deliberately omit random metadata so they remain reproducible.
+            for signal in symbol_aggregated_signals:
+                signal["id"] = str(uuid.uuid4())
 
             if not evaluate_on_incomplete and context.primary_bar:
                 self.last_scanned_candle[symbol] = context.primary_bar.end

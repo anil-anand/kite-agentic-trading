@@ -11,6 +11,7 @@ from .metrics_evaluator import MetricsEvaluator
 class RegressionSuite:
     def __init__(self, data_dir: str):
         self.data_dir = data_dir
+        self.last_manifest: Dict[str, Any] | None = None
 
     def run_regression_test(
         self, test_name: str, strategy: BaseStrategy, expected_metrics: Dict[str, Any]
@@ -28,6 +29,7 @@ class RegressionSuite:
         engine = BacktestEngine(strategy)
         engine.load_data("TEST_SYM", df)
         engine.run()
+        self.last_manifest = dict(engine.run_manifest)
 
         metrics = MetricsEvaluator.evaluate(
             engine.broker.trades, engine.broker.initial_capital
@@ -68,6 +70,7 @@ class RegressionSuite:
         engine = BacktestEngine(strategy)
         engine.load_data("TEST_SYM", df)
         engine.run()
+        self.last_manifest = dict(engine.run_manifest)
 
         metrics = MetricsEvaluator.evaluate(
             engine.broker.trades, engine.broker.initial_capital
