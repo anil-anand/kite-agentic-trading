@@ -23,12 +23,16 @@ class TickerManager:
         self.ticker = None
         self.thread = None
         self.tokens = set()
+        self._client_tokens = set()
+        self._managed_tokens = set()
+        self._subscription_lock = threading.RLock()
         self.running = False
         self._dev = False
         self._dev_thread = None
         self._symbol_map = {}  # instrument_token -> tradingsymbol
         self._dev_prices = {}  # token -> last synthetic price
         self._order_update_listeners = []
+        self._tick_listeners = []
         self._connection_state = "DISCONNECTED"
         self._last_tick_at = None
         self._last_tick_received_at = None
@@ -43,6 +47,21 @@ class TickerManager:
     def remove_order_update_listener(self, listener):
         if listener in self._order_update_listeners:
             self._order_update_listeners.remove(listener)
+
+    def add_tick_listener(self, listener):
+        """Register an observational backend tick consumer.
+
+        Tick listeners receive a copy of the normalized event payload.  They
+        cannot own order state or issue mutations from the websocket callback;
+        consumers enqueue work for their own serialized supervisor.
+        """
+
+        if listener not in self._tick_listeners:
+            self._tick_listeners.append(listener)
+
+    def remove_tick_listener(self, listener):
+        if listener in self._tick_listeners:
+            self._tick_listeners.remove(listener)
 
     def start(self, api_key: str, access_token: str):
         if self.running:
@@ -106,22 +125,32 @@ class TickerManager:
             else None,
         }
 
-    def subscribe(self, tokens: list):
-        for token in tokens:
-            self.tokens.add(int(token))
+    def _sync_subscriptions(self):
+        desired = self._client_tokens | self._managed_tokens
+        added, removed = desired - self.tokens, self.tokens - desired
         if not self._dev and self.ticker and self.running:
-            self.ticker.subscribe(list(self.tokens))
-            self.ticker.set_mode(self.ticker.MODE_FULL, list(self.tokens))
+            if added:
+                self.ticker.subscribe(list(added))
+                self.ticker.set_mode(self.ticker.MODE_FULL, list(added))
+            if removed:
+                self.ticker.unsubscribe(list(removed))
+        self.tokens = desired
+
+    def subscribe(self, tokens: list):
+        with self._subscription_lock:
+            self._client_tokens.update(int(token) for token in tokens)
+            self._sync_subscriptions()
 
     def unsubscribe(self, tokens: list):
-        # Normalize to int so the broker unsubscribe matches the int tokens we
-        # subscribed with — a stringified token from the renderer would
-        # otherwise leave a stale subscription active.
-        normalized = [int(token) for token in tokens]
-        for token in normalized:
-            self.tokens.discard(token)
-        if not self._dev and self.ticker and self.running:
-            self.ticker.unsubscribe(normalized)
+        with self._subscription_lock:
+            self._client_tokens.difference_update(int(token) for token in tokens)
+            self._sync_subscriptions()
+
+    def set_managed_tokens(self, tokens):
+        """Keep exposure observations subscribed independently of renderer views."""
+        with self._subscription_lock:
+            self._managed_tokens = {int(token) for token in tokens}
+            self._sync_subscriptions()
 
     # -- token -> symbol -------------------------------------------------
     def _symbol_for(self, token: int) -> str:
@@ -181,6 +210,7 @@ class TickerManager:
             "event": _TICK_CHANNEL,
             "data": {
                 "instrumentToken": token,
+                "exchange": "NSE",
                 "tradingsymbol": symbol,
                 "lastPrice": round(last_price, 2),
                 "changePercent": round(change_percent, 2),
@@ -191,6 +221,11 @@ class TickerManager:
                 "timestampQuality": quality,
             },
         }
+        for listener in tuple(self._tick_listeners):
+            try:
+                listener(dict(event["data"]))
+            except Exception as exc:
+                print(f"Ticker tick listener failed: {exc}", file=sys.stderr)
         with _stdout_lock:
             print(json.dumps(event, cls=DateTimeEncoder))
             sys.stdout.flush()

@@ -158,6 +158,16 @@ class ConfigManager:
                 "thesisSchemaVersion": "entry-thesis-v1",
                 "defaultProfileVersion": "management-profiles-v1",
                 "legacyControlPolicyVersion": "legacy-control-v1",
+                # Phase 7 records deterministic policy decisions alongside the
+                # approved legacy controller.  This is deliberately a
+                # per-position pin, captured with the entry thesis/checkpoint;
+                # changing Settings must not reinterpret an open position.
+                # ``candidate`` is representable for replay/integration
+                # contracts, but live dispatch stays disabled until the later
+                # promotion gates are complete.
+                "livePolicyMode": "shadow",
+                "candidatePolicyVersion": "deterministic-exit-v1",
+                "candidateActivationEnabled": False,
             },
         }
 
@@ -339,8 +349,35 @@ class ConfigManager:
     def get_exit_management_config(self):
         """Return a detached policy/provenance contract for new positions."""
 
-        return deepcopy(
-            self.config.get("exitManagement", self.default_config["exitManagement"])
+        settings = self.config.get(
+            "exitManagement", self.default_config["exitManagement"]
+        )
+        if not isinstance(settings, dict):
+            # A malformed settings object must not crash thesis capture or
+            # silently opt a new position into the current shadow default.
+            settings = {
+                **self.default_config["exitManagement"],
+                "livePolicyMode": "legacy_control",
+            }
+        return deepcopy(settings)
+
+    def get_exit_live_policy_mode(self) -> str:
+        """Return the requested phase-7 policy pin without enabling dispatch.
+
+        The value is intentionally constrained here rather than being inferred
+        by callers.  A malformed older settings file keeps the frozen legacy
+        controller; candidate execution is separately and unconditionally
+        disabled by the live orchestrator in this phase.
+        """
+
+        value = self.get_exit_management_config().get(
+            "livePolicyMode", "legacy_control"
+        )
+        return (
+            value
+            if isinstance(value, str)
+            and value in {"legacy_control", "shadow", "candidate"}
+            else "legacy_control"
         )
 
     def get_effective_exit_management_config(self):

@@ -413,6 +413,16 @@ states remain distinct; old and candidate paths cannot both submit exits.
 **Expected behavior:** observable candidate HOLD/weakening/exit recommendations in
 shadow, with existing approved control behavior executing through corrected safety.
 
+**Implementation/review evidence:** [PHASE7_REVIEW.md](PHASE7_REVIEW.md) records
+the pre-commit adversarial findings and fixes. Managed positions receive independent
+shadow scheduling, durable pinned policies, causal retained inputs, serialized
+candidate state and truthful legacy comparison. Quote observations cannot advance
+or reset normal confirmation; broker mutations remain suppressed. Scripted common
+coordinator tests cover cancel/fill races, partial residuals and unknown submissions.
+Final offline validation: **1,294 Python tests**, Ruff lint/format and
+`git diff --check` passed. No commit, real broker order or candidate live activation
+was performed. Phases 8–10 and the separate promotion gates remain required.
+
 ## Phase 8 — Shared paper, backtest and decision replay adapters
 
 **Responsibility:** candidate policy is executable identically in every mode;

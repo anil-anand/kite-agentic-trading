@@ -8,7 +8,7 @@ import time
 import uuid
 from dataclasses import replace
 from functools import wraps
-from typing import Optional
+from typing import Mapping, Optional
 
 from .accounting import accounting_service
 from .broker_models import (
@@ -25,8 +25,11 @@ from .broker_models import (
 )
 from .config import config_manager
 from .execution_gateway import execution_gateway
+from .exit_management.engine import ExitPolicy, evaluate_exit
 from .exit_management.models import (
+    DecisionRecord,
     LifecycleEvent,
+    ManagementState,
     PositionCheckpoint,
     PositionState,
     ProtectionState,
@@ -140,6 +143,11 @@ class TradingEngine:
         self._entry_stop = threading.Event()
         self._supervisor_wakeup = threading.Event()
         self._broker_event_queue: queue.Queue = queue.Queue()
+        self._quote_events: dict[str, dict] = {}
+        self._quote_lock = threading.Lock()
+        self._quote_thread = None
+        self._shadow_management_thread = None
+        self._shadow_position_workers = {}
         self._ticker_listener_registered = False
         self._supervision_generation = 0
         self._hard_flatten_reason: Optional[str] = None
@@ -182,6 +190,30 @@ class TradingEngine:
         self._entry_theses: dict[str, EntryThesis] = {}
         self._managed_position_states: dict[str, PositionState] = {}
         self._exit_state_locks: dict[str, threading.RLock] = {}
+
+    @staticmethod
+    def _exit_policy_mode_from_settings(settings: object) -> str:
+        """Return a stable per-position mode, preserving old records as control."""
+
+        if not isinstance(settings, Mapping):
+            return "legacy_control"
+        mode = settings.get("livePolicyMode", settings.get("policyMode"))
+        return (
+            str(mode)
+            if isinstance(mode, str)
+            and mode in {"legacy_control", "shadow", "candidate"}
+            else "legacy_control"
+        )
+
+    @classmethod
+    def _exit_policy_mode_for_thesis(cls, thesis: Optional[EntryThesis]) -> str:
+        if thesis is None:
+            return "legacy_control"
+        values = thesis.policy_snapshot.values
+        settings = (
+            values.get("exitManagement", {}) if isinstance(values, Mapping) else {}
+        )
+        return cls._exit_policy_mode_from_settings(settings)
 
     # Kite order statuses that mean an order is still live (protecting / working).
     _TERMINAL_ORDER_STATUSES = {
@@ -298,15 +330,17 @@ class TradingEngine:
         does not alter hard-risk supervision of any existing position.
         """
 
+        effective_config = config_manager.get_effective_exit_management_config()
         thesis = capture_entry_thesis(
             signal,
             position_key=position_key,
             trade_id=trade_id,
             position_epoch=position_epoch,
             instrument_id=str(instrument_id),
-            effective_config=config_manager.get_effective_exit_management_config(),
+            effective_config=effective_config,
             created_at=now_utc(),
         )
+        exit_policy_mode = self._exit_policy_mode_for_thesis(thesis)
         intent_id = str(uuid.uuid4())
         initial_state = PositionState(
             position_key=position_key,
@@ -329,7 +363,11 @@ class TradingEngine:
             state_version=state.version,
             sequence=0,
             state=state,
-            counters={"eligible_completed_bars": 0},
+            counters={
+                "eligible_completed_bars": 0,
+                "exit_policy_mode": exit_policy_mode,
+                "exit_policy": ManagementState().to_dict(),
+            },
             extrema={"observed_mfe": None, "observed_mae": None},
             intents={"entry_intent_id": intent_id},
             protection={
@@ -362,9 +400,11 @@ class TradingEngine:
                         "thesis_id": thesis.thesis_id,
                         "thesis_revision": thesis.revision,
                         "management_profile": thesis.management_profile.name,
+                        "exit_policy_mode": exit_policy_mode,
                     },
                     "thesis_id": thesis.thesis_id,
                     "policy_version": thesis.policy_snapshot.policy_version,
+                    "exit_policy_mode": exit_policy_mode,
                 },
             },
         )
@@ -793,6 +833,31 @@ class TradingEngine:
                 if key in trade
             },
         }
+        # The candidate policy reads confirmed protection from its own typed
+        # memory. Broker acknowledgement remains the sole source for those
+        # fields, so synchronize it as part of this existing observation
+        # checkpoint rather than waiting for the next completed candle.
+        try:
+            shadow_memory = self._shadow_management_from_checkpoint(previous)
+            if self._is_valid_management_price(protection.get("confirmed_stop")):
+                shadow_memory = replace(
+                    shadow_memory,
+                    confirmed_stop=float(protection["confirmed_stop"]),
+                    requested_stop=(
+                        float(protection["requested_stop"])
+                        if self._is_valid_management_price(
+                            protection.get("requested_stop")
+                        )
+                        else None
+                    ),
+                )
+            elif protection.get("requested_stop") is None:
+                shadow_memory = replace(shadow_memory, requested_stop=None)
+            counters["exit_policy"] = shadow_memory.to_dict()
+        except (TypeError, ValueError):
+            # An invalid shadow-only cache cannot weaken broker protection.
+            # Leave it for the next shadow evaluation to surface explicitly.
+            pass
         if (
             coverage == state.protection
             and quantity == state.known_quantity
@@ -821,6 +886,673 @@ class TradingEngine:
             protection=protection,
             counters=counters,
         )
+
+    @staticmethod
+    def _shadow_management_from_checkpoint(checkpoint: dict) -> ManagementState:
+        """Restore candidate memory without conflating it with broker state."""
+
+        payload = (checkpoint or {}).get("counters", {}).get("exit_policy")
+        return ManagementState.from_dict(payload or {})
+
+    @staticmethod
+    def _shadow_candidate_state_from_checkpoint(
+        checkpoint: dict, actual_state: PositionState
+    ) -> PositionState:
+        """Read the shadow state, keeping legacy checkpoints safely usable."""
+
+        payload = (
+            (checkpoint or {})
+            .get("counters", {})
+            .get("shadow_candidate_position_state")
+        )
+        if not payload:
+            return actual_state
+        candidate = PositionState.from_dict(payload)
+        if candidate.position_key != actual_state.position_key:
+            raise ValueError("shadow candidate state belongs to another position")
+        if actual_state.exposure.value in {
+            "CLOSED",
+            "ENTRY_ABORTED",
+            "FLAT_PENDING_RECONCILIATION",
+        }:
+            return actual_state
+        # Copy execution facts without erasing the hypothetical thesis/latch.
+        # A partial fill or acknowledged stop update cannot heal invalidation.
+        # Conversely, a reconciled OPEN must clear a *nonlatched* observational
+        # recovery request caused by an earlier unavailable broker snapshot.
+        return replace(
+            actual_state,
+            exposure=(
+                "EXIT_PENDING"
+                if actual_state.exposure.value == "OPEN"
+                and candidate.latched_exit_intent_id
+                else actual_state.exposure
+            ),
+            thesis_health=candidate.thesis_health,
+            development=candidate.development,
+            latched_exit_intent_id=(
+                actual_state.latched_exit_intent_id or candidate.latched_exit_intent_id
+            ),
+        )
+
+    @staticmethod
+    def _shadow_input_references(context, risk_snapshot, *, mode: str) -> dict:
+        """Keep direct join keys small; the full immutable inputs are in trace."""
+
+        summary = context.summary() if context is not None else None
+        mark_time = as_utc(risk_snapshot.mark_time)
+        return {
+            "shadow": {"mode": mode, "dispatch": "SUPPRESSED_PHASE7"},
+            "market_context": {
+                "snapshot_id": summary.get("snapshot_id") if summary else None,
+                "input_hash": summary.get("input_hash") if summary else None,
+                "primary_bar_id": summary.get("primary_bar_id") if summary else None,
+                "higher_bar_id": summary.get("higher_bar_id") if summary else None,
+                "primary_quality": summary.get("primary_quality") if summary else None,
+                "higher_quality": summary.get("higher_quality") if summary else None,
+            },
+            "risk_snapshot": {
+                "position_key": risk_snapshot.position_key,
+                "signed_quantity": risk_snapshot.signed_quantity,
+                "direction": risk_snapshot.direction,
+                "mark_price": risk_snapshot.mark_price,
+                "mark_time": mark_time.isoformat() if mark_time else None,
+                "broker_state_known": risk_snapshot.broker_state_known,
+                "session_id": risk_snapshot.session.session_id,
+            },
+        }
+
+    @staticmethod
+    def _legacy_control_summary(trade: dict, thesis: Optional[EntryThesis]) -> dict:
+        """Report observed control decisions without inventing a HOLD evaluation."""
+
+        values = thesis.management_profile.values if thesis is not None else {}
+        assessments = dict(trade.get("legacy_control_assessments") or {})
+        latest = max(
+            assessments.values(),
+            key=lambda item: item.get("evaluated_at", ""),
+            default={},
+        )
+        pending = bool(trade.get("exit_pending"))
+        return {
+            "policy_version": str(
+                values.get("control_policy_version", "legacy-control-v1")
+            ),
+            "reason": (
+                trade.get("exit_reason") or "LEGACY_CONTROL_EXIT_PENDING"
+                if pending
+                else latest.get("reason", "LEGACY_CONTROL_NOT_YET_EVALUATED")
+            ),
+            "action": "MANAGE_PENDING_INTENT"
+            if pending
+            else latest.get("action", "NOT_EVALUATED"),
+            "evaluated_at": latest.get("evaluated_at"),
+            "comparison_basis": "LATEST_OBSERVED_AS_OF_SHADOW_EVALUATION",
+            "assessments": assessments,
+            "exit_pending": pending,
+            "stop_order_id": trade.get("stop_order_id"),
+            "target": trade.get("target"),
+        }
+
+    def _record_legacy_control_observation(
+        self,
+        symbol: str,
+        *,
+        source: str,
+        action: str,
+        reason: str,
+        context=None,
+        details: Optional[dict] = None,
+        expected_trade: Optional[dict] = None,
+    ) -> None:
+        """Retain the latest actual assessment for each approved legacy rule.
+
+        These timestamps/provenance deliberately remain separate from the
+        candidate event: legacy rules run on their existing review schedules.
+        The next shadow trace retains the detached comparison durably.
+        """
+
+        provenance = (
+            context.summary()
+            if context is not None and hasattr(context, "summary")
+            else dict(context)
+            if isinstance(context, Mapping)
+            else {"primary_quality": "UNAVAILABLE"}
+        )
+        observation = {
+            "source": source,
+            "action": action,
+            "reason": reason,
+            "evaluated_at": now_utc().isoformat(),
+            "market_context": provenance,
+            "details": dict(details or {}),
+        }
+        with self._trade_lock:
+            current = self.active_trades.get(symbol)
+            if current is None or (
+                expected_trade is not None and current is not expected_trade
+            ):
+                return
+            current["legacy_control_assessments"] = {
+                **current.get("legacy_control_assessments", {}),
+                source: observation,
+            }
+
+    @_serialized_exit_state
+    def _commit_shadow_evaluation(
+        self,
+        position_key: str,
+        *,
+        thesis: Optional[EntryThesis],
+        context,
+        risk_snapshot: HardRiskSnapshot,
+        policy: ExitPolicy,
+        mode: str,
+        assessment_key: str,
+        source: str,
+        legacy_control: Optional[dict] = None,
+    ) -> Optional[dict]:
+        """Atomically store a candidate transition without changing live authority.
+
+        ``PositionState`` is the broker/execution lifecycle owned by phase 2/5.
+        A shadow exit must not latch that lifecycle because doing so could block
+        a later approved reduction or be mistaken for broker execution.  The
+        candidate's state machine therefore lives in checkpoint counters, while
+        the actual checkpoint advances only as an observation boundary.
+        """
+
+        record = journal.get_managed_position(position_key)
+        if record is None or record.get("state_corrupt"):
+            raise ValueError("managed position checkpoint is unavailable")
+        checkpoint_payload = record["state"]
+        actual_before = PositionState.from_dict(checkpoint_payload["state"])
+        if actual_before.exposure.value in {
+            "CLOSED",
+            "ENTRY_ABORTED",
+            "FLAT_PENDING_RECONCILIATION",
+        }:
+            return None
+        with self._trade_lock:
+            owner = next(
+                (
+                    dict(t)
+                    for t in self.active_trades.values()
+                    if t.get("exit_management_position_key") == position_key
+                ),
+                None,
+            )
+        if not owner or owner.get("ownership_quarantined"):
+            return None
+        if self._phase5_thesis_for(position_key) != thesis:
+            # A terminal fill/amendment changed the immutable input while
+            # candles were loading. The next cycle rebuilds the whole snapshot.
+            return None
+        # Market IO ran without the position lock. A fill during that fetch
+        # invalidates the old position snapshot; retry from the next broker
+        # observation instead of poisoning the candidate with false recovery.
+        if actual_before.known_quantity != abs(risk_snapshot.signed_quantity):
+            return None
+        mode = self._exit_policy_mode_from_settings(
+            {
+                "livePolicyMode": checkpoint_payload.get("counters", {}).get(
+                    "exit_policy_mode", self._exit_policy_mode_for_thesis(thesis)
+                )
+            }
+        )
+        if mode == "legacy_control":
+            return None
+        risk_snapshot = replace(
+            risk_snapshot,
+            session=self._session_clock().snapshot(now_utc()),
+            hard_stop_price=owner.get("sl"),
+            protection_failed=(
+                actual_before.protection is ProtectionState.FAILED_OR_UNKNOWN
+                or owner.get("recovery_state") == "EMERGENCY_REDUCTION_REQUIRED"
+            ),
+            daily_loss_latched=bool(getattr(risk_manager, "kill_switch_active", False)),
+            operator_close_requested=position_key.rsplit(":", 1)[0]
+            in self._operator_close_keys,
+            operator_emergency_requested=(
+                self._hard_flatten_reason
+                == HardRiskReason.OPERATOR_EMERGENCY_FLATTEN.value
+            ),
+            broker_state_known=(
+                risk_snapshot.broker_state_known
+                and not self._reconciliation_pending
+                and not self._lifecycle_recovery_pending
+                and not owner.get("broker_reconciliation_pending")
+            ),
+        )
+        counters_before = checkpoint_payload.get("counters", {})
+        assessment_key += ":execution:" + json.dumps(
+            {
+                "known": risk_snapshot.broker_state_known,
+                "quantity": actual_before.known_quantity,
+                "signed_quantity": risk_snapshot.signed_quantity,
+                "direction": risk_snapshot.direction,
+                "exposure": actual_before.exposure.value,
+                "protection": actual_before.protection.value,
+                "intent": actual_before.latched_exit_intent_id,
+            },
+            sort_keys=True,
+        )
+        if assessment_key == counters_before.get("exit_shadow_assessment_key"):
+            return None
+        primary = context.primary_bar if context is not None else None
+        eligible = bool(context is not None and context.normal_decision_eligible)
+        previous_end = as_utc(counters_before.get("exit_shadow_last_bar_end"))
+        if eligible and previous_end is not None and primary.end <= previous_end:
+            return None
+        candidate_before = self._shadow_candidate_state_from_checkpoint(
+            checkpoint_payload, actual_before
+        )
+        management_before = self._shadow_management_from_checkpoint(checkpoint_payload)
+        protection = checkpoint_payload.get("protection", {})
+        confirmed_stop = protection.get("confirmed_stop")
+        requested_stop = protection.get("requested_stop")
+        if self._is_valid_management_price(confirmed_stop):
+            management_before = replace(
+                management_before, confirmed_stop=float(confirmed_stop)
+            )
+        management_before = replace(
+            management_before,
+            requested_stop=float(requested_stop)
+            if self._is_valid_management_price(requested_stop)
+            else None,
+        )
+
+        evaluation = evaluate_exit(
+            thesis,
+            candidate_before,
+            context,
+            risk_snapshot,
+            policy,
+            management_state=management_before,
+        )
+        candidate_after = evaluation.next_position_state
+        management_after = evaluation.next_management_state
+        occurred_at = as_utc(evaluation.decision.occurred_at) or now_utc()
+        # Every scheduled shadow result, including a HOLD whose candidate state
+        # is unchanged, receives one durable actual-state observation.  This is
+        # the atomic join point for trace, input references and policy memory.
+        actual_after = reduce_lifecycle(
+            actual_before,
+            LifecycleEvent.STATE_OBSERVED,
+            event_id=f"shadow-observation:{evaluation.decision.decision_id}",
+            occurred_at=occurred_at,
+            known_quantity=actual_before.known_quantity,
+            protection=actual_before.protection,
+        )
+        input_references = self._shadow_input_references(
+            context, risk_snapshot, mode=mode
+        )
+        suppressed_intent = (
+            evaluation.proposed_intent.to_dict()
+            if evaluation.proposed_intent is not None
+            else None
+        )
+        trace = {
+            **evaluation.decision.to_dict()["trace"],
+            "orchestration": {
+                "phase": "phase7_shadow",
+                "mode": mode,
+                "source": source,
+                "assessment_key": assessment_key,
+                "dispatch": "SUPPRESSED_PHASE7",
+                "candidate_activation_enabled": False,
+                "suppressed_intent": suppressed_intent,
+                "legacy_control": dict(legacy_control or {}),
+                "missed_primary_intervals": (
+                    max(0, int((primary.start - previous_end).total_seconds() // 300))
+                    if eligible
+                    and previous_end is not None
+                    and primary.start.astimezone(EXCHANGE_TIMEZONE).date()
+                    == previous_end.astimezone(EXCHANGE_TIMEZONE).date()
+                    else 0
+                ),
+                "missing_supervision_interval": {
+                    "from": previous_end.isoformat(),
+                    "to": primary.start.isoformat(),
+                }
+                if eligible
+                and previous_end is not None
+                and primary.start > previous_end
+                else None,
+                "catch_up_policy": "LATEST_AVAILABLE_ONLY_NO_RETROACTIVE_ORDERS",
+                "actual_state_before": actual_before.to_dict(),
+                "actual_state_after": actual_after.to_dict(),
+                "candidate_state_before": candidate_before.to_dict(),
+                "candidate_state_after": candidate_after.to_dict(),
+            },
+        }
+        decision = DecisionRecord(
+            decision_id=evaluation.decision.decision_id,
+            position_key=position_key,
+            occurred_at=evaluation.decision.occurred_at,
+            action=evaluation.decision.action.value,
+            primary_reason_code=evaluation.decision.primary_reason_code,
+            policy_version=evaluation.decision.policy_version,
+            state_before=actual_before,
+            state_after=actual_after,
+            input_references=input_references,
+            supporting_evidence=evaluation.decision.supporting_evidence,
+            opposing_evidence=evaluation.decision.opposing_evidence,
+            contributing_reason_codes=evaluation.decision.contributing_reason_codes,
+            suppressed_candidates=evaluation.decision.suppressed_candidates,
+            trace=trace,
+        )
+        extrema = dict(checkpoint_payload.get("extrema", {}))
+        for name in (
+            "observed_mfe_r",
+            "observed_mae_r",
+            "completed_mfe_r",
+            "completed_mae_r",
+        ):
+            value = getattr(management_after, name)
+            if value is not None:
+                extrema[name] = value
+        counters = {
+            **checkpoint_payload.get("counters", {}),
+            "exit_policy_mode": mode,
+            "exit_policy": management_after.to_dict(),
+            "shadow_candidate_position_state": candidate_after.to_dict(),
+            "exit_shadow_assessment_key": assessment_key,
+            "exit_shadow_last_decision_id": evaluation.decision.decision_id,
+        }
+        if (
+            eligible
+            and as_utc(management_after.last_processed_primary_bar_end) == primary.end
+        ):
+            counters["exit_shadow_last_bar_end"] = primary.end.isoformat()
+        intents = dict(checkpoint_payload.get("intents", {}))
+        if suppressed_intent is not None:
+            intents["shadow_suppressed_intent"] = suppressed_intent
+        checkpoint = PositionCheckpoint(
+            position_key=position_key,
+            state_version=actual_after.version,
+            sequence=int(record["checkpoint_sequence"]) + 1,
+            state=actual_after,
+            counters=counters,
+            extrema=extrema,
+            intents=intents,
+            protection=dict(checkpoint_payload.get("protection", {})),
+            input_references={
+                **checkpoint_payload.get("input_references", {}),
+                "shadow": input_references,
+            },
+        )
+        journal.commit_position_checkpoint(
+            checkpoint,
+            event_id=actual_after.last_event_id,
+            event_type="EXIT_POLICY_SHADOW_EVALUATED",
+            details={
+                "decision_id": evaluation.decision.decision_id,
+                "mode": mode,
+                "source": source,
+                "assessment_key": assessment_key,
+                "action": evaluation.decision.action.value,
+                "reason": evaluation.decision.primary_reason_code,
+                "suppressed_intent": suppressed_intent,
+            },
+            expected_state_version=actual_before.version,
+            decision=decision,
+        )
+        self._managed_position_states[position_key] = actual_after
+        return {
+            "decision_id": evaluation.decision.decision_id,
+            "action": evaluation.decision.action.value,
+            "reason": evaluation.decision.primary_reason_code,
+            "suppressed_intent": suppressed_intent,
+        }
+
+    @_serialized_exit_state
+    def _record_shadow_quote_observation(
+        self, position_key: str, *, trade: dict, observations: list[dict]
+    ) -> None:
+        """Persist extrema without evaluating rules or changing bar confirmation."""
+        with self._trade_lock:
+            owner = self.active_trades.get(trade.get("tradingsymbol"), {})
+            if (
+                owner.get("exit_management_position_key") != position_key
+                or owner.get("position_epoch") != trade.get("position_epoch")
+                or owner.get("ownership_quarantined")
+            ):
+                return
+        record = journal.get_managed_position(position_key)
+        if not record or record.get("state_corrupt"):
+            return
+        checkpoint = record["state"]
+        state = PositionState.from_dict(checkpoint["state"])
+        thesis = self._phase5_thesis_for(position_key)
+        mode = self._exit_policy_mode_from_settings(
+            {
+                "livePolicyMode": checkpoint.get("counters", {}).get(
+                    "exit_policy_mode", self._exit_policy_mode_for_thesis(thesis)
+                )
+            }
+        )
+        if mode == "legacy_control":
+            return
+        if (
+            state.exposure.value not in {"OPEN", "EXIT_PENDING"}
+            or not state.known_quantity
+            or thesis is None
+            or thesis.fill_binding is None
+            or thesis.binding_status.value != "BOUND"
+        ):
+            return
+        binding = thesis.fill_binding
+        terminal_at = as_utc(binding.entry_terminal_at)
+        if terminal_at is None:
+            return
+        memory = self._shadow_management_from_checkpoint(checkpoint)
+        changed = {}
+        retained = []
+        direction = 1 if thesis.direction == "BUY" else -1
+        for observation in sorted(observations, key=lambda item: item["observed_at"]):
+            at = observation["observed_at"]
+            if at < terminal_at:
+                continue
+            value = direction * (observation["mark"] - binding.entry_vwap)
+            value /= binding.initial_r_per_share
+            for name, excursion in (
+                ("mfe", max(0.0, value)),
+                ("mae", max(0.0, -value)),
+            ):
+                field = f"observed_{name}_r"
+                previous = changed.get(field, getattr(memory, field))
+                if previous is None or excursion > previous:
+                    changed[field] = excursion
+                    changed[f"observed_{name}_at"] = at.isoformat()
+            retained.append({**observation, "observed_at": at.isoformat()})
+        if not changed:
+            return
+        memory = replace(memory, **changed, observed_extrema_source="timestamped_mark")
+        event_id = f"quote-extrema:{position_key}:{state.version}"
+        next_state = reduce_lifecycle(
+            state,
+            LifecycleEvent.STATE_OBSERVED,
+            event_id=event_id,
+            occurred_at=now_utc(),
+        )
+        self._commit_phase5_checkpoint(
+            position_key=position_key,
+            state=next_state,
+            event_id=event_id,
+            event_type="QUOTE_EXTREMA_OBSERVED",
+            details={"observations": retained, "instrument_id": thesis.instrument_id},
+            counters={"exit_policy": memory.to_dict()},
+            extrema={
+                name: getattr(memory, name)
+                for name in ("observed_mfe_r", "observed_mae_r")
+            },
+        )
+
+    @staticmethod
+    def _shadow_assessment_key(context) -> str:
+        """Deduplicate only the input that can advance normal management."""
+
+        if context is None:
+            return "context:unavailable"
+        bar = context.primary_bar
+        if context.normal_decision_eligible and bar is not None:
+            # Revisions of a completed interval are not a second decision bar.
+            return f"bar-end:{bar.end.isoformat()}"
+        quality = context.primary_quality
+        latest = quality.latest_bar_end.isoformat() if quality.latest_bar_end else None
+        return "quality:" + json.dumps(
+            {
+                "status": quality.status.value,
+                "issues": list(quality.issues),
+                "latest_bar_end": latest,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    def _evaluate_shadow_position(self, position: dict, trade: dict) -> None:
+        """Evaluate one durable position from its own market-data subscription.
+
+        This deliberately does not use the scanner's dynamic watchlist.  An
+        open position remains eligible for observation even after it falls out
+        of entry ranking, while hard supervision continues on its independent
+        cadence in ``monitor_positions``.
+        """
+
+        position_key = trade.get("exit_management_position_key")
+        if not position_key or not self._trade_matches_position(trade, position):
+            return
+        thesis = self._phase5_thesis_for(position_key)
+        try:
+            state_record = journal.get_managed_position(position_key)
+            checkpoint = (state_record or {}).get("state") or {}
+            mode = self._exit_policy_mode_from_settings(
+                {
+                    "livePolicyMode": checkpoint.get("counters", {}).get(
+                        "exit_policy_mode", self._exit_policy_mode_for_thesis(thesis)
+                    )
+                }
+            )
+            if mode == "legacy_control":
+                return
+            memory = self._shadow_management_from_checkpoint(checkpoint)
+        except (TypeError, ValueError) as exc:
+            self._push_log(
+                f"Shadow state unavailable for {position.get('tradingsymbol')}: {exc}",
+                level="warning",
+            )
+            return
+
+        symbol = position["tradingsymbol"]
+        instrument_id = (
+            thesis.instrument_id if thesis is not None else trade.get("instrument_id")
+        )
+        if instrument_id in (None, "", "UNKNOWN"):
+            return
+        # This fetch is intentionally outside the per-position state lock. A
+        # slow historical endpoint cannot hold the reducer or delay a fill/
+        # protection update for the same position.
+        context = scanner.get_market_context(
+            int(instrument_id) if str(instrument_id).isdigit() else instrument_id,
+            symbol,
+            context_settings=(
+                thesis.policy_snapshot.values.get("marketContext", {})
+                if thesis is not None
+                else None
+            ),
+        )
+        # Reception precedes the decision. Capturing the clock before a cache
+        # miss makes every freshly fetched candle appear to come from the future.
+        event_time = now_utc()
+        assessment_key = self._shadow_assessment_key(context)
+        if (
+            context is not None
+            and context.normal_decision_eligible
+            and context.primary_bar is not None
+        ):
+            last_end = as_utc(memory.last_processed_primary_bar_end)
+            if last_end is not None and context.primary_bar.end <= last_end:
+                return
+
+        direction = thesis.direction if thesis is not None else trade.get("direction")
+        state = self._phase5_state_for(position_key)
+        if state is None or direction not in {"BUY", "SELL"}:
+            return
+        signed_quantity = int(position.get("quantity", 0) or 0)
+        risk = HardRiskSnapshot(
+            session=self._session_clock().snapshot(event_time),
+            position_key=position_key,
+            signed_quantity=signed_quantity,
+            direction=direction,
+            mark_price=position.get("last_price"),
+            mark_time=as_utc(position.get("mark_time")),
+            hard_stop_price=trade.get("sl"),
+            daily_loss_latched=bool(getattr(risk_manager, "kill_switch_active", False)),
+            protection_failed=(
+                state.protection is ProtectionState.FAILED_OR_UNKNOWN
+                or trade.get("recovery_state") == "EMERGENCY_REDUCTION_REQUIRED"
+            ),
+            broker_state_known=(
+                not self._reconciliation_pending
+                and not self._lifecycle_recovery_pending
+                and not trade.get("broker_reconciliation_pending")
+            ),
+            operator_close_requested=(
+                position.get("position_key") in self._operator_close_keys
+            ),
+            operator_emergency_requested=(
+                self._hard_flatten_reason
+                == HardRiskReason.OPERATOR_EMERGENCY_FLATTEN.value
+            ),
+        )
+        settings = (
+            thesis.policy_snapshot.values.get("exitManagement", {})
+            if thesis is not None
+            else {}
+        )
+        policy = ExitPolicy(
+            policy_version=str(
+                settings.get("candidatePolicyVersion", "deterministic-exit-v1")
+            ),
+            tick_size=self._get_tick_size(symbol, trade.get("exchange", "NSE")),
+            hard_risk_policy=HardRiskPolicy(
+                policy_version=str(
+                    thesis.policy_snapshot.values.get("risk", {}).get(
+                        "hardRiskPolicyVersion", "hard-risk-v1"
+                    )
+                    if thesis is not None
+                    else "hard-risk-v1"
+                )
+            ),
+        )
+        result = self._commit_shadow_evaluation(
+            position_key,
+            thesis=thesis,
+            context=context,
+            risk_snapshot=risk,
+            policy=policy,
+            mode=mode,
+            assessment_key=assessment_key,
+            source="COMPLETED_BAR"
+            if context is not None and context.normal_decision_eligible
+            else "DATA_QUALITY",
+            legacy_control=self._legacy_control_summary(trade, thesis),
+        )
+        if result:
+            with self._trade_lock:
+                current = self.active_trades.get(symbol)
+                if (
+                    current
+                    and current.get("exit_management_position_key") == position_key
+                ):
+                    current.update(
+                        exit_policy_mode=mode,
+                        shadow_exit_decision_id=result["decision_id"],
+                        shadow_exit_reason=result["reason"],
+                        shadow_exit_action=result["action"],
+                        shadow_exit_suppressed_intent=result["suppressed_intent"],
+                        shadow_evaluation_pending=False,
+                    )
 
     @_serialized_exit_state
     def _record_phase5_exit_pending(
@@ -1050,6 +1782,16 @@ class TradingEngine:
                     "exit_management_checkpoint_sequence": record[
                         "checkpoint_sequence"
                     ],
+                    # Position modes are pinned in the durable checkpoint.
+                    # Old records deliberately remain on the approved legacy
+                    # control rather than inheriting today's shadow setting.
+                    "exit_policy_mode": self._exit_policy_mode_from_settings(
+                        {
+                            "livePolicyMode": payload.get("counters", {}).get(
+                                "exit_policy_mode"
+                            )
+                        }
+                    ),
                 }
                 if state.known_quantity is not None:
                     updates["residual_quantity"] = state.known_quantity
@@ -2575,6 +3317,7 @@ class TradingEngine:
             from .ticker import ticker_manager
 
             ticker_manager.add_order_update_listener(self.enqueue_broker_event)
+            ticker_manager.add_tick_listener(self.enqueue_quote_event)
             self._ticker_listener_registered = True
         except Exception as exc:
             # Polling remains a mandatory recovery path when the stream cannot
@@ -2591,6 +3334,59 @@ class TradingEngine:
             return
         self._broker_event_queue.put(dict(event))
         self._supervisor_wakeup.set()
+
+    def enqueue_quote_event(self, event: dict) -> None:
+        """Coalesce identified, fresh observations into a bounded position buffer."""
+        if not isinstance(event, dict):
+            return
+        symbol = str(event.get("tradingsymbol") or "").upper()
+        try:
+            mark = float(event.get("lastPrice"))
+            observed_at = as_utc(event.get("observedAt"))
+            received_at = as_utc(event.get("receivedAt")) or now_utc()
+        except (TypeError, ValueError):
+            return
+        current_time = now_utc()
+        if (
+            not math.isfinite(mark)
+            or mark <= 0
+            or observed_at is None
+            or observed_at > received_at
+            or received_at > current_time
+            or (current_time - observed_at).total_seconds()
+            > HardRiskPolicy().mark_max_age_seconds
+        ):
+            return
+        with self._trade_lock:
+            trade = dict(self.active_trades.get(symbol, {}))
+        key = trade.get("exit_management_position_key")
+        if (
+            not key
+            or trade.get("ownership_quarantined")
+            or str(event.get("instrumentToken")) != str(trade.get("instrument_id"))
+            or event.get("exchange", "NSE") != trade.get("exchange", "NSE")
+        ):
+            return
+        observation = {
+            "mark": mark,
+            "observed_at": observed_at,
+            "received_at": received_at.isoformat(),
+            "source": str(event.get("timestampQuality") or "TICKER"),
+        }
+        with self._quote_lock:
+            # One entry per managed epoch, two extrema regardless of tick rate.
+            self._quote_events = {
+                item_key: item
+                for item_key, item in self._quote_events.items()
+                if item["trade"].get("tradingsymbol") != symbol or item_key == key
+            }
+            batch = self._quote_events.setdefault(
+                key, {"trade": trade, "low": observation, "high": observation}
+            )
+            if mark < batch["low"]["mark"]:
+                batch["low"] = observation
+            if mark > batch["high"]["mark"]:
+                batch["high"] = observation
 
     def _consume_broker_events(self) -> None:
         """Consume queued broker facts before the polling recovery pass."""
@@ -2609,6 +3405,46 @@ class TradingEngine:
             with self._trade_lock:
                 if str(order_id) in self._lifecycle_attempts_by_order:
                     self._lifecycle_recovery_pending = True
+
+    def _consume_quote_events(self) -> None:
+        """Take one bounded batch; arriving quotes belong to the next cycle."""
+        with self._quote_lock:
+            batches = self._quote_events
+            self._quote_events = {}
+        for key, batch in batches.items():
+            observations = [batch["low"]]
+            if batch["high"] != batch["low"]:
+                observations.append(batch["high"])
+            try:
+                self._record_shadow_quote_observation(
+                    key, trade=batch["trade"], observations=observations
+                )
+            except Exception as exc:
+                self._push_log(
+                    f"Shadow quote observation unavailable for {batch['trade'].get('tradingsymbol')}: {exc}",
+                    level="warning",
+                )
+
+    def _quote_observation_loop(self) -> None:
+        """Keep optional quote persistence and subscriptions off the risk worker."""
+        while self._supervision_active and not self._supervisor_stop.is_set():
+            try:
+                from .ticker import ticker_manager
+
+                with self._trade_lock:
+                    trades = [dict(trade) for trade in self.active_trades.values()]
+                tokens = {
+                    int(trade["instrument_id"])
+                    for trade in trades
+                    if trade.get("exit_management_position_key")
+                    and not trade.get("ownership_quarantined")
+                    and str(trade.get("instrument_id", "")).isdigit()
+                }
+                ticker_manager.set_managed_tokens(tokens)
+                self._consume_quote_events()
+            except Exception as exc:
+                self._push_log(f"Quote observation unavailable: {exc}", level="warning")
+            self._supervisor_stop.wait(1)
 
     def _latch_account_flatten(self, reason: str) -> None:
         """Persist an account-level hard obligation until terminal cleanup."""
@@ -2736,6 +3572,19 @@ class TradingEngine:
         self._supervision_active = True
         self._supervisor_stop.clear()
         self._register_ticker_supervision_listener()
+        if not self._quote_thread or not self._quote_thread.is_alive():
+            self._quote_thread = threading.Thread(
+                target=self._quote_observation_loop, daemon=True
+            )
+            self._quote_thread.start()
+        if (
+            not self._shadow_management_thread
+            or not self._shadow_management_thread.is_alive()
+        ):
+            self._shadow_management_thread = threading.Thread(
+                target=self._shadow_management_loop, daemon=True
+            )
+            self._shadow_management_thread.start()
         if not self._supervisor_thread or not self._supervisor_thread.is_alive():
             self._supervision_generation += 1
             self._supervisor_thread = threading.Thread(target=self._supervisor_loop)
@@ -2749,6 +3598,59 @@ class TradingEngine:
                 target=self._normal_management_loop, daemon=True
             )
             self._normal_management_thread.start()
+
+    def _run_shadow_position_review(self, position: dict, trade: dict) -> None:
+        try:
+            self._evaluate_shadow_position(position, trade)
+        except Exception as exc:
+            with self._trade_lock:
+                current = self.active_trades.get(position.get("tradingsymbol"))
+                if current and current.get("exit_management_position_key") == trade.get(
+                    "exit_management_position_key"
+                ):
+                    current["shadow_evaluation_pending"] = True
+            self._push_log(
+                f"Shadow exit evaluation unavailable for {position.get('tradingsymbol')}: {exc}",
+                level="warning",
+            )
+
+    def _schedule_shadow_evaluations(self) -> None:
+        """One in-flight review per owned position, independent of legacy IO.
+
+        Worker count is bounded by the managed position book. No unbounded task
+        queue builds up while one instrument's historical request is blocked.
+        """
+        with self._trade_lock:
+            self._shadow_position_workers = {
+                key: worker
+                for key, worker in self._shadow_position_workers.items()
+                if worker.is_alive()
+            }
+            for position in self._last_positions:
+                trade = dict(self.active_trades.get(position.get("tradingsymbol"), {}))
+                key = trade.get("exit_management_position_key")
+                if (
+                    not position.get("quantity")
+                    or not key
+                    or key in self._shadow_position_workers
+                    or not self._trade_matches_position(trade, position)
+                ):
+                    continue
+                worker = threading.Thread(
+                    target=self._run_shadow_position_review,
+                    args=(dict(position), trade),
+                    daemon=True,
+                )
+                self._shadow_position_workers[key] = worker
+                worker.start()
+
+    def _shadow_management_loop(self) -> None:
+        while self._supervision_active and not self._supervisor_stop.is_set():
+            try:
+                self._schedule_shadow_evaluations()
+            except Exception as exc:
+                self._push_log(f"Shadow scheduling unavailable: {exc}", level="warning")
+            self._supervisor_stop.wait(5)
 
     def _normal_management_loop(self) -> None:
         while self._supervision_active and not self._supervisor_stop.is_set():
@@ -3434,6 +4336,7 @@ class TradingEngine:
                     "thesis_id": thesis.thesis_id,
                     "thesis_revision": thesis.revision,
                     "management_profile": thesis.management_profile.name,
+                    "exit_policy_mode": self._exit_policy_mode_for_thesis(thesis),
                 }
                 with self._trade_lock:
                     self.active_trades[symbol].update(phase5_fields)
@@ -5473,15 +6376,31 @@ class TradingEngine:
     def _check_resistance_exit(
         self, symbol: str, ltp: float, direction: str, lookback: int = 20
     ) -> bool:
+        context = None
+        trade = None
+
+        def record(action, reason, **details):
+            self._record_legacy_control_observation(
+                symbol,
+                source="resistance_support",
+                action=action,
+                reason=reason,
+                context=context,
+                details=details,
+                expected_trade=trade,
+            )
+
         try:
             with self._trade_lock:
                 trade = self.active_trades.get(symbol, {})
                 if trade.get("legacy_bounded_management") or trade.get(
                     "exit_state_recovery_required"
                 ):
+                    record("NOT_EVALUATED", "LEGACY_CONTROL_BOUNDED_OR_RECOVERING")
                     return False
             token = self._ensure_instrument_map().get(symbol)
             if not token:
+                record("UNAVAILABLE", "LEGACY_CONTROL_INSTRUMENT_UNAVAILABLE")
                 return False
 
             # The legacy rejection control shares the same causal boundary as
@@ -5489,9 +6408,11 @@ class TradingEngine:
             # incomplete, or a rejection that happened before this trade.
             context = scanner.get_market_context(token, symbol)
             if not context.normal_decision_eligible:
+                record("UNAVAILABLE", "LEGACY_CONTROL_DATA_UNAVAILABLE")
                 return False
             df = context.primary_frame()
             if len(df) < lookback + 1:
+                record("UNAVAILABLE", "LEGACY_CONTROL_HISTORY_INSUFFICIENT")
                 return False
             bar = context.primary_bar
             with self._trade_lock:
@@ -5543,6 +6464,12 @@ class TradingEngine:
                             f"last candle tested high ₹{last_high:.2f} but closed ₹{last_close:.2f} — resistance wins. Exiting.",
                             level="info",
                         )
+                        record(
+                            "REQUEST_EXIT",
+                            "LEGACY_CONTROL_RESISTANCE_REJECTION",
+                            level=float(resistance),
+                            close=float(last_close),
+                        )
                         return True
             else:  # SELL
                 # Support = lowest low over lookback
@@ -5557,8 +6484,18 @@ class TradingEngine:
                             f"last candle tested low ₹{last_low:.2f} but closed ₹{last_close:.2f} — support wins. Exiting.",
                             level="info",
                         )
+                        record(
+                            "REQUEST_EXIT",
+                            "LEGACY_CONTROL_SUPPORT_REJECTION",
+                            level=float(support),
+                            close=float(last_close),
+                        )
                         return True
+            record("HOLD", "LEGACY_CONTROL_NO_LEVEL_REJECTION")
         except Exception as e:
+            record(
+                "UNAVAILABLE", "LEGACY_CONTROL_DATA_UNAVAILABLE", error=type(e).__name__
+            )
             self._push_log(
                 f"Resistance exit check failed for {symbol}: {e}", level="warning"
             )
@@ -5661,6 +6598,18 @@ class TradingEngine:
 
     def _reevaluate_positions(self):
         """Re-evaluate open positions against current strategy signals (thesis invalidation)."""
+
+        def record(symbol, trade, action, reason, context=None, **details):
+            self._record_legacy_control_observation(
+                symbol,
+                source="strategy_reevaluation",
+                action=action,
+                reason=reason,
+                context=context,
+                details=details,
+                expected_trade=trade,
+            )
+
         with self._trade_lock:
             if not self.active_trades or self._hard_flatten_reason:
                 return
@@ -5679,6 +6628,13 @@ class TradingEngine:
                 p["tradingsymbol"]: p for p in positions if p["quantity"] != 0
             }
         except Exception as e:
+            for symbol in symbols_to_evaluate:
+                record(
+                    symbol,
+                    None,
+                    "UNAVAILABLE",
+                    "LEGACY_CONTROL_BROKER_SNAPSHOT_UNAVAILABLE",
+                )
             self._push_log(f"Error fetching positions for re-evaluation: {e}")
             return
 
@@ -5720,11 +6676,23 @@ class TradingEngine:
 
             token = instrument_map.get(symbol)
             if not token:
+                record(
+                    symbol,
+                    trade,
+                    "UNAVAILABLE",
+                    "LEGACY_CONTROL_INSTRUMENT_UNAVAILABLE",
+                )
                 continue
 
             # Get current position data
             pos = position_map.get(symbol)
             if not pos or not self._has_fresh_position_mark(pos):
+                record(
+                    symbol,
+                    trade,
+                    "UNAVAILABLE",
+                    "LEGACY_CONTROL_POSITION_MARK_UNAVAILABLE",
+                )
                 continue  # Position already closed
             if not self._trade_matches_position(trade, pos):
                 self._quarantine_identity_mismatch(symbol, trade)
@@ -5738,6 +6706,13 @@ class TradingEngine:
             try:
                 evaluation = scanner.evaluate_position(symbol, token)
             except Exception as e:
+                record(
+                    symbol,
+                    trade,
+                    "UNAVAILABLE",
+                    "LEGACY_CONTROL_DATA_UNAVAILABLE",
+                    error=type(e).__name__,
+                )
                 self._push_log(f"Error evaluating {symbol}: {e}")
                 continue
 
@@ -5749,6 +6724,13 @@ class TradingEngine:
             # enabled strategy failed to calculate its evidence.
             if evaluation.get("assessment_available") is not True:
                 context = evaluation.get("market_context", {})
+                record(
+                    symbol,
+                    trade,
+                    "UNAVAILABLE",
+                    "LEGACY_CONTROL_DATA_UNAVAILABLE",
+                    context,
+                )
                 self._push_log(
                     f"Skipping normal re-evaluation for {symbol}: market context "
                     f"{context.get('primary_quality', 'UNAVAILABLE')}.",
@@ -5783,10 +6765,26 @@ class TradingEngine:
                 opposing = evaluation["buy_signals"]
 
             # === Graduated Exit Rules ===
+            control_context = evaluation.get("market_context", {})
+            control_details = {
+                "supporting": supporting,
+                "opposing": opposing,
+                "mark_price": ltp,
+                "mark_time": pos.get("mark_time"),
+                "mins_held": mins_held,
+            }
 
             # Rule 1: Strong opposing signal — thesis fully invalidated
             if opposing >= 2 and supporting == 0:
                 reason = f"Thesis invalidated for {symbol}: {opposing} opposing signals, 0 supporting. Exiting."
+                record(
+                    symbol,
+                    trade,
+                    "REQUEST_EXIT",
+                    "LEGACY_CONTROL_OPPOSING_SIGNALS",
+                    control_context,
+                    **control_details,
+                )
                 self._push_log(reason, level="warning")
                 self._exit_position(pos, symbol, reason)
                 continue
@@ -5794,6 +6792,14 @@ class TradingEngine:
             # Rule 2: Weak conviction — no support + in loss + time elapsed
             if supporting == 0 and in_loss and mins_held >= weak_exit_mins:
                 reason = f"Weak conviction for {symbol}: 0 supporting signals, in loss, held {mins_held:.0f} mins. Exiting."
+                record(
+                    symbol,
+                    trade,
+                    "REQUEST_EXIT",
+                    "LEGACY_CONTROL_WEAK_CONVICTION",
+                    control_context,
+                    **control_details,
+                )
                 self._push_log(reason, level="warning")
                 self._exit_position(pos, symbol, reason)
                 continue
@@ -5802,10 +6808,29 @@ class TradingEngine:
             if mins_held >= breakeven_mins:
                 if entry_price > 0 and current_sl != entry_price:
                     old_sl = current_sl
-                    if self._tighten_to_breakeven(symbol):
+                    tightened = self._tighten_to_breakeven(symbol)
+                    record(
+                        symbol,
+                        trade,
+                        "REQUEST_TIGHTEN",
+                        "LEGACY_CONTROL_TIME_BREAKEVEN_REVIEW",
+                        control_context,
+                        confirmed=tightened,
+                        **control_details,
+                    )
+                    if tightened:
                         self._push_log(
                             f"Time decay for {symbol}: held {mins_held:.0f} mins. SL tightened from ₹{old_sl} to breakeven ₹{entry_price}."
                         )
+                else:
+                    record(
+                        symbol,
+                        trade,
+                        "HOLD",
+                        "LEGACY_CONTROL_TIME_REVIEW_STOP_RETAINED",
+                        control_context,
+                        **control_details,
+                    )
                 continue
 
             # Rule 4: Thesis still valid — hold
@@ -5813,6 +6838,14 @@ class TradingEngine:
                 self._push_log(
                     f"Thesis valid for {symbol}: {supporting} supporting, {opposing} opposing. Holding."
                 )
+            record(
+                symbol,
+                trade,
+                "HOLD",
+                "LEGACY_CONTROL_HOLD",
+                control_context,
+                **control_details,
+            )
 
             with self._trade_lock:
                 trade = self.active_trades.get(symbol)

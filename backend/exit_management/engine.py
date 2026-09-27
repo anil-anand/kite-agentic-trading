@@ -548,6 +548,9 @@ def evaluate_exit(
                 "schema_version": 1,
                 "rule_id": reason,
                 "input_hash": inputs_hash,
+                # Hashes alone cannot reproduce a live decision once the
+                # scanner cache expires or the vendor revises a candle.
+                "input_snapshot": input_payload,
                 "thesis_id": thesis.thesis_id if thesis else None,
                 "thesis_hash": _canonical_hash(thesis.to_dict()) if thesis else None,
                 "context": market_context.summary() if market_context else None,

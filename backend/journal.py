@@ -1261,12 +1261,14 @@ class TradeJournal:
         return result
 
     def get_exit_decisions(self, position_key: str) -> List[Dict[str, Any]]:
+        # Broker recovery and a normal assessment can share one source instant.
+        # Commit versions, not timestamp ties or hash IDs, define causal order.
         conn = self._get_conn()
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """
             SELECT * FROM exit_decision_records WHERE position_key = ?
-            ORDER BY created_at ASC, decision_id ASC
+            ORDER BY state_after_version ASC, state_before_version ASC, decision_id ASC
             """,
             (position_key,),
         ).fetchall()

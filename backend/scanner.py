@@ -2,8 +2,9 @@ import datetime
 import hashlib
 import json
 import threading
+from collections import OrderedDict
 from copy import deepcopy
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Mapping, Tuple
 
 import pandas as pd
 
@@ -82,6 +83,9 @@ class Scanner:
         self._market_context_policy = self._market_context_service.policy
         self._market_session_policy = SessionPolicy()
         self._market_context_lock = threading.Lock()
+        self._pinned_context_services: OrderedDict[
+            ContextPolicy, MarketContextService
+        ] = OrderedDict()
         self._scan_locks = {}
         self._scan_locks_lock = threading.Lock()
         self.playbooks = [
@@ -202,25 +206,45 @@ class Scanner:
         ]
 
     def _market_context(
-        self, instrument_token: int, df: pd.DataFrame, decision_at=None
+        self,
+        instrument_token: int,
+        df: pd.DataFrame,
+        decision_at=None,
+        *,
+        context_settings: Mapping[str, Any] | None = None,
     ) -> MarketContext:
-        """Build a causal context using the current versioned configuration.
+        """Build causal context from the pinned or current feature configuration.
 
         Entry strategy formulas retain their existing incomplete-candle setting
         for this phase.  Position assessment and all context provenance use the
         completed-candle path below, independently of that legacy switch.
         """
 
-        policy = ContextPolicy.from_config(config_manager.get_market_context_config())
+        policy = ContextPolicy.from_config(
+            config_manager.get_market_context_config()
+            if context_settings is None
+            else context_settings
+        )
         # Operator trading hours constrain admission/supervision, not the
         # exchange's candle grid or full-session VWAP history.
         with self._market_context_lock:
-            if policy != self._market_context_policy:
-                self._market_context_service = MarketContextService(
-                    policy, self._market_session_policy
-                )
-                self._market_context_policy = policy
-            service = self._market_context_service
+            if context_settings is not None:
+                # Pinned open positions keep their own regime progression when
+                # a Settings save changes the entry scanner's feature policy.
+                service = self._pinned_context_services.get(policy)
+                if service is None:
+                    service = MarketContextService(policy, self._market_session_policy)
+                    self._pinned_context_services[policy] = service
+                self._pinned_context_services.move_to_end(policy)
+                while len(self._pinned_context_services) > 256:
+                    self._pinned_context_services.popitem(last=False)
+            else:
+                if policy != self._market_context_policy:
+                    self._market_context_service = MarketContextService(
+                        policy, self._market_session_policy
+                    )
+                    self._market_context_policy = policy
+                service = self._market_context_service
         event_time = decision_at or now_utc()
         return service.build(
             instrument_token,
@@ -233,12 +257,28 @@ class Scanner:
         )
 
     def get_market_context(
-        self, instrument_token: int, tradingsymbol: str, *, decision_at=None
+        self,
+        instrument_token: int,
+        tradingsymbol: str,
+        *,
+        decision_at=None,
+        context_settings: Mapping[str, Any] | None = None,
     ) -> MarketContext:
-        """Fetch a snapshot with original provenance for normal management."""
+        """Fetch a causal snapshot, optionally using a position's pinned policy.
+
+        Live callers omit ``decision_at``: their decision occurs after receipt,
+        while the historical request cutoff remains separately preserved. An
+        explicit earlier time is an as-of query and cannot see a later response.
+        """
 
         df, _ = self._fetch_candles(instrument_token, tradingsymbol)
-        return self._market_context(instrument_token, df, decision_at)
+        event_time = decision_at if decision_at is not None else now_utc()
+        return self._market_context(
+            instrument_token,
+            df,
+            event_time,
+            context_settings=context_settings,
+        )
 
     def scan_watchlist(
         self, symbols: List[str], on_signal=None
