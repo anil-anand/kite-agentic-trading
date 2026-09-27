@@ -1,16 +1,27 @@
-"""Versioned contracts for durable exit-management state.
+"""Versioned, broker-independent contracts for exit-management decisions."""
 
-The package deliberately contains no broker calls and no discretionary exit
-policy.  Phase 5 uses it to preserve the entry premise and lifecycle history;
-the pure decision engine is introduced in phase 6.
-"""
-
+from .engine import ExitEvaluation, ExitPolicy, evaluate_exit
+from .evidence import (
+    EvidenceDirection,
+    EvidenceFamily,
+    EvidenceReport,
+    EvidenceSeverity,
+)
+from .evidence import (
+    EvidenceObservation as MarketEvidenceObservation,
+)
 from .models import (
     DecisionRecord,
     DevelopmentPhase,
+    ExitAction,
+    ExitDecision,
+    ExitIntentType,
+    ExitReasonCode,
     ExposureState,
+    ManagementState,
     PositionCheckpoint,
     PositionState,
+    ProposedIntent,
     ProtectionState,
     ThesisHealth,
 )
@@ -20,11 +31,25 @@ __all__ = [
     "DecisionRecord",
     "DevelopmentPhase",
     "EntryThesis",
+    "EvidenceDirection",
+    "EvidenceFamily",
+    "EvidenceReport",
+    "EvidenceSeverity",
+    "ExitAction",
+    "ExitDecision",
+    "ExitEvaluation",
+    "ExitIntentType",
+    "ExitPolicy",
+    "ExitReasonCode",
     "ExposureState",
+    "ManagementState",
+    "MarketEvidenceObservation",
     "PositionCheckpoint",
     "PositionState",
     "ProtectionState",
+    "ProposedIntent",
     "ThesisHealth",
     "bind_terminal_fill",
     "capture_entry_thesis",
+    "evaluate_exit",
 ]

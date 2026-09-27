@@ -7,6 +7,7 @@ transitions instead of repairing an in-memory dictionary silently.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
@@ -185,6 +186,8 @@ class ManagementProfileSnapshot:
     values: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.values, Mapping):
+            raise ValueError("management profile values must be a mapping")
         object.__setattr__(self, "values", _freeze(self.values))
 
     def to_dict(self) -> dict[str, Any]:
@@ -655,6 +658,381 @@ class DecisionRecord:
                 item.to_dict() for item in self.supporting_evidence
             ],
             "opposing_evidence": [item.to_dict() for item in self.opposing_evidence],
+            "contributing_reason_codes": list(self.contributing_reason_codes),
+            "suppressed_candidates": list(self.suppressed_candidates),
+            "trace": thaw(self.trace),
+        }
+
+
+class ExitAction(str, Enum):
+    """A broker-independent action proposed by the deterministic policy."""
+
+    HOLD = "HOLD"
+    REQUEST_EXIT = "REQUEST_EXIT"
+    TIGHTEN_STOP = "TIGHTEN_STOP"
+    RECONCILE_REQUIRED = "RECONCILE_REQUIRED"
+    MANAGE_PENDING_INTENT = "MANAGE_PENDING_INTENT"
+
+
+class ExitIntentType(str, Enum):
+    """The small set of mutations the policy may propose, never execute."""
+
+    EXIT = "EXIT"
+    FLATTEN = "FLATTEN"
+    TIGHTEN_STOP = "TIGHTEN_STOP"
+    RECONCILE = "RECONCILE"
+
+
+class ExitReasonCode(str, Enum):
+    """Stable phase-6 reason-code vocabulary from EXIT_REASON_CODES.md."""
+
+    RISK_CATASTROPHIC_STOP = "RISK_CATASTROPHIC_STOP"
+    RISK_PROTECTIVE_STOP_TRIGGERED = "RISK_PROTECTIVE_STOP_TRIGGERED"
+    RISK_DAILY_LOSS = "RISK_DAILY_LOSS"
+    RISK_PROTECTION_FAILURE = "RISK_PROTECTION_FAILURE"
+    RISK_ENTRY_BUDGET_EXCEEDED = "RISK_ENTRY_BUDGET_EXCEEDED"
+    RISK_DATA_BLINDNESS = "RISK_DATA_BLINDNESS"
+    SESSION_FORCED_FLAT = "SESSION_FORCED_FLAT"
+    OPERATOR_EMERGENCY_FLATTEN = "OPERATOR_EMERGENCY_FLATTEN"
+    OPERATOR_POSITION_CLOSE = "OPERATOR_POSITION_CLOSE"
+    EXEC_UNRECOVERABLE_FAILURE = "EXEC_UNRECOVERABLE_FAILURE"
+    EXEC_BROKER_STATE_UNKNOWN = "EXEC_BROKER_STATE_UNKNOWN"
+    THESIS_STRUCTURE_ACCEPTANCE_FAILED = "THESIS_STRUCTURE_ACCEPTANCE_FAILED"
+    THESIS_BREAKOUT_FAILED = "THESIS_BREAKOUT_FAILED"
+    THESIS_VWAP_ACCEPTANCE_FAILED = "THESIS_VWAP_ACCEPTANCE_FAILED"
+    THESIS_MULTI_FAMILY_FAILURE = "THESIS_MULTI_FAMILY_FAILURE"
+    THESIS_REGIME_INCOMPATIBLE = "THESIS_REGIME_INCOMPATIBLE"
+    PROFIT_FIXED_OBJECTIVE_REACHED = "PROFIT_FIXED_OBJECTIVE_REACHED"
+    PROFIT_CONVERGENCE_OBJECTIVE = "PROFIT_CONVERGENCE_OBJECTIVE"
+    PROFIT_REVERSAL_CONFIRMED = "PROFIT_REVERSAL_CONFIRMED"
+    PROFIT_STRUCTURE_TRAIL = "PROFIT_STRUCTURE_TRAIL"
+    PROFIT_COST_AWARE_PROTECTION = "PROFIT_COST_AWARE_PROTECTION"
+    TIME_NO_PROGRESS_CONFIRMED = "TIME_NO_PROGRESS_CONFIRMED"
+    SESSION_LATE_MANAGEMENT = "SESSION_LATE_MANAGEMENT"
+    HOLD_THESIS_VALID = "HOLD_THESIS_VALID"
+    HOLD_EARLY_DEVELOPMENT = "HOLD_EARLY_DEVELOPMENT"
+    HOLD_HEALTHY_PULLBACK = "HOLD_HEALTHY_PULLBACK"
+    HOLD_CONSOLIDATION = "HOLD_CONSOLIDATION"
+    HOLD_TREND_CONTINUATION = "HOLD_TREND_CONTINUATION"
+    HOLD_THESIS_WEAKENING = "HOLD_THESIS_WEAKENING"
+    HOLD_CONFIRMATION_PENDING = "HOLD_CONFIRMATION_PENDING"
+    HOLD_HIGHER_TIMEFRAME_SUPPORT = "HOLD_HIGHER_TIMEFRAME_SUPPORT"
+    HOLD_OBJECTIVE_REVIEW_ZONE = "HOLD_OBJECTIVE_REVIEW_ZONE"
+    HOLD_NO_VALID_STOP_IMPROVEMENT = "HOLD_NO_VALID_STOP_IMPROVEMENT"
+    HOLD_UNKNOWN_THESIS = "HOLD_UNKNOWN_THESIS"
+    HOLD_DATA_DEGRADED = "HOLD_DATA_DEGRADED"
+    DATA_INCOMPLETE_CANDLE = "DATA_INCOMPLETE_CANDLE"
+    DATA_DUPLICATE_BAR = "DATA_DUPLICATE_BAR"
+    DATA_STALE_CONTEXT = "DATA_STALE_CONTEXT"
+    DATA_GAP_OR_INVALID_OHLCV = "DATA_GAP_OR_INVALID_OHLCV"
+    DATA_HIGHER_TIMEFRAME_UNAVAILABLE = "DATA_HIGHER_TIMEFRAME_UNAVAILABLE"
+    EXEC_INTENT_ALREADY_PENDING = "EXEC_INTENT_ALREADY_PENDING"
+    EXEC_SUBMISSION_UNKNOWN = "EXEC_SUBMISSION_UNKNOWN"
+    EXEC_CANCEL_UNKNOWN = "EXEC_CANCEL_UNKNOWN"
+    EXEC_PARTIAL_FILL = "EXEC_PARTIAL_FILL"
+    EXEC_ORDER_REJECTED = "EXEC_ORDER_REJECTED"
+    EXEC_PROTECTION_UPDATE_PENDING = "EXEC_PROTECTION_UPDATE_PENDING"
+    EXEC_EXTERNAL_POSITION_CHANGE = "EXEC_EXTERNAL_POSITION_CHANGE"
+    EXEC_FILL_ATTRIBUTION_PENDING = "EXEC_FILL_ATTRIBUTION_PENDING"
+    BROKER_STOP_FILLED = "BROKER_STOP_FILLED"
+    BROKER_APP_EXIT_FILLED = "BROKER_APP_EXIT_FILLED"
+    BROKER_EXTERNAL_CLOSE = "BROKER_EXTERNAL_CLOSE"
+    RESEARCH_END_OF_DATA = "RESEARCH_END_OF_DATA"
+    LEGACY_REASON_UNRESOLVED = "LEGACY_REASON_UNRESOLVED"
+
+
+@dataclass(frozen=True)
+class ManagementState:
+    """Replayable policy memory kept separately from broker lifecycle state.
+
+    The generic phase-5 checkpoint already has ``counters`` and ``extrema``
+    storage.  This typed projection makes the phase-6 decision memory explicit
+    without making a fill, acknowledgement, or poll look like a candle vote.
+    """
+
+    last_processed_primary_bar_id: Optional[str] = None
+    last_processed_primary_bar_end: Optional[str] = None
+    policy_fingerprint: Optional[str] = None
+    latched_exit_reason_code: Optional[str] = None
+    latched_exit_urgency: Optional[str] = None
+    failure_episode: Optional[str] = None
+    failure_count: int = 0
+    last_failure_bar_end: Optional[str] = None
+    local_failure_episode: Optional[str] = None
+    local_failure_count: int = 0
+    last_local_failure_bar_end: Optional[str] = None
+    weakening_count: int = 0
+    last_weakening_bar_end: Optional[str] = None
+    recovery_count: int = 0
+    last_recovery_bar_end: Optional[str] = None
+    stagnation_count: int = 0
+    last_stagnation_bar_end: Optional[str] = None
+    eligible_completed_bars: int = 0
+    last_favorable_progress_bar_id: Optional[str] = None
+    last_favorable_progress_bar_count: Optional[int] = None
+    last_close_progress_bar_count: Optional[int] = None
+    observed_mfe_r: Optional[float] = None
+    observed_mae_r: Optional[float] = None
+    completed_mfe_r: Optional[float] = None
+    completed_mae_r: Optional[float] = None
+    observed_mfe_at: Optional[str] = None
+    observed_mae_at: Optional[str] = None
+    completed_mfe_at: Optional[str] = None
+    completed_mae_at: Optional[str] = None
+    observed_extrema_source: Optional[str] = None
+    progress_close_r: Optional[float] = None
+    favorable_structure_id: Optional[str] = None
+    favorable_structure_price: Optional[float] = None
+    favorable_structure_buffer: Optional[float] = None
+    favorable_structure_failure_buffer: Optional[float] = None
+    favorable_structure_known_at: Optional[str] = None
+    confirmed_stop: Optional[float] = None
+    requested_stop: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        if self.latched_exit_urgency is not None and (
+            not isinstance(self.latched_exit_urgency, str)
+            or self.latched_exit_urgency not in {"NORMAL", "CRITICAL"}
+        ):
+            raise ValueError("latched exit urgency must be NORMAL or CRITICAL")
+        for name in (
+            "last_processed_primary_bar_id",
+            "policy_fingerprint",
+            "latched_exit_reason_code",
+            "failure_episode",
+            "local_failure_episode",
+            "last_favorable_progress_bar_id",
+            "observed_extrema_source",
+            "favorable_structure_id",
+        ):
+            value = getattr(self, name)
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ValueError(f"{name} must be nonempty text when present")
+        for name in (
+            "failure_count",
+            "local_failure_count",
+            "weakening_count",
+            "recovery_count",
+            "stagnation_count",
+            "eligible_completed_bars",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a nonnegative integer")
+        for name in (
+            "last_favorable_progress_bar_count",
+            "last_close_progress_bar_count",
+        ):
+            value = getattr(self, name)
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+            ):
+                raise ValueError(f"{name} must be a nonnegative integer")
+        for name in (
+            "observed_mfe_r",
+            "observed_mae_r",
+            "completed_mfe_r",
+            "completed_mae_r",
+            "progress_close_r",
+            "favorable_structure_price",
+            "favorable_structure_buffer",
+            "favorable_structure_failure_buffer",
+            "confirmed_stop",
+            "requested_stop",
+        ):
+            value = getattr(self, name)
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+            ):
+                raise ValueError(f"{name} must be finite when present")
+        # MFE and MAE are magnitudes, not signed returns.  Keep the management
+        # checkpoint on the same unit convention as research/accounting traces.
+        for name in (
+            "observed_mfe_r",
+            "observed_mae_r",
+            "completed_mfe_r",
+            "completed_mae_r",
+            "favorable_structure_buffer",
+            "favorable_structure_failure_buffer",
+        ):
+            value = getattr(self, name)
+            if value is not None and value < 0:
+                raise ValueError(f"{name} must be nonnegative when present")
+        for name in ("confirmed_stop", "requested_stop", "favorable_structure_price"):
+            value = getattr(self, name)
+            if value is not None and value <= 0:
+                raise ValueError(f"{name} must be positive when present")
+        for name in (
+            "last_processed_primary_bar_end",
+            "last_failure_bar_end",
+            "last_local_failure_bar_end",
+            "last_weakening_bar_end",
+            "last_recovery_bar_end",
+            "last_stagnation_bar_end",
+            "observed_mfe_at",
+            "observed_mae_at",
+            "completed_mfe_at",
+            "completed_mae_at",
+            "favorable_structure_known_at",
+        ):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if not isinstance(value, str):
+                raise ValueError(f"{name} must be an aware ISO timestamp")
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise ValueError(f"{name} must be an aware ISO timestamp") from exc
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                raise ValueError(f"{name} must be an aware ISO timestamp")
+            object.__setattr__(self, name, as_utc(parsed).isoformat())
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "last_processed_primary_bar_id": self.last_processed_primary_bar_id,
+            "last_processed_primary_bar_end": self.last_processed_primary_bar_end,
+            "policy_fingerprint": self.policy_fingerprint,
+            "latched_exit_reason_code": self.latched_exit_reason_code,
+            "latched_exit_urgency": self.latched_exit_urgency,
+            "failure_episode": self.failure_episode,
+            "failure_count": self.failure_count,
+            "last_failure_bar_end": self.last_failure_bar_end,
+            "local_failure_episode": self.local_failure_episode,
+            "local_failure_count": self.local_failure_count,
+            "last_local_failure_bar_end": self.last_local_failure_bar_end,
+            "weakening_count": self.weakening_count,
+            "last_weakening_bar_end": self.last_weakening_bar_end,
+            "recovery_count": self.recovery_count,
+            "last_recovery_bar_end": self.last_recovery_bar_end,
+            "stagnation_count": self.stagnation_count,
+            "last_stagnation_bar_end": self.last_stagnation_bar_end,
+            "eligible_completed_bars": self.eligible_completed_bars,
+            "last_favorable_progress_bar_id": self.last_favorable_progress_bar_id,
+            "last_favorable_progress_bar_count": self.last_favorable_progress_bar_count,
+            "last_close_progress_bar_count": self.last_close_progress_bar_count,
+            "observed_mfe_r": self.observed_mfe_r,
+            "observed_mae_r": self.observed_mae_r,
+            "completed_mfe_r": self.completed_mfe_r,
+            "completed_mae_r": self.completed_mae_r,
+            "observed_mfe_at": self.observed_mfe_at,
+            "observed_mae_at": self.observed_mae_at,
+            "completed_mfe_at": self.completed_mfe_at,
+            "completed_mae_at": self.completed_mae_at,
+            "observed_extrema_source": self.observed_extrema_source,
+            "progress_close_r": self.progress_close_r,
+            "favorable_structure_id": self.favorable_structure_id,
+            "favorable_structure_price": self.favorable_structure_price,
+            "favorable_structure_buffer": self.favorable_structure_buffer,
+            "favorable_structure_failure_buffer": self.favorable_structure_failure_buffer,
+            "favorable_structure_known_at": self.favorable_structure_known_at,
+            "confirmed_stop": self.confirmed_stop,
+            "requested_stop": self.requested_stop,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "ManagementState":
+        return cls(**dict(payload))
+
+
+@dataclass(frozen=True)
+class ProposedIntent:
+    """A serializable proposal for the lifecycle coordinator."""
+
+    intent_type: ExitIntentType
+    position_key: str
+    reason_code: str
+    intent_id: Optional[str] = None
+    urgency: str = "NORMAL"
+    quantity: Optional[int] = None
+    stop_price: Optional[float] = None
+    parent_intent_id: Optional[str] = None
+    details: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "intent_type", ExitIntentType(self.intent_type))
+        if not isinstance(self.position_key, str) or not self.position_key:
+            raise ValueError("proposed intent needs a position key")
+        if self.quantity is not None and (
+            isinstance(self.quantity, bool)
+            or not isinstance(self.quantity, int)
+            or self.quantity <= 0
+        ):
+            raise ValueError("proposed quantity must be a positive integer")
+        if self.stop_price is not None and (
+            isinstance(self.stop_price, bool)
+            or not isinstance(self.stop_price, (int, float))
+            or not math.isfinite(float(self.stop_price))
+            or self.stop_price <= 0
+        ):
+            raise ValueError("proposed stop must be a finite positive price")
+        object.__setattr__(self, "details", _freeze(self.details))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "intent_type": self.intent_type.value,
+            "position_key": self.position_key,
+            "reason_code": self.reason_code,
+            "intent_id": self.intent_id,
+            "urgency": self.urgency,
+            "quantity": self.quantity,
+            "stop_price": self.stop_price,
+            "parent_intent_id": self.parent_intent_id,
+            "details": thaw(self.details),
+        }
+
+
+@dataclass(frozen=True)
+class ExitDecision:
+    """Complete, deterministic explanation for one policy evaluation."""
+
+    decision_id: str
+    action: ExitAction
+    primary_reason_code: str
+    policy_version: str
+    occurred_at: str
+    supporting_evidence: tuple[Any, ...] = ()
+    opposing_evidence: tuple[Any, ...] = ()
+    contributing_reason_codes: tuple[str, ...] = ()
+    suppressed_candidates: tuple[str, ...] = ()
+    trace: Mapping[str, Any] = field(default_factory=dict)
+    urgency: str = "NORMAL"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "action", ExitAction(self.action))
+        if not isinstance(self.urgency, str) or self.urgency not in {
+            "NORMAL",
+            "CRITICAL",
+        }:
+            raise ValueError("decision urgency must be NORMAL or CRITICAL")
+        for name in (
+            "supporting_evidence",
+            "opposing_evidence",
+            "contributing_reason_codes",
+            "suppressed_candidates",
+        ):
+            object.__setattr__(
+                self, name, tuple(_freeze(item) for item in getattr(self, name))
+            )
+        object.__setattr__(self, "trace", _freeze(self.trace))
+
+    def to_dict(self) -> dict[str, Any]:
+        def serialize(item: Any) -> Any:
+            return item.to_dict() if hasattr(item, "to_dict") else thaw(item)
+
+        return {
+            "decision_id": self.decision_id,
+            "action": self.action.value,
+            "urgency": self.urgency,
+            "primary_reason_code": self.primary_reason_code,
+            "policy_version": self.policy_version,
+            "occurred_at": self.occurred_at,
+            "supporting_evidence": [
+                serialize(item) for item in self.supporting_evidence
+            ],
+            "opposing_evidence": [serialize(item) for item in self.opposing_evidence],
             "contributing_reason_codes": list(self.contributing_reason_codes),
             "suppressed_candidates": list(self.suppressed_candidates),
             "trace": thaw(self.trace),

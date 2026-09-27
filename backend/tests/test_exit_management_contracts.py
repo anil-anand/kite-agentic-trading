@@ -152,9 +152,21 @@ def test_late_partial_fill_is_retained_after_cancel(monkeypatch):
 
 
 def test_real_risk_and_execution_gateway_accept_a_valid_entry(monkeypatch):
+    import backend.broker_models as broker_module
     import backend.execution_gateway as gateway_module
     import backend.risk_manager as risk_module
     import backend.trading_engine as engine_module
+
+    session_now = datetime.datetime(2026, 9, 21, 10, 0, tzinfo=EXCHANGE_TIMEZONE)
+    utc_time = session_now.astimezone(datetime.timezone.utc)
+    # Use one session for marks, broker snapshots and admission. Mixing a frozen
+    # risk clock with today's date made this contract fail after 2026-09-20.
+    monkeypatch.setitem(globals(), "now_utc", lambda: utc_time)
+    monkeypatch.setattr(broker_module, "utc_now", lambda: utc_time)
+    monkeypatch.setattr(risk_module, "utc_now", lambda: utc_time)
+    monkeypatch.setattr(engine_module, "now_utc", lambda: utc_time)
+    monkeypatch.setattr(gateway_module, "now_utc", lambda: utc_time)
+    monkeypatch.setattr(risk_module, "get_ist_now", lambda: session_now)
 
     class ScriptedBroker:
         def __init__(self):
@@ -282,11 +294,6 @@ def test_real_risk_and_execution_gateway_accept_a_valid_entry(monkeypatch):
     risk.date_str = now_utc().astimezone(EXCHANGE_TIMEZONE).strftime("%Y-%m-%d")
     config = dict(config_manager.get_risk_config())
     config.update({"startTradeAfter": "00:00", "noNewTradesAfter": "23:59"})
-    monkeypatch.setattr(
-        risk_module,
-        "get_ist_now",
-        lambda: datetime.datetime(2026, 9, 20, 10, 0, tzinfo=EXCHANGE_TIMEZONE),
-    )
     monkeypatch.setattr(config_manager, "get_risk_config", lambda: config)
     monkeypatch.setattr(engine_module, "kite_client", broker)
     monkeypatch.setattr(engine_module, "execution_gateway", execution_gateway)

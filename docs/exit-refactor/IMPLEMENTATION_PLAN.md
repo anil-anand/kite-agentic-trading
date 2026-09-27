@@ -367,6 +367,15 @@ decisions including HOLD reasoning.
 failure exits and justified profit protection. Trading benefit remains unproven
 until later validation; this phase does not activate the policy live.
 
+**Implementation/review evidence:** [PHASE6_REVIEW.md](PHASE6_REVIEW.md) records
+the hostile pre-commit review, severity, scenarios, corrections and phase
+boundaries. The pure policy uses shared hard-risk rules, causal evidence,
+distinct-bar confirmation/recovery, immutable profile/objective semantics and
+monotone confirmed protection. Tests cover real context/thesis contracts and
+checkpoint restart as well as mirrored adversarial paths. Final offline
+validation: **1,226 Python tests**, Ruff lint/format and `git diff --check` passed.
+No commit, live broker order or candidate-policy activation was performed.
+
 ## Phase 7 — Live orchestration integration in shadow mode
 
 **Responsibility:** connect the pure engine to existing live data/state/supervision,
