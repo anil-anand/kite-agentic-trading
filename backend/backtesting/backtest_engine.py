@@ -5,6 +5,7 @@ from typing import Dict, Mapping, Optional, Sequence
 
 import pandas as pd
 
+from ..entry_ordering import PRODUCTION_CANDLE_HISTORY_DAYS
 from ..exit_management.engine import ExitPolicy
 from ..exit_management.models import ManagementState, PositionState
 from ..exit_management.thesis import EntryThesis
@@ -98,7 +99,19 @@ class BacktestEngine:
             else "INJECTED_PRODUCTION_ENTRY_OR_FIXED_OPPORTUNITIES",
         }
 
-    def run(self):
+    @staticmethod
+    def _aware_time(value, name: str) -> datetime:
+        try:
+            if not isinstance(value, (datetime, str)):
+                raise ValueError("timestamp type")
+            timestamp = pd.Timestamp(value)
+            if pd.isna(timestamp) or timestamp.tzinfo is None:
+                raise ValueError("timestamp missing or naive")
+            return as_utc(timestamp.to_pydatetime())
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"{name} requires a finite aware timestamp") from exc
+
+    def run(self, *, trading_start_at: datetime | None = None):
         """
         Runs the backtest by iterating through the timeline chronologically across all symbols.
 
@@ -116,16 +129,47 @@ class BacktestEngine:
                 "fixed/reproducible entry and fill opportunities"
             )
         self.run_manifest = self._build_manifest()
+        trading_start = (
+            self._aware_time(trading_start_at, "trading_start_at")
+            if trading_start_at is not None
+            else None
+        )
+        if trading_start_at is not None:
+            if (
+                self.broker.orders
+                or self.broker.fills
+                or self.broker.positions
+                or self.broker.trades
+                or self.broker.pending_orders
+                or self.broker._mark_times
+                or self.broker.cash != self.broker.initial_capital
+                or self.broker.reserved_cash
+                or self.equity_curve
+            ):
+                raise ValueError(
+                    "feature-only warmup requires a fresh account; "
+                    "carried state needs a separate continuous-state study"
+                )
+        self.run_manifest["warmup"] = (
+            "FEATURES_ONLY_BEFORE_TRADING_START"
+            if trading_start is not None
+            else "NOT_CONFIGURED"
+        )
+        self.run_manifest["trading_start_at"] = (
+            trading_start.isoformat() if trading_start is not None else None
+        )
         for frame in self.market_data.values():
             if frame["date"].duplicated().any():
                 raise ValueError("raw lab requires unique candle starts")
             for row in frame.to_dict("records"):
                 completed = self.broker._time(row["date"]) + timedelta(minutes=5)
                 for field in ("available_at", "received_at"):
-                    if row.get(field) is not None and as_utc(row[field]) > completed:
-                        raise ValueError(
-                            "delayed data requires the candidate event driver"
-                        )
+                    if row.get(field) is not None:
+                        observed = self._aware_time(row[field], "candle availability")
+                        if observed > completed:
+                            raise ValueError(
+                                "delayed data requires the candidate event driver"
+                            )
 
         # Find the global timeline
         all_dates = []
@@ -147,7 +191,10 @@ class BacktestEngine:
         for current_time in unique_dates:
             for symbol in sorted(aligned_data):
                 frame = aligned_data[symbol]
-                if current_time in frame.index:
+                if current_time in frame.index and (
+                    trading_start is None
+                    or self.broker._time(current_time) >= trading_start
+                ):
                     candle = frame.loc[current_time].copy()
                     candle["date"] = current_time
                     self.broker.process_candle(symbol, candle)
@@ -164,11 +211,17 @@ class BacktestEngine:
                 frame = aligned_data[symbol]
                 if current_time not in frame.index:
                     continue
+                decision_at = self.broker._time(current_time) + timedelta(minutes=5)
+                # Feature warmup may update market observations and provide
+                # causal strategy history, but no signal/order/reservation can
+                # exist before the declared scoring boundary.
+                if trading_start is not None and decision_at < trading_start:
+                    continue
                 signals = self.strategy.calculate_signals_with_context(
                     frame.loc[:current_time].reset_index().copy(deep=True),
                     symbol,
                     risk_config=self.risk_config,
-                    decision_at=self.broker._time(current_time) + timedelta(minutes=5),
+                    decision_at=decision_at,
                 )
                 for signal in signals:
                     if symbol in self.broker.positions or symbol in pending:
@@ -203,13 +256,15 @@ class BacktestEngine:
                     pending[symbol] = self.broker.get_order(order_id)
                     reservations[symbol] = qty * entry_price
             self.broker.reserved_cash = round(sum(reservations.values()), 2)
-            self.equity_curve.append(
-                {
-                    "timestamp": current_time + timedelta(minutes=5),
-                    "equity": self.broker.current_equity({}),
-                    "reserved_cash": self.broker.reserved_cash,
-                }
-            )
+            equity_at = self.broker._time(current_time) + timedelta(minutes=5)
+            if trading_start is None or equity_at >= trading_start:
+                self.equity_curve.append(
+                    {
+                        "timestamp": equity_at,
+                        "equity": self.broker.current_equity({}),
+                        "reserved_cash": self.broker.reserved_cash,
+                    }
+                )
         for order in list(self.broker.pending_orders):
             if order["role"] == "ENTRY":
                 self.broker.cancel_order(order["order_id"])
@@ -357,7 +412,12 @@ class BacktestEngine:
                     managed = runner.positions[symbol]
                     contexts[symbol] = service.build(
                         managed.thesis.instrument_id,
-                        histories[symbol],
+                        [
+                            row
+                            for row in histories[symbol]
+                            if row["date"]
+                            >= at - timedelta(days=PRODUCTION_CANDLE_HISTORY_DAYS)
+                        ],
                         at,
                         received_at=at,
                     )
@@ -372,6 +432,9 @@ class BacktestEngine:
         result = runner.finish()
         self.run_manifest = self._build_manifest() | result["manifest"]
         self.run_manifest["context_policy"] = dict(vars(context_policy))
+        self.run_manifest["production_candle_history_days"] = (
+            PRODUCTION_CANDLE_HISTORY_DAYS
+        )
         self.run_manifest["timestamp_convention"] = "BAR_START_AWARE"
         self.run_manifest["checkpoint_at"] = (
             checkpoint_at.isoformat() if checkpoint_at else None

@@ -1,7 +1,17 @@
 import datetime
 import threading
 
+import pytest
+
 from backend.trading_engine import TradingEngine
+
+
+@pytest.fixture(autouse=True)
+def open_brokerage_session(monkeypatch, open_session_clock):
+    """These cases exercise capital/protection during an ordinary open session."""
+    monkeypatch.setattr(
+        TradingEngine, "_session_clock", lambda self: open_session_clock
+    )
 
 
 class FakeKiteClient:

@@ -2,6 +2,8 @@ import datetime
 import math
 import threading
 import uuid
+from collections.abc import Callable, Mapping
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from typing import Any, Dict, Optional, Tuple
 
@@ -11,27 +13,59 @@ from .accounting import (
     SUPPORTED_EXCHANGE,
     SUPPORTED_PRODUCT,
     AccountingQuality,
+    AccountingService,
     accounting_service,
 )
 from .broker_models import (
     BrokerOrder,
     BrokerPosition,
     BrokerSnapshot,
+    ExecutionNamespace,
     OrderRole,
     PositionSnapshot,
     SnapshotQuality,
     normalize_position,
     utc_now,
 )
-from .config import config_manager
 from .nifty_universe import get_sector
 from .session_clock import SessionSnapshot
-from .time_utils import as_utc
+from .time_utils import EXCHANGE_TIMEZONE, as_utc
 
 
 def get_ist_now():
     ist = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
     return datetime.datetime.now(ist)
+
+
+class _LazyLiveConfig:
+    """Do not read live configuration when importing isolated risk algorithms."""
+
+    def __getattr__(self, name):
+        from .config import config_manager as live_config
+
+        return getattr(live_config, name)
+
+
+config_manager = _LazyLiveConfig()
+
+
+@dataclass(frozen=True)
+class RiskDependencies:
+    """Explicit boundary for risk algorithms outside the live application.
+
+    Providers must expose only information available at ``clock()``. Counts
+    include journaled entries (open and closed), with their entry order IDs;
+    they are not just a count of completed round trips.
+    """
+
+    config: Callable[[], Mapping[str, Any]]
+    load_state: Callable[[], Mapping[str, Any]]
+    save_state: Callable[[Mapping[str, Any]], None]
+    clock: Callable[[], datetime.datetime]
+    trade_counts: Callable[[datetime.datetime], Mapping[str, Any]]
+    correlation: Callable[[str, str, datetime.datetime], Optional[float]]
+    sector: Callable[[str], str]
+    accounting: AccountingService
 
 
 @dataclass(frozen=True)
@@ -64,7 +98,11 @@ class _ExposureState:
 
 
 class RiskManager:
-    def __init__(self):
+    def __init__(self, *, dependencies: Optional[RiskDependencies] = None):
+        self._dependencies = dependencies
+        self._accounting = (
+            dependencies.accounting if dependencies else accounting_service
+        )
         self.win_count = 0
         self.loss_count = 0
         self.open_positions = 0
@@ -72,12 +110,12 @@ class RiskManager:
         self.daily_pnl = 0.0
         self.incurred_fees = 0.0
         self.accounting_quality = AccountingQuality.UNAVAILABLE.value
-        self.accounting_policy_version = accounting_service.calculator.rate_version
-        self.cost_model_version = accounting_service.calculator.rate_version
-        self.rounding_version = accounting_service.calculator.rounding_version
+        self.accounting_policy_version = self._accounting.calculator.rate_version
+        self.cost_model_version = self._accounting.calculator.rate_version
+        self.rounding_version = self._accounting.calculator.rounding_version
         self.kill_switch_active = False
         self.reconciliation_status = "RECONCILIATION_PENDING"
-        self.date_str = get_ist_now().strftime("%Y-%m-%d")
+        self.date_str = self._exchange_now().strftime("%Y-%m-%d")
 
         self._correlation_cache: Dict[Tuple[str, str], Optional[float]] = {}
         self._last_corr_date = None
@@ -86,8 +124,124 @@ class RiskManager:
 
         self._load_state()
 
+    @classmethod
+    def for_research(
+        cls,
+        *,
+        risk_config: Mapping[str, Any],
+        clock: Callable[[], datetime.datetime],
+        trade_counts_provider: Callable[[datetime.datetime], Mapping[str, Any]],
+        correlation_provider: Callable[[str, str, datetime.datetime], Optional[float]],
+        sector_provider: Callable[[str], str],
+        accounting: Optional[AccountingService] = None,
+        initial_state: Optional[Mapping[str, Any]] = None,
+    ) -> "RiskManager":
+        """Run production risk rules with frozen config and memory-only state.
+
+        No default live provider is used by this factory. Callers supply
+        causal market classification and counts from their isolated ledger.
+        An unknown correlation must return ``None`` and blocks new exposure.
+        """
+        frozen_config = deepcopy(dict(risk_config))
+        memory_state = deepcopy(dict(initial_state or {}))
+
+        def save_state(state):
+            memory_state.clear()
+            memory_state.update(deepcopy(dict(state)))
+
+        return cls(
+            dependencies=RiskDependencies(
+                config=lambda: deepcopy(frozen_config),
+                load_state=lambda: deepcopy(memory_state),
+                save_state=save_state,
+                clock=clock,
+                trade_counts=trade_counts_provider,
+                correlation=correlation_provider,
+                sector=sector_provider,
+                accounting=accounting or AccountingService(),
+            )
+        )
+
+    def _now(self) -> datetime.datetime:
+        value = self._dependencies.clock() if self._dependencies else utc_now()
+        if (
+            not isinstance(value, datetime.datetime)
+            or value.tzinfo is None
+            or value.utcoffset() is None
+        ):
+            raise ValueError("risk clock must return an aware datetime")
+        return value.astimezone(datetime.timezone.utc)
+
+    def _exchange_now(self) -> datetime.datetime:
+        if self._dependencies:
+            return self._now().astimezone(EXCHANGE_TIMEZONE)
+        return get_ist_now()
+
+    def _risk_config(self) -> Mapping[str, Any]:
+        if self._dependencies:
+            return self._dependencies.config()
+        return config_manager.get_risk_config()
+
+    def _sector(self, symbol: str) -> str:
+        if self._dependencies:
+            return self._dependencies.sector(symbol)
+        return get_sector(symbol)
+
+    def _trade_counts(self) -> Mapping[str, Any]:
+        if self._dependencies:
+            counts = self._dependencies.trade_counts(self._now())
+            if not isinstance(counts, Mapping):
+                raise ValueError("isolated trade counts must be a mapping")
+            total, by_symbol = counts.get("total"), counts.get("by_symbol")
+            if (
+                isinstance(total, bool)
+                or not isinstance(total, int)
+                or total < 0
+                or not isinstance(by_symbol, Mapping)
+                or any(
+                    not isinstance(symbol, str)
+                    or isinstance(count, bool)
+                    or not isinstance(count, int)
+                    or count < 0
+                    for symbol, count in by_symbol.items()
+                )
+                or sum(by_symbol.values()) != total
+            ):
+                raise ValueError("isolated trade counts are inconsistent")
+            return counts
+        from .journal import journal
+
+        return journal.get_todays_trade_counts()
+
+    def _validate_snapshot_scope(self, snapshot: BrokerSnapshot) -> None:
+        if not self._dependencies:
+            return
+        if snapshot.namespace is ExecutionNamespace.LIVE:
+            raise ValueError("isolated risk cannot consume a LIVE broker snapshot")
+        for item in (
+            *snapshot.positions,
+            *snapshot.day_positions,
+            *snapshot.current_orders,
+            *snapshot.fills,
+        ):
+            if (
+                item.key.namespace is not snapshot.namespace
+                or item.key.account_id != snapshot.account_id
+            ):
+                raise ValueError(
+                    "isolated snapshot contains another account or namespace"
+                )
+
+    def _snapshot_entry_ready(self, snapshot: BrokerSnapshot) -> bool:
+        self._validate_snapshot_scope(snapshot)
+        return snapshot.entry_ready_at(self._now())
+
     def _load_state(self):
-        state = config_manager.load_daily_risk_state()
+        state = (
+            self._dependencies.load_state()
+            if self._dependencies
+            else config_manager.load_daily_risk_state()
+        )
         if state:
             # A restart after midnight is not evidence that yesterday's
             # exposure/flatten orders are terminal. Retain the old session
@@ -113,9 +267,9 @@ class RiskManager:
             self.accounting_quality = AccountingQuality.UNAVAILABLE.value
             self.kill_switch_active = False
             self.reconciliation_status = "RECONCILIATION_PENDING"
-            self.accounting_policy_version = accounting_service.calculator.rate_version
-            self.cost_model_version = accounting_service.calculator.rate_version
-            self.rounding_version = accounting_service.calculator.rounding_version
+            self.accounting_policy_version = self._accounting.calculator.rate_version
+            self.cost_model_version = self._accounting.calculator.rate_version
+            self.rounding_version = self._accounting.calculator.rounding_version
             self._save_state()
 
     def _save_state(self):
@@ -130,7 +284,10 @@ class RiskManager:
             "kill_switch_active": self.kill_switch_active,
             "reconciliation_status": self.reconciliation_status,
         }
-        config_manager.save_daily_risk_state(state)
+        if self._dependencies:
+            self._dependencies.save_state(state)
+        else:
+            config_manager.save_daily_risk_state(state)
 
     def rotate_session_if_verified(
         self,
@@ -204,7 +361,7 @@ class RiskManager:
         self.accounting_policy_version = accounting.policy_version
         self.cost_model_version = accounting.cost_model_version
         self.rounding_version = accounting.rounding_version
-        config = config_manager.get_risk_config()
+        config = self._risk_config()
         if self.daily_pnl <= -config["maxDailyLoss"]:
             self.kill_switch_active = True
         return True
@@ -232,8 +389,8 @@ class RiskManager:
         fetched_utc = as_utc(fetched_at)
         if fetched_utc is None:
             return False
-        age = (utc_now() - fetched_utc).total_seconds()
-        config = config_manager.get_risk_config()
+        age = (self._now() - fetched_utc).total_seconds()
+        config = self._risk_config()
         if age < -5 or age > int(config.get("brokerSnapshotMaxAgeSeconds", 120)):
             return False
         gross_values = []
@@ -250,7 +407,7 @@ class RiskManager:
                 return False
             gross_values.append(gross)
 
-        estimated = accounting_service.estimated_session_accounting_from_positions(
+        estimated = self._accounting.estimated_session_accounting_from_positions(
             positions
         )
         incurred_costs = estimated.incurred_fees
@@ -265,17 +422,23 @@ class RiskManager:
             return True
         return False
 
-    def reconcile_state(self):
-        from .kite_client import kite_client
+    def reconcile_state(self, snapshot: Optional[BrokerSnapshot] = None):
+        if snapshot is None:
+            if self._dependencies:
+                raise RuntimeError(
+                    "isolated reconciliation requires an explicit snapshot"
+                )
+            from .kite_client import kite_client
+
+            snapshot = kite_client.get_broker_snapshot()
         from .utils import push_log
 
-        snapshot = kite_client.get_broker_snapshot()
         self._apply_conservative_hard_loss(
             snapshot.day_positions,
             snapshot.positions_fetched_at or snapshot.fetched_at,
             positions_complete=snapshot.positions_quality is SnapshotQuality.COMPLETE,
         )
-        if not snapshot.entry_ready:
+        if not self._snapshot_entry_ready(snapshot):
             self.reconciliation_status = "RECONCILIATION_FAILED"
             self._save_state()
             push_log(
@@ -285,7 +448,7 @@ class RiskManager:
             )
             return
 
-        accounting = accounting_service.session_accounting(
+        accounting = self._accounting.session_accounting(
             snapshot.day_positions, snapshot.fills, orders=snapshot.current_orders
         )
         if not self._apply_accounting(accounting):
@@ -323,11 +486,11 @@ class RiskManager:
                 f"Broker risk state is not reconciled ({self.reconciliation_status})",
             )
 
-        if self.date_str != get_ist_now().date().isoformat():
+        if self.date_str != self._exchange_now().date().isoformat():
             return False, "Exchange session reset requires verified reconciliation"
 
-        config = config_manager.get_risk_config()
-        now = get_ist_now().time()
+        config = self._risk_config()
+        now = self._exchange_now().time()
 
         start_trade_after_str = config.get("startTradeAfter", "09:45")
         try:
@@ -379,7 +542,7 @@ class RiskManager:
         ):
             return 0
 
-        config = config_manager.get_risk_config()
+        config = self._risk_config()
         max_capital = float(config.get("maxCapitalPerTrade", 10000))
         leverage = float(config.get("leverageMultiplier", 5))
         max_buying_power = max_capital * leverage
@@ -413,7 +576,7 @@ class RiskManager:
                 price, stop_loss, available_margin=available_margin
             )
         else:
-            config = config_manager.get_risk_config()
+            config = self._risk_config()
             leverage = float(config.get("leverageMultiplier", 5))
             max_capital = float(config.get("maxCapitalPerTrade", 10000))
             usable_margin = min(max_capital, max(0.0, available_margin))
@@ -423,7 +586,7 @@ class RiskManager:
     def check_daily_loss_limit(self) -> bool:
         if self.kill_switch_active:
             return True
-        config = config_manager.get_risk_config()
+        config = self._risk_config()
         if self.daily_pnl <= -config["maxDailyLoss"]:
             self.kill_switch_active = True
             self._save_state()
@@ -431,8 +594,8 @@ class RiskManager:
         return False
 
     def should_square_off(self) -> bool:
-        config = config_manager.get_risk_config()
-        now = get_ist_now().time()
+        config = self._risk_config()
+        now = self._exchange_now().time()
         max_loss_hit = self.check_daily_loss_limit()
 
         time_to_square_off = False
@@ -452,6 +615,11 @@ class RiskManager:
         return False
 
     def update_from_position_snapshot(self, snapshot: PositionSnapshot):
+        if self._dependencies and any(
+            item.key.namespace is ExecutionNamespace.LIVE
+            for item in (*snapshot.net, *snapshot.day)
+        ):
+            raise ValueError("isolated risk cannot consume LIVE positions")
         self._apply_conservative_hard_loss(
             snapshot.day,
             snapshot.fetched_at,
@@ -463,7 +631,7 @@ class RiskManager:
             self._save_state()
             return
 
-        accounting = accounting_service.estimated_session_accounting_from_positions(
+        accounting = self._accounting.estimated_session_accounting_from_positions(
             snapshot.day
         )
         # This is intentionally only a degraded fallback.  It is never the
@@ -493,17 +661,18 @@ class RiskManager:
     def update_from_broker_snapshot(self, snapshot: BrokerSnapshot) -> None:
         """Refresh risk from one cumulative, order-grouped broker snapshot."""
 
+        self._validate_snapshot_scope(snapshot)
         self._apply_conservative_hard_loss(
             snapshot.day_positions,
             snapshot.positions_fetched_at or snapshot.fetched_at,
             positions_complete=snapshot.positions_quality is SnapshotQuality.COMPLETE,
         )
-        if not snapshot.entry_ready:
+        if not self._snapshot_entry_ready(snapshot):
             self.reconciliation_status = "RECONCILIATION_STALE"
             self.accounting_quality = AccountingQuality.UNAVAILABLE.value
             self._save_state()
             return
-        accounting = accounting_service.session_accounting(
+        accounting = self._accounting.session_accounting(
             snapshot.day_positions, snapshot.fills, orders=snapshot.current_orders
         )
         if not self._apply_accounting(accounting):
@@ -536,6 +705,8 @@ class RiskManager:
                 payload.setdefault("exchange", "NSE")
                 payload.setdefault("product", "MIS")
                 payload.setdefault("tradingsymbol", "UNKNOWN")
+                if self._dependencies:
+                    raise ValueError("isolated risk requires typed position identities")
                 normalized.append(normalize_position(payload))
         except Exception:
             self.reconciliation_status = "RECONCILIATION_STALE"
@@ -545,7 +716,7 @@ class RiskManager:
             net=tuple(normalized),
             day=tuple(normalized),
             quality=SnapshotQuality.COMPLETE,
-            fetched_at=utc_now(),
+            fetched_at=self._now(),
         )
         self.update_from_position_snapshot(snapshot)
 
@@ -567,7 +738,19 @@ class RiskManager:
         }
 
     def _get_correlation(self, symbol_a: str, symbol_b: str) -> Optional[float]:
-        today = get_ist_now().date()
+        if self._dependencies:
+            # A daily cache can leak a later observation into an earlier replay
+            # decision. The causal provider owns any timestamp-aware caching.
+            value = self._dependencies.correlation(symbol_a, symbol_b, self._now())
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or not -1 <= value <= 1
+            ):
+                return None
+            return float(value)
+        today = self._exchange_now().date()
         if self._last_corr_date != today:
             self._correlation_cache.clear()
             self._last_corr_date = today
@@ -578,12 +761,12 @@ class RiskManager:
 
         from .kite_client import kite_client
 
-        config = config_manager.get_risk_config()
+        config = self._risk_config()
         lookback_days = int(config.get("correlationLookbackDays", 30))
         min_samples = int(config.get("correlationMinSamples", 5))
 
         try:
-            now = utc_now()
+            now = self._now()
             from_date = now - datetime.timedelta(days=lookback_days + 15)
             instruments = kite_client.get_instruments("NSE")
             token_by_symbol = {
@@ -625,13 +808,14 @@ class RiskManager:
             )
             return None
 
-    @staticmethod
-    def _add_exposure(state: _ExposureState, symbol: str, signed_value: float) -> None:
+    def _add_exposure(
+        self, state: _ExposureState, symbol: str, signed_value: float
+    ) -> None:
         gross_value = abs(signed_value)
         state.gross += gross_value
         state.net += signed_value
         state.symbol_gross[symbol] = state.symbol_gross.get(symbol, 0.0) + gross_value
-        sector = get_sector(symbol)
+        sector = self._sector(symbol)
         state.sector_gross[sector] = state.sector_gross.get(sector, 0.0) + gross_value
 
     def _position_quantity(
@@ -688,7 +872,7 @@ class RiskManager:
         self,
         broker_snapshot,
     ) -> Tuple[Optional[_ExposureState], str]:
-        if not broker_snapshot.entry_ready:
+        if not self._snapshot_entry_ready(broker_snapshot):
             return None, "BROKER_STATE_UNAVAILABLE"
 
         state = _ExposureState(0.0, 0.0, 0.0, 0.0, {}, {}, set(), {})
@@ -799,7 +983,7 @@ class RiskManager:
                 or mark <= 0
                 or mark_time is None
                 or not -5
-                <= (utc_now() - as_utc(mark_time)).total_seconds()
+                <= (self._now() - as_utc(mark_time)).total_seconds()
                 <= broker_snapshot.max_age_seconds
             ):
                 return None, f"MARK_UNAVAILABLE: {key.tradingsymbol}"
@@ -965,7 +1149,7 @@ class RiskManager:
             return False, "DAILY_LOSS_LIMIT"
         if self.reconciliation_status != "RECONCILED":
             return False, f"RECONCILIATION_REQUIRED: {self.reconciliation_status}"
-        if self.date_str != get_ist_now().date().isoformat():
+        if self.date_str != self._exchange_now().date().isoformat():
             return False, "RECONCILIATION_REQUIRED: SESSION_RESET_PENDING"
         if exchange != SUPPORTED_EXCHANGE or product != SUPPORTED_PRODUCT:
             return False, "UNSUPPORTED_PRODUCT_OR_EXCHANGE"
@@ -992,10 +1176,8 @@ class RiskManager:
         ):
             return False, f"DUPLICATE_POSITION_OR_ENTRY: {symbol}"
 
-        config = config_manager.get_risk_config()
-        from .journal import journal
-
-        counts = journal.get_todays_trade_counts()
+        config = self._risk_config()
+        counts = self._trade_counts()
         journal_order_ids = set(counts.get("entry_order_ids", ()))
         local_order_ids = {
             reservation.broker_order_id
@@ -1071,7 +1253,7 @@ class RiskManager:
         if state.symbol_gross.get(symbol, 0.0) + proposed_value > max_single:
             return False, f"SINGLE_SYMBOL_LIMIT: {symbol} would exceed {max_single}"
 
-        proposed_sector = get_sector(symbol)
+        proposed_sector = self._sector(symbol)
         if state.sector_gross.get(proposed_sector, 0.0) + proposed_value > max_sector:
             return False, (
                 f"SECTOR_EXPOSURE_LIMIT: {proposed_sector} would exceed {max_sector}"
@@ -1160,7 +1342,7 @@ class RiskManager:
                 quantity=qty,
                 reference_price=price,
                 baseline_signed_quantity=baseline,
-                created_at=utc_now(),
+                created_at=self._now(),
                 namespace=broker_snapshot.namespace.value,
                 account_id=broker_snapshot.account_id,
                 instrument_id=instrument_id,
@@ -1213,7 +1395,7 @@ class RiskManager:
                 quantity=quantity,
                 reference_price=price,
                 baseline_signed_quantity=trade.get("baseline_signed_quantity", 0),
-                created_at=as_utc(trade.get("entry_time")) or utc_now(),
+                created_at=as_utc(trade.get("entry_time")) or self._now(),
                 broker_order_id=trade.get("entry_order_id"),
                 namespace=trade["namespace"],
                 account_id=trade["account_id"],
@@ -1278,4 +1460,27 @@ class RiskManager:
             return len(self._entry_reservations)
 
 
-risk_manager = RiskManager()
+class _LazyLiveRiskManager:
+    """Retain the live singleton without loading live state during research imports."""
+
+    def __init__(self):
+        object.__setattr__(self, "_instance", None)
+        object.__setattr__(self, "_instance_lock", threading.Lock())
+
+    def _live_instance(self):
+        with self._instance_lock:
+            if self._instance is None:
+                object.__setattr__(self, "_instance", RiskManager())
+            return self._instance
+
+    def __getattr__(self, name):
+        return getattr(self._live_instance(), name)
+
+    def __setattr__(self, name, value):
+        setattr(self._live_instance(), name, value)
+
+    def __delattr__(self, name):
+        delattr(self._live_instance(), name)
+
+
+risk_manager = _LazyLiveRiskManager()

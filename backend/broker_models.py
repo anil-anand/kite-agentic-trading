@@ -255,6 +255,9 @@ class BrokerSnapshot:
 
     @property
     def entry_ready(self) -> bool:
+        return self.entry_ready_at(utc_now())
+
+    def entry_ready_at(self, as_of: datetime) -> bool:
         """Whether this snapshot is safe for a new risk-increasing order.
 
         ``COMPLETE`` describes parsing, not freshness or read consistency.  A
@@ -262,6 +265,12 @@ class BrokerSnapshot:
         with excessive skew is deliberately not admission-authoritative.
         """
 
+        if (
+            not isinstance(as_of, datetime)
+            or as_of.tzinfo is None
+            or as_of.utcoffset() is None
+        ):
+            raise ValueError("admission time must be an aware datetime")
         if self.account_id in {"", "UNKNOWN", None}:
             return False
         if any(
@@ -273,7 +282,7 @@ class BrokerSnapshot:
             )
         ):
             return False
-        now = utc_now()
+        now = as_of.astimezone(timezone.utc)
         source_times = [
             _as_utc(item)
             for item in (

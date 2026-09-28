@@ -167,6 +167,36 @@ def _capture(signal):
     )
 
 
+@pytest.mark.parametrize("direction", ["BUY", "SELL"])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_warmup_acquisition_ties_choose_latest_formed_swing(direction, reverse):
+    signal = _signal()
+    signal.update(
+        direction=direction,
+        management_profile="trend_continuation",
+        stopLoss=95 if direction == "BUY" else 105,
+        target=110 if direction == "BUY" else 90,
+    )
+    levels = [
+        {
+            "level_id": identifier,
+            "kind": "SWING_LOW" if direction == "BUY" else "SWING_HIGH",
+            "price": price if direction == "BUY" else 200 - price,
+            "formed_at": formed,
+            "known_at": "2026-09-20T04:25:00+00:00",
+            "source_bar_ids": [identifier],
+        }
+        for identifier, price, formed in (
+            ("z-old", 96, "2026-09-17T04:00:00+00:00"),
+            ("a-new", 98, "2026-09-20T04:10:00+00:00"),
+        )
+    ]
+    signal["market_context"]["knownSwings"] = levels[::-1] if reverse else levels
+    thesis = _capture(signal)
+    assert thesis.management_profile.name == "trend_continuation"
+    assert thesis.management_profile.values["entry_boundary"]["level_id"] == "a-new"
+
+
 def test_confirmation_delay_preserves_original_scan_time_and_profile():
     thesis = _capture(_signal())
     assert thesis.created_at == "2026-09-20T04:29:00+00:00"

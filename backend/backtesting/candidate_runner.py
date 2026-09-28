@@ -64,6 +64,7 @@ class CandidateRunner:
         coordinator: OrderLifecycleCoordinator,
         session_policy: SessionPolicy = SessionPolicy(),
         daily_loss_limit: float | None = None,
+        dynamic_entries: bool = False,
     ):
         if not isinstance(broker, SimulatedBroker) or broker.namespace not in {
             ExecutionNamespace.REPLAY,
@@ -82,6 +83,7 @@ class CandidateRunner:
         self.coordinator = coordinator
         self.clock = SessionClock(session_policy)
         self.daily_loss_limit = daily_loss_limit
+        self.dynamic_entries = dynamic_entries
         self.daily_loss_latched = False
         self.positions: dict[str, CandidatePosition] = {}
         self.evaluations: list[ExitEvaluation] = []
@@ -107,7 +109,16 @@ class CandidateRunner:
         """Bind an immutable thesis/checkpoint to verified simulated entry fills."""
         symbol = thesis.symbol
         position = self.broker.positions.get(symbol)
-        if symbol in self.positions or position is None:
+        previous = self.positions.get(symbol)
+        if (
+            previous is not None
+            and not (
+                self.dynamic_entries
+                and previous.state.exposure
+                in {ExposureState.CLOSED, ExposureState.ENTRY_ABORTED}
+                and previous.state.position_key != state.position_key
+            )
+        ) or position is None:
             raise ValueError("register a filled position exactly once per runner")
         if (
             state.position_key
@@ -118,9 +129,20 @@ class CandidateRunner:
             or thesis.position_key != state.position_key
             or state.known_quantity != position["quantity"]
             or thesis.direction != position["direction"]
-            or thesis.fill_binding is None
-            or abs(thesis.fill_binding.entry_vwap - position["entry_price"]) > 1e-8
-            or thesis.fill_binding.filled_quantity != position["initial_quantity"]
+            or (
+                thesis.fill_binding is None
+                and not (
+                    self.dynamic_entries and state.thesis_health.value == "UNKNOWN"
+                )
+            )
+            or (
+                thesis.fill_binding is not None
+                and (
+                    abs(thesis.fill_binding.entry_vwap - position["entry_price"]) > 1e-8
+                    or thesis.fill_binding.filled_quantity
+                    != position["initial_quantity"]
+                )
+            )
             or state.exposure is not ExposureState.OPEN
             or state.protection is not ProtectionState.ACTIVE
             or state.latched_exit_intent_id is not None
@@ -135,7 +157,12 @@ class CandidateRunner:
         if (
             not stop
             or stop["remaining_quantity"] != position["quantity"]
-            or stop["status"] not in {"OPEN", "TRIGGER PENDING"}
+            or stop["status"]
+            not in (
+                {"OPEN", "TRIGGER PENDING", "TRIGGERED"}
+                if self.dynamic_entries
+                else {"OPEN", "TRIGGER PENDING"}
+            )
             or stop["side"] == thesis.direction
         ):
             raise ValueError(
@@ -276,9 +303,12 @@ class CandidateRunner:
             raise ValueError("candidate events require increasing aware timestamps")
         candles = dict(candles or {})
         contexts = dict(contexts or {})
-        if set(self.broker.positions).difference(self.positions) or any(
-            order["role"] == OrderRole.ENTRY.value
-            for order in self.broker.pending_orders
+        if set(self.broker.positions).difference(self.positions) or (
+            not self.dynamic_entries
+            and any(
+                order["role"] == OrderRole.ENTRY.value
+                for order in self.broker.pending_orders
+            )
         ):
             raise ValueError(
                 "exit-only runner requires registered terminal entry fills"
@@ -455,6 +485,14 @@ class CandidateRunner:
                     },
                     submit_order=amend,
                     reason=proposal.reason_code,
+                )
+                self.execution_results.append(
+                    {
+                        "decision_id": evaluation.decision.decision_id,
+                        "intent_id": response.intent_id,
+                        "order_id": response.broker_order_id,
+                        "state": response.state,
+                    }
                 )
                 acknowledged = self.broker.get_order(response.broker_order_id)
                 if response.state == "REJECTED":

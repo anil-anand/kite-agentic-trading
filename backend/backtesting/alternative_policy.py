@@ -34,6 +34,7 @@ def simulate_alternative_exit_execution(
     market_data: Mapping[str, pd.DataFrame],
     context_policy: ContextPolicy = ContextPolicy(),
     clock_events: Sequence[datetime] = (),
+    legacy_control: Mapping | None = None,
 ) -> dict:
     """Execute original and alternative policies with identical fill assumptions.
 
@@ -94,7 +95,18 @@ def simulate_alternative_exit_execution(
         broker = deepcopy(checkpoint.broker)
         journal = TradeJournal(str(Path(directory) / f"{name}.db"))
         try:
-            runner = CandidateRunner(
+            from .legacy_control import LegacyControlRunner
+
+            runner_type = (
+                LegacyControlRunner
+                if alternative and legacy_control is not None
+                else CandidateRunner
+            )
+            extra = (
+                dict(legacy_control or {}) if runner_type is LegacyControlRunner else {}
+            )
+            runner = runner_type(
+                **extra,
                 broker=broker,
                 coordinator=OrderLifecycleCoordinator(journal),
                 session_policy=checkpoint.clock.policy,
@@ -156,6 +168,9 @@ def simulate_alternative_exit_execution(
                         equity_curve=result["equity_curve"],
                     ),
                     "recorded_decisions": result["recorded_decisions"],
+                    "legacy_control_decisions": result.get(
+                        "legacy_control_decisions", []
+                    ),
                     "execution_results": result["execution_results"],
                     "fills": broker.fills,
                     "ambiguity_events": broker.ambiguous_events,

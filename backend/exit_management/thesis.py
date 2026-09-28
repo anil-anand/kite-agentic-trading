@@ -465,7 +465,14 @@ def _management_profile(
             )
         ]
         if candidates:
-            boundary = max(candidates, key=lambda level: as_utc(level["known_at"]))
+            boundary = max(
+                candidates,
+                key=lambda level: (
+                    as_utc(level["known_at"]),
+                    as_utc(level["formed_at"]),
+                    level["level_id"],
+                ),
+            )
     elif valid_range and requested == "breakout_follow_through":
         close = trigger.get("close")
         # Keep a range only when the recorded trigger actually broke its edge.

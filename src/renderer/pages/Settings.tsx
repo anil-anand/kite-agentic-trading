@@ -93,6 +93,8 @@ const Settings: React.FC = () => {
 
   const handleProviderChange = (provider: string) => {
     updateLlm({ provider: provider as LLMSettings['provider'], ...(provider === 'OpenCode' ? OPENCODE_PLAN_PRESETS.zen : LLM_PRESETS[provider] || {}) });
+    setLlmKey('');
+    updateLlm({ apiKeyConfigured: provider === settings?.llm.provider && Boolean(settings?.llm.apiKeyConfigured) });
     setModels([]);
     setDiscoveryError('');
   };

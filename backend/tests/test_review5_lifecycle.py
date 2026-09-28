@@ -148,12 +148,19 @@ class ScriptedSDK:
 
 
 @pytest.fixture
-def lifecycle(monkeypatch, tmp_path):
+def lifecycle(monkeypatch, tmp_path, open_session_clock):
     import backend.execution_gateway as gateway_module
     import backend.journal as journal_module
     import backend.kite_client as client_module
     import backend.trading_engine as engine_module
 
+    # These cases exercise entry/protection recovery during an open session.
+    # Restarted engines must receive the same declared session facts; the test
+    # runner's wall-clock square-off deadline is not part of their scenario.
+    # Quote/fill freshness remains checked against the real supplied event time.
+    monkeypatch.setattr(
+        TradingEngine, "_session_clock", lambda self: open_session_clock
+    )
     sdk = ScriptedSDK()
     client = KiteClient()
     monkeypatch.setattr(client, "kite", sdk)

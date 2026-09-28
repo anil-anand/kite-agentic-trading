@@ -1,12 +1,18 @@
 import { spawn, ChildProcess } from 'child_process';
 import * as path from 'path';
-import { app, webContents } from 'electron';
+import { app, WebContents } from 'electron';
+import { sameDocumentLocation } from '../shared/navigation-policy';
 import { RPCRequest, RPCResponse, RPCEvent } from '../shared/types';
 import * as channels from '../shared/ipc-channels';
 import { secureStorage } from './secure-storage';
 
 class PythonBridge {
   private childProcess: ChildProcess | null = null;
+  private renderer: { contents: WebContents; trustedUrl: string } | null = null;
+
+  public setRenderer(contents: WebContents | null, trustedUrl = ''): void {
+    this.renderer = contents ? { contents, trustedUrl } : null;
+  }
   private requestId = 0;
   private pendingRequests: Map<number, { resolve: (value: any) => void; reject: (error: any) => void }> = new Map();
   private restartCount = 0;
@@ -235,10 +241,11 @@ class PythonBridge {
   }
 
   private broadcastToRenderer(channel: string, data: any) {
-    const allWebContents = webContents.getAllWebContents();
-    for (const contents of allWebContents) {
-      contents.send(channel, data);
-    }
+    const target = this.renderer;
+    if (!(channels.EVENT_CHANNELS as readonly string[]).includes(channel) || !target
+      || target.contents.isDestroyed()
+      || !sameDocumentLocation(target.contents.getURL(), target.trustedUrl)) return;
+    target.contents.send(channel, data);
   }
 }
 

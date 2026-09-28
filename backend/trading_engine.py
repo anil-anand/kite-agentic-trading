@@ -24,6 +24,7 @@ from .broker_models import (
     position_to_backend_dict,
 )
 from .config import config_manager
+from .entry_ordering import ordered_entry_signals, round_entry_price_to_tick
 from .execution_gateway import execution_gateway
 from .exit_management.engine import ExitPolicy, evaluate_exit
 from .exit_management.models import (
@@ -190,6 +191,24 @@ class TradingEngine:
         self._entry_theses: dict[str, EntryThesis] = {}
         self._managed_position_states: dict[str, PositionState] = {}
         self._exit_state_locks: dict[str, threading.RLock] = {}
+        self._operational_observer = None
+        try:
+            from .backtesting.operational_capture import live_observer_from_environment
+
+            self._operational_observer = live_observer_from_environment(journal)
+        except Exception:
+            # Optional evidence collection cannot disable protection or exits.
+            self._push_log(
+                "Operational evidence recorder could not start", level="warning"
+            )
+
+    def _capture_operational_position(self, position_key):
+        observer = getattr(self, "_operational_observer", None)
+        if observer is not None:
+            try:
+                observer.position(position_key)
+            except Exception:
+                observer.recorder.failed = True
 
     @staticmethod
     def _exit_policy_mode_from_settings(settings: object) -> str:
@@ -486,6 +505,7 @@ class TradingEngine:
             bound_thesis=bound_thesis,
         )
         self._managed_position_states[position_key] = state
+        self._capture_operational_position(position_key)
 
     @_best_effort_exit_observation
     @_serialized_exit_state
@@ -1061,6 +1081,14 @@ class TradingEngine:
         the actual checkpoint advances only as an observation boundary.
         """
 
+        observer = getattr(self, "_operational_observer", None)
+        received_at = None
+        if observer is not None:
+            try:
+                received_at = observer.received()
+            except Exception:
+                observer.recorder.failed = True
+                observer = None
         record = journal.get_managed_position(position_key)
         if record is None or record.get("state_corrupt"):
             raise ValueError("managed position checkpoint is unavailable")
@@ -1298,6 +1326,11 @@ class TradingEngine:
             decision=decision,
         )
         self._managed_position_states[position_key] = actual_after
+        if observer is not None:
+            try:
+                observer.decision(decision.to_dict(), received_at=received_at)
+            except Exception:
+                observer.recorder.failed = True
         return {
             "decision_id": evaluation.decision.decision_id,
             "action": evaluation.decision.action.value,
@@ -2026,6 +2059,8 @@ class TradingEngine:
                     level="warning",
                 )
                 return
+
+        self._capture_operational_position(position_key)
 
     def _owned_lifecycle_order_ids(self, position_key: str, trade: dict) -> set[str]:
         """Find explicit current/predecessor order ownership for one position epoch."""
@@ -3194,7 +3229,7 @@ class TradingEngine:
             return 0.05
 
     def _round_to_tick(self, price: float, tick_size: float) -> float:
-        return round(round(price / tick_size) * tick_size, 2)
+        return round_entry_price_to_tick(price, tick_size)
 
     def _session_clock(self) -> SessionClock:
         """Build the explicit exchange clock from the pinned risk settings."""
@@ -3993,7 +4028,9 @@ class TradingEngine:
                 with self._trade_lock:
                     preserved = set(self.active_trades.keys()) | self._pending_entries
 
-                self.dynamic_watchlist = list(set(new_watchlist) | preserved)
+                self.dynamic_watchlist = list(new_watchlist) + sorted(
+                    preserved.difference(new_watchlist)
+                )
                 self.universe_version += 1
                 self.last_universe_refresh_time = now
 
@@ -4006,33 +4043,54 @@ class TradingEngine:
                     level="error",
                 )
 
-        def handle_new_signal(signal):
-            # NOTE: This callback is invoked from scanner ThreadPoolExecutor
-            # threads, so active_trades access must be guarded by the lock.
-            signal["universe_version"] = str(self.universe_version)
-            signal["screener_ranking"] = self.watchlist_rankings.get(
-                signal["tradingsymbol"]
+        # Pin one batch's admission priority before parallel market-data work.
+        # UI delivery remains immediate; broker admission waits for a complete
+        # batch so API latency cannot decide who receives the last risk slot.
+        universe = tuple(
+            sorted(
+                self.dynamic_watchlist,
+                key=lambda symbol: (
+                    self.watchlist_rankings.get(symbol, float("inf")),
+                    symbol,
+                ),
             )
+        )
+        rankings = dict(self.watchlist_rankings)
+        universe_version = str(self.universe_version)
+        batch_signals = []
+        batch_lock = threading.Lock()
 
+        def handle_new_signal(signal):
+            signal["universe_version"] = universe_version
+            signal["screener_ranking"] = rankings.get(signal["tradingsymbol"])
             if signal["signal_score"] >= 70:
                 self._push_signal(signal)
-                prob = signal.get("estimated_probability")
-                if self.mode == "auto" and (prob is None or prob >= 0.60) and can_trade:
-                    symbol = signal["tradingsymbol"]
-                    with self._trade_lock:
-                        already_active = (
-                            symbol in self.active_trades
-                            or symbol in self._pending_entries
-                        )
-                    if already_active:
-                        self._push_log(
-                            f"Skipping auto-trade for {symbol} as it is already an active or pending position."
-                        )
-                    else:
-                        self.execute_signal(signal)
+                with batch_lock:
+                    batch_signals.append(signal)
 
-        # Scan stocks in parallel and stream signals to the UI instantly via handle_new_signal callback
-        scanner.scan_watchlist(self.dynamic_watchlist, on_signal=handle_new_signal)
+        scanner.scan_watchlist(list(universe), on_signal=handle_new_signal)
+        for signal in ordered_entry_signals(batch_signals, universe):
+            probability = signal.get("estimated_probability")
+            if (
+                signal["signal_score"] < 70
+                or self.mode != "auto"
+                or not can_trade
+                or (probability is not None and not probability >= 0.60)
+            ):
+                continue
+            symbol = signal["tradingsymbol"]
+            with self._trade_lock:
+                already_active = (
+                    symbol in self.active_trades or symbol in self._pending_entries
+                )
+            if already_active:
+                self._push_log(
+                    f"Skipping auto-trade for {symbol} as it is already an active or pending position."
+                )
+            else:
+                # execute_signal revalidates current risk, session and capacity
+                # under the existing serialized entry-admission boundary.
+                self.execute_signal(signal)
 
         # Normal management has its own worker, including while entries pause.
 

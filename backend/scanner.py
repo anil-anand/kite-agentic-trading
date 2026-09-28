@@ -10,6 +10,7 @@ import pandas as pd
 from .calibration import calibrator
 from .config import config_manager
 from .entry_decisions import evaluate_production_entries
+from .entry_ordering import PRODUCTION_CANDLE_HISTORY_DAYS
 from .kite_client import kite_client
 from .market_context import ContextPolicy, MarketContext, MarketContextService
 from .playbooks import BreakoutPlaybook, MeanReversionPlaybook, TrendPullbackPlaybook
@@ -113,7 +114,7 @@ class Scanner:
         ):
             return self.candle_cache[instrument_token].copy(deep=True), True
 
-        from_date = now - datetime.timedelta(days=5)
+        from_date = now - datetime.timedelta(days=PRODUCTION_CANDLE_HISTORY_DAYS)
         to_date = now
 
         try:

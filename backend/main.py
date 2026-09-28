@@ -386,8 +386,13 @@ def _handle_request(req):
         elif method == "discover_models":
             llm = config_manager.get_llm_settings()
             credentials = config_manager.get_credentials()
-            api_key = params.get("apiKey") or credentials.get("llmApiKey", "")
             provider = params.get("provider", llm.get("provider", "Gemini"))
+            saved_key = credentials.get("llmApiKey", "")
+            if provider != credentials.get(
+                "llmProvider", llm.get("provider", "Gemini")
+            ):
+                saved_key = ""
+            api_key = params.get("apiKey") or saved_key
             base_url = params.get("baseUrl", llm.get("baseUrl", ""))
             plan = params.get("openCodePlan", llm.get("openCodePlan", "zen"))
             if provider == "OpenCode":

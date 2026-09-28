@@ -20,7 +20,7 @@ async function bundledModule(entry: string, fixtures: Record<string, unknown>, g
     } }],
   });
   const context = vm.createContext({
-    module: { exports: {} }, fixtures, console: { log() {}, error() {} },
+    module: { exports: {} }, fixtures, URL, console: { log() {}, error() {} },
     __dirname: '/offline/project/dist/main/main', process: { platform: 'linux' },
     ...globals,
   });
@@ -55,6 +55,11 @@ async function bridgeFixture() {
     setTimeout: (callback: () => void) => { const id = ++timerId; timers.set(id, callback); return id; },
     clearTimeout: (id: number) => timers.delete(id),
   });
+  module.pythonBridge.setRenderer({
+    send: (channel: string, data: any) => statuses.push({ channel, ...data }),
+    isDestroyed: () => false,
+    getURL: () => 'http://localhost:5173/',
+  }, 'http://localhost:5173/');
   return { bridge: module.pythonBridge, children, statuses, timers };
 }
 
@@ -132,7 +137,7 @@ test('logout retains the trusted session when backend cannot release supervision
   const module = await bundledModule('src/main/auth-manager.ts', {
     electron: {},
     './python-bridge': { pythonBridge: { call: async (method: string) => { calls.push(method); if (blocked) throw new Error('live exposure'); return {}; } } },
-    './secure-storage': { secureStorage: { updateCredentials: () => calls.push('clear-token') } },
+    './secure-storage': { secureStorage: { clearAccessToken: () => calls.push('clear-token') } },
   });
   await assert.rejects(module.authManager.logout(), /live exposure/);
   assert.deepEqual(calls, ['logout']);

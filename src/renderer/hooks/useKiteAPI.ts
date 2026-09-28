@@ -5,10 +5,10 @@ import { OrderRequest, KiteCredentials, StrategyName, OrderVariety, ExitQualityR
 
 export interface ElectronAPI {
   isDevMode?: boolean;
-  invoke(channel: string, ...args: any[]): Promise<any>;
-  on(channel: string, listener: (...args: any[]) => void): () => void;
-  removeListener(channel: string, listener: (...args: any[]) => void): void;
-  removeAllListeners(channel: string): void;
+  invoke(channel: IPC.InvokeChannel, ...args: any[]): Promise<any>;
+  on(channel: IPC.EventChannel, listener: (...args: any[]) => void): () => void;
+  removeListener(channel: IPC.EventChannel, listener: (...args: any[]) => void): void;
+  removeAllListeners(channel: IPC.EventChannel): void;
   dashboard: {
     summary(): Promise<any>;
   };
@@ -211,7 +211,7 @@ export const useKiteAPI = ({ subscribe = false }: { subscribe?: boolean } = {}) 
 
   const logout = async () => {
     await window.electronAPI?.invoke(IPC.AUTH_LOGOUT);
-    store.setAuth({ isLoggedIn: false });
+    store.setAuth({ isLoggedIn: false, credentials: null });
     store.setConnectionStatus('disconnected');
   };
 

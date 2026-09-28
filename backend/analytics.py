@@ -6,6 +6,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Mapping
 
+from .dev_mode import runtime_data_dir
 from .exit_management.models import ExitReasonCode
 from .exit_quality import build_exit_quality_report, calculate_exit_quality
 from .financial_eligibility import verified_outcome, verified_outcome_sql
@@ -35,7 +36,7 @@ def _exchange_hour(value: Any) -> str:
 class TradeAnalytics:
     def __init__(self, db_path: str = None):
         if db_path is None:
-            self.db_path = Path.home() / ".kite-agentic-trading" / "journal.db"
+            self.db_path = runtime_data_dir() / "journal.db"
         else:
             self.db_path = Path(db_path)
         self._journal = None
@@ -987,6 +988,8 @@ class TradeAnalytics:
         llm = config_manager.get_llm_settings()
         api_key = creds.get("llmApiKey")
         provider = llm.get("provider", "Gemini")
+        if creds.get("llmProvider", provider) != provider:
+            api_key = ""
         if not api_key and provider != "Ollama":
             return {"error": "LLM API Key not configured in settings."}
 

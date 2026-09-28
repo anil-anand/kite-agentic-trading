@@ -579,10 +579,20 @@ cannot loosen stops or revoke exits. No improvement claim based only on in-sampl
 **Expected behavior:** coherent, explained, validated management with strict
 hard-risk authority. More holding time or fewer trades alone is not success.
 
+**Implementation/review status:** [PHASE10_REVIEW.md](PHASE10_REVIEW.md) records
+the findings and corrections. The [acceptance workflow](PHASE10_ACCEPTANCE.md)
+implements frozen paired and independent portfolio runs, repaired legacy control,
+causal production entry/risk/calibration, single-access holdout, session-block
+inference, authentic shadow/paper capture, and binding of review claims to executed
+artifacts. F26/F29/F30 source fixes and focused regressions are included. Historical
+and operational outcomes must still satisfy the predeclared empirical gates;
+working adapters and passing synthetic tests do not establish that result.
+Candidate activation and legacy retirement remain conditional on accepted evidence.
+
 ## Separate work and explicit non-rewrites
 
-Before live promotion, deliver focused fixes for F29 secrets/blank saves, F26
-DEV/LIVE storage isolation and F30 privileged IPC/provider boundaries. Complete
+The focused F29 secrets/blank-save, F26 DEV/LIVE storage isolation, and F30
+IPC/provider corrections are included in this review. Before live promotion, complete
 any enabled manual entry protection/validation gaps from F09. These are not
 opportunities to add LLM trade authority or replace native credential storage.
 

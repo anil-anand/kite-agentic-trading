@@ -3,6 +3,7 @@
 export interface KiteCredentials {
   apiKey: string;
   apiSecret: string;
+  redirectUrl?: string;
   accessToken?: string;
   userId?: string;
   userName?: string;
@@ -23,7 +24,7 @@ export interface LLMSettings {
 
 export interface AuthState {
   isLoggedIn: boolean;
-  credentials: KiteCredentials | null;
+  credentials: { userId?: string; userName?: string } | null;
   loginUrl: string | null;
   error: string | null;
 }

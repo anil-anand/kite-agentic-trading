@@ -21,6 +21,7 @@ from collections import OrderedDict
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from enum import Enum
+from functools import lru_cache
 from threading import RLock
 from types import MappingProxyType
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -815,11 +816,15 @@ def _normalize_candles(
         lambda row: (
             str(row["revision"])
             + ":"
-            + _input_hash(
-                pd.DataFrame([row]).drop(
-                    columns=["available_at", "received_at"], errors="ignore"
-                )
-            )[:16]
+            + _content_revision_hash(
+                row["date"],
+                row["open"],
+                row["high"],
+                row["low"],
+                row["close"],
+                None if pd.isna(row["volume"]) else row["volume"],
+                row["revision"],
+            )
         ),
         axis=1,
     )
@@ -1284,6 +1289,32 @@ def _optional_float(value: Any) -> Optional[float]:
 def _bar_id(start: Any, revision: Any, interval_minutes: int = 5) -> str:
     timestamp = _as_datetime(start).isoformat()
     return f"{interval_minutes}m:{timestamp}:{revision}"
+
+
+@lru_cache(maxsize=65536, typed=True)
+def _content_revision_hash(start, opening, high, low, close, volume, revision):
+    """Memoize immutable row identity, not eligibility or observation state.
+
+    ``typed=True`` preserves existing integer-versus-float JSON hashes. Receipt,
+    availability, source cutoff and decision time still pass through full
+    normalization on every build; a cache hit cannot make a future bar eligible.
+    NaN volume is normalized to None solely because both encode as JSON null.
+    The bounded cache retains only scalar content and a digest, never frames.
+    """
+    frame = pd.DataFrame(
+        [
+            {
+                "date": start,
+                "open": opening,
+                "high": high,
+                "low": low,
+                "close": close,
+                "volume": volume,
+                "revision": revision,
+            }
+        ]
+    )
+    return _input_hash(frame)[:16]
 
 
 def _input_hash(frame: pd.DataFrame) -> str:

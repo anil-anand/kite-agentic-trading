@@ -1,6 +1,7 @@
 """Backtest measurements with explicit financial and observation coverage."""
 
 from collections import Counter, defaultdict
+from datetime import datetime
 from math import isfinite, sqrt
 from numbers import Real
 from statistics import mean, stdev
@@ -14,11 +15,30 @@ from ..time_utils import EXCHANGE_TIMEZONE, as_utc
 def _number(value: Any) -> float | None:
     if isinstance(value, bool) or not isinstance(value, Real):
         return None
-    return float(value) if isfinite(value) else None
+    try:
+        return float(value) if isfinite(value) else None
+    except OverflowError:
+        return None
 
 
 def _average(values: list[float], digits: int = 2) -> float | None:
     return round(mean(values), digits) if values else None
+
+
+def _aware_timestamp(value: Any) -> datetime:
+    parsed = (
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if isinstance(value, str)
+        else value
+    )
+    if (
+        not isinstance(parsed, datetime)
+        or parsed.tzinfo is None
+        or parsed.utcoffset() is None
+        or parsed != parsed
+    ):
+        raise ValueError("timestamp must be finite and timezone-aware")
+    return as_utc(parsed)
 
 
 def _sharpe(returns: list[float]) -> float | None:
@@ -127,6 +147,13 @@ class MetricsEvaluator:
             "sharpe_session_count": len(session_returns),
             "sharpe_risk_free_rate": 0.0,
             "sharpe_annualization_sessions": 252,
+            "avg_r": None,
+            "total_net_r": None,
+            "total_gross_r": None,
+            "r_coverage": {"available": 0, "trades": len(eligible)},
+            "gross_r_coverage": {"available": 0, "trades": len(eligible)},
+            "cohorts": [],
+            "cohort_coverage": {},
         }
         if not eligible:
             return base
@@ -142,8 +169,22 @@ class MetricsEvaluator:
         equity = peak = initial_capital
         completed_drawdown = 0.0
         daily_pnl: dict[str, float] = defaultdict(float)
-        captured_r, mfe_prices, mae_prices, mfe_rs, mae_rs = [], [], [], [], []
+        captured_r, gross_r, mfe_prices, mae_prices, mfe_rs, mae_rs = (
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+        )
         excursion_quality: Counter[str] = Counter()
+        reason_distribution: Counter[str] = Counter()
+        playbook_distribution: Counter[str] = Counter()
+        symbol_distribution: Counter[str] = Counter()
+        entry_time_of_day: Counter[str] = Counter()
+        exit_time_of_day: Counter[str] = Counter()
+        cohort_trades: dict[tuple[str, str], list[dict]] = defaultdict(list)
+        cohort_counts: Counter[str] = Counter()
         for trade in eligible:
             equity += trade["net_pnl"]
             peak = max(peak, equity)
@@ -162,12 +203,68 @@ class MetricsEvaluator:
                 else None
             )
             budget = _number(risk * trade["quantity"]) if risk is not None else None
+            value = gross_value = None
             if risk is not None and risk > 0 and budget is not None and budget > 0:
                 value = _number(trade["net_pnl"] / budget)
                 if value is not None:
                     captured_r.append(value)
+                gross_value = _number(trade["gross_pnl"] / budget)
+                if gross_value is not None:
+                    gross_r.append(gross_value)
             else:
                 risk = None
+            reason = trade.get("exit_reason") or trade.get("reason")
+            if isinstance(reason, str) and reason:
+                reason_distribution[reason] += 1
+            symbol = trade.get("symbol") or trade.get("tradingsymbol")
+            if isinstance(symbol, str) and symbol:
+                symbol_distribution[symbol] += 1
+            playbook = trade.get("playbook")
+            if not isinstance(playbook, str):
+                playbook = signal.get("playbook") if isinstance(signal, dict) else None
+            if isinstance(playbook, str) and playbook:
+                playbook_distribution[playbook] += 1
+            entry_bucket = (
+                trade["entry_time"].astimezone(EXCHANGE_TIMEZONE).strftime("%H:%M")
+            )
+            exit_bucket = (
+                trade["exit_time"].astimezone(EXCHANGE_TIMEZONE).strftime("%H:%M")
+            )
+            entry_time_of_day[entry_bucket] += 1
+            exit_time_of_day[exit_bucket] += 1
+            dimensions = {
+                "reason": reason,
+                "playbook": playbook,
+                "symbol": symbol,
+                "entry_time_bucket": entry_bucket,
+                "exit_time_bucket": exit_bucket,
+                **{
+                    field: trade.get(field)
+                    for field in (
+                        "entry_regime",
+                        "exit_regime",
+                        "regime_transition",
+                        "setup_variant",
+                        "sector",
+                        "liquidity",
+                        "direction",
+                    )
+                },
+            }
+            for dimension, label in dimensions.items():
+                # Keep missing metadata and unavailable R visible; silently
+                # dropping them would overstate breadth and sample coverage.
+                cohort_counts.setdefault(dimension, 0)
+                if not isinstance(label, str) or not label.strip():
+                    continue
+                cohort_counts[dimension] += 1
+                cohort_trades[(dimension, label)].append(
+                    {
+                        "net_pnl": trade["net_pnl"],
+                        "net_r": value,
+                        "gross_r": gross_value,
+                    }
+                )
             mfe, mae = _number(trade.get("mfe")), _number(trade.get("mae"))
             quality = str(trade.get("excursion_quality") or "UNSPECIFIED")
             excursion_quality[quality] += 1
@@ -204,7 +301,10 @@ class MetricsEvaluator:
             "avg_win": round(avg_win, 2),
             "avg_loss": round(avg_loss, 2),
             "avg_r": _average(captured_r),
+            "total_net_r": round(sum(captured_r), 4) if captured_r else None,
+            "total_gross_r": round(sum(gross_r), 4) if gross_r else None,
             "r_coverage": {"available": len(captured_r), "trades": len(eligible)},
+            "gross_r_coverage": {"available": len(gross_r), "trades": len(eligible)},
             "completed_trade_drawdown": round(completed_drawdown, 2),
             "legacy_trade_day_sharpe": _sharpe(
                 [value / initial_capital for value in daily_pnl.values()]
@@ -235,4 +335,125 @@ class MetricsEvaluator:
             if gross
             else None,
             "net_profit": round(sum(pnl), 2),
+            "reason_distribution": dict(sorted(reason_distribution.items())),
+            "playbook_distribution": dict(sorted(playbook_distribution.items())),
+            "symbol_distribution": dict(sorted(symbol_distribution.items())),
+            "entry_time_of_day_distribution": dict(sorted(entry_time_of_day.items())),
+            "exit_time_of_day_distribution": dict(sorted(exit_time_of_day.items())),
+            "cohort_coverage": {
+                dimension: {"available": count, "trades": len(eligible)}
+                for dimension, count in sorted(cohort_counts.items())
+            },
+            "cohorts": [
+                {
+                    "dimension": dimension,
+                    "value": label,
+                    "trade_count": len(records),
+                    "net_profit": round(sum(row["net_pnl"] for row in records), 2),
+                    "average_net_r": _average(
+                        [row["net_r"] for row in records if row["net_r"] is not None],
+                        4,
+                    ),
+                    "average_gross_r": _average(
+                        [
+                            row["gross_r"]
+                            for row in records
+                            if row["gross_r"] is not None
+                        ],
+                        4,
+                    ),
+                    "r_coverage": sum(row["net_r"] is not None for row in records),
+                    "gross_r_coverage": sum(
+                        row["gross_r"] is not None for row in records
+                    ),
+                }
+                for (dimension, label), records in sorted(cohort_trades.items())
+            ],
+        }
+
+    @staticmethod
+    def validate_walk_forward_trade_window(
+        trades: List[Dict[str, Any]], start: datetime, end: datetime
+    ) -> None:
+        """Reject results whose realized outcome was unavailable within a fold."""
+
+        for trade in trades:
+            timestamps = []
+            for field in ("entry_time", "exit_time"):
+                try:
+                    at = _aware_timestamp(trade.get(field))
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise ValueError(
+                        "walk-forward trade requires valid aware entry/exit timestamps"
+                    ) from exc
+                timestamps.append(at)
+            entered, exited = timestamps
+            if not start <= entered <= exited < end:
+                raise ValueError(
+                    "warmup or out-of-window trade leaked into OOS scoring"
+                )
+
+    @staticmethod
+    def evaluate_walk_forward(
+        fold_reports: List[Dict[str, Any]], initial_capital: float
+    ) -> Dict[str, Any]:
+        """Aggregate disjoint OOS folds without inventing a continuous account.
+
+        Each fold conventionally starts from a fresh declared account state. A
+        concatenated closed-trade curve would therefore misstate drawdown and
+        session return risk. Trade aggregates are useful diagnostics; continuous
+        MTM statistics remain unavailable unless a separately declared
+        continuous-state study supplies one account equity path.
+        """
+
+        previous_end = None
+        all_trades = []
+        windows = []
+        for report in fold_reports:
+            fold = report.get("fold") if isinstance(report, dict) else None
+            if not isinstance(fold, dict):
+                raise ValueError("walk-forward report requires fold metadata")
+            try:
+                start = _aware_timestamp(fold.get("test_start"))
+                end = _aware_timestamp(fold.get("test_end"))
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(
+                    "walk-forward fold has invalid test boundaries"
+                ) from exc
+            if end <= start:
+                raise ValueError("walk-forward fold has invalid test boundaries")
+            if previous_end is not None and start < previous_end:
+                raise ValueError("walk-forward OOS windows overlap")
+            trades = [dict(trade) for trade in report.get("trades", ())]
+            MetricsEvaluator.validate_walk_forward_trade_window(trades, start, end)
+            all_trades.extend(trades)
+            windows.append(
+                {
+                    "fold_id": fold.get("fold_id"),
+                    "test_start": start.isoformat(),
+                    "test_end": end.isoformat(),
+                    "trade_count": len(trades),
+                    "selected_policy_id": report.get("selected_policy_id"),
+                }
+            )
+            previous_end = end
+        trade_metrics = MetricsEvaluator.evaluate(all_trades, initial_capital)
+        # Even a completed-trade curve and trade-day Sharpe depend on account
+        # continuity. Retain them only on individual fold reports, where the
+        # declared reset state is meaningful.
+        trade_metrics.update(
+            metrics_basis="DISJOINT_OOS_COMPLETED_TRADES_NO_CONTINUOUS_ACCOUNT",
+            completed_trade_drawdown=None,
+            legacy_trade_day_sharpe=None,
+            path_dependent_metrics_basis="UNAVAILABLE_ACROSS_ACCOUNT_RESETS",
+        )
+        return {
+            "metrics_basis": "DISJOINT_OOS_FOLD_AGGREGATE_NO_CONTINUOUS_MTM",
+            "fold_count": len(windows),
+            "windows": windows,
+            "aggregate_trade_metrics": trade_metrics,
+            "continuous_mtm": {
+                "available": False,
+                "reason": "FOLDS_USE_SEPARATE_DECLARED_ACCOUNT_STATE",
+            },
         }

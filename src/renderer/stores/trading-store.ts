@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
+import { publicAuthState } from '@shared/credential-boundary';
 import {
   AuthState, Position, Order, Holding, Margins, AgentState,
   Signal, ActivityLogEntry, WatchlistItem, Tick, AppSettings, DashboardSummary
@@ -38,6 +39,10 @@ interface TradingState {
   setConnectionStatus: (status: 'connected' | 'disconnected' | 'connecting') => void;
 }
 
+// Earlier versions persisted native credentials here. Delete that payload
+// without reading its secrets or hydrating untrusted session state.
+try { localStorage.removeItem('kite-trading-storage'); } catch { /* Storage may be disabled. */ }
+
 export const useTradingStore = create<TradingState>()(
   persist(
     (set) => ({
@@ -66,7 +71,7 @@ export const useTradingStore = create<TradingState>()(
       dashboard: null,
       connectionStatus: 'disconnected',
 
-      setAuth: (auth) => set((state) => ({ auth: { ...state.auth, ...auth } })),
+      setAuth: (auth) => set((state) => ({ auth: { ...state.auth, ...publicAuthState(auth) } })),
       setPositions: (positions) => set({ positions }),
       setOrders: (orders) => set({ orders }),
       setHoldings: (holdings) => set({ holdings }),
@@ -100,24 +105,12 @@ export const useTradingStore = create<TradingState>()(
       setConnectionStatus: (status) => set({ connectionStatus: status })
     }),
     {
-      name: 'kite-trading-storage',
-      partialize: (state) => ({
-        auth: state.auth,
-        activityLog: state.activityLog,
-        watchlist: state.watchlist,
-        settings: state.settings,
-        agentState: {
-          enabledStrategies: state.agentState.enabledStrategies,
-          tradesToday: state.agentState.tradesToday,
-          signalsGenerated: state.agentState.signalsGenerated,
-          currentPnl: state.agentState.currentPnl,
-          maxDrawdownToday: state.agentState.maxDrawdownToday,
-          lastScanTime: state.agentState.lastScanTime,
-          running: false,
-          status: 'idle',
-          statusMessage: ''
-        }
-      }),
+      name: `kite-trading-preferences-v2-${window.electronAPI?.isDevMode ? 'dev' : 'live'}`,
+      partialize: (state) => ({ watchlist: state.watchlist }),
+      merge: (persisted, current) => {
+        const preferences = persisted as Partial<TradingState> | null;
+        return { ...current, watchlist: Array.isArray(preferences?.watchlist) ? preferences.watchlist : [] };
+      },
     }
   )
 );

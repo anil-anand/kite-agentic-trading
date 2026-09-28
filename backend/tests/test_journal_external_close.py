@@ -8,8 +8,18 @@ forever and never reached analytics.
 
 import datetime
 
+import pytest
+
 import backend.trading_engine as te
 from backend.trading_engine import TradingEngine
+
+
+@pytest.fixture(autouse=True)
+def open_brokerage_session(monkeypatch, open_session_clock):
+    """External-close attribution must not depend on the test host's session."""
+    monkeypatch.setattr(
+        TradingEngine, "_session_clock", lambda self: open_session_clock
+    )
 
 
 class FakeJournal:

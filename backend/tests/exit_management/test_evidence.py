@@ -383,6 +383,36 @@ def test_completed_higher_swing_contradicts_a_local_break_without_an_extra_vote(
     assert not has_independent_corroborator(report)
 
 
+def test_higher_structure_acquired_together_uses_formed_time_before_id(monkeypatch):
+    from backend.exit_management import evidence
+
+    thesis = _frozen_thesis()
+    context = _structure_context()
+    context = replace(context, higher_bar=context.primary_bar)
+    old = replace(
+        context.known_structure[0],
+        level_id="z-old",
+        price=90,
+        formed_at=context.decision_event_time - timedelta(minutes=60),
+        known_at=context.decision_event_time,
+    )
+    new = replace(
+        old,
+        level_id="a-new",
+        price=110,
+        formed_at=context.decision_event_time - timedelta(minutes=30),
+    )
+    monkeypatch.setattr(evidence, "_usable_higher_bars", lambda context: True)
+    monkeypatch.setattr(evidence, "_known_structure", lambda *args: (old, new))
+    monkeypatch.setattr(evidence, "_confirmation_buffer", lambda *args: 0.1)
+    observation, supportive, failed = evidence._higher_timeframe_evidence(
+        thesis, context, resolve_profile(thesis.management_profile), 0.05
+    )
+    assert observation.details["level_id"] == "a-new"
+    assert failed is True
+    assert supportive is False
+
+
 def test_explicit_vwap_boundary_can_fail_without_counting_its_alias_twice():
     thesis = _frozen_thesis(
         profile="trend_continuation",

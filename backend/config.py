@@ -8,12 +8,13 @@ from pathlib import Path
 
 from cryptography.fernet import Fernet
 
+from .dev_mode import runtime_data_dir
 from .time_utils import as_utc
 
 
 class ConfigManager:
     def __init__(self):
-        self.config_dir = Path.home() / ".kite-agentic-trading"
+        self.config_dir = runtime_data_dir()
         self.config_file = self.config_dir / "config.json"
         self.key_file = self.config_dir / ".key"
         self.config = {}
@@ -255,14 +256,22 @@ class ConfigManager:
         }
 
     def set_credentials(self, creds: dict):
-        self.in_memory_credentials.update(creds)
+        incoming = deepcopy(creds)
+        if incoming.get("llmApiKey") and not incoming.get("llmProvider"):
+            # Bind legacy trusted-native credentials to their existing profile.
+            incoming["llmProvider"] = self.get_llm_settings().get("provider")
+        self.in_memory_credentials.update(incoming)
 
     def get_credentials(self):
         return {
             "apiKey": self.in_memory_credentials.get("apiKey", ""),
             "apiSecret": self.in_memory_credentials.get("apiSecret", ""),
             "accessToken": self.in_memory_credentials.get("accessToken", ""),
-            "llmApiKey": self.in_memory_credentials.get("llmApiKey", ""),
+            "llmApiKey": self.in_memory_credentials.get("llmApiKey", "")
+            if self.in_memory_credentials.get("llmProvider")
+            == self.get_llm_settings().get("provider")
+            else "",
+            "llmProvider": self.in_memory_credentials.get("llmProvider"),
         }
 
     def get_llm_settings(self):
@@ -273,7 +282,7 @@ class ConfigManager:
         settings.setdefault("llm", deepcopy(self.default_config["llm"]))
         settings["llm"]["apiKey"] = ""
         settings["llm"]["apiKeyConfigured"] = bool(
-            self.in_memory_credentials.get("llmApiKey")
+            self.get_credentials().get("llmApiKey")
         )
         settings["credentials"] = {key: "" for key in settings.get("credentials", {})}
         return settings
@@ -281,6 +290,15 @@ class ConfigManager:
     def save_settings(self, settings: dict):
         incoming = deepcopy(settings)
         incoming_llm = incoming.pop("llm", None)
+        if incoming_llm is not None:
+            from .llm_client import validate_provider_url
+
+            proposed_llm = {**self.get_llm_settings(), **incoming_llm}
+            validate_provider_url(
+                proposed_llm.get("provider"),
+                proposed_llm.get("baseUrl"),
+                proposed_llm.get("openCodePlan", "zen"),
+            )
         incoming_credentials = incoming.pop("credentials", None)
         for key, value in incoming.items():
             if isinstance(value, dict) and isinstance(self.config.get(key), dict):
@@ -311,7 +329,7 @@ class ConfigManager:
                     "baseUrl"
                 ]
             if api_key and api_key != "********":
-                self.in_memory_credentials["llmApiKey"] = api_key
+                self.save_llm_api_key(api_key)
         self.save()
 
     def save_credentials(self, api_key: str, api_secret: str, access_token: str = ""):
@@ -325,6 +343,9 @@ class ConfigManager:
 
     def save_llm_api_key(self, llm_api_key: str):
         self.in_memory_credentials["llmApiKey"] = llm_api_key
+        self.in_memory_credentials["llmProvider"] = self.get_llm_settings().get(
+            "provider"
+        )
 
     def get_risk_config(self):
         return self.config.get("risk", self.default_config["risk"])

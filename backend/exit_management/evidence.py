@@ -534,7 +534,10 @@ def _higher_timeframe_evidence(
         kind = "SWING_LOW" if thesis.direction == "BUY" else "SWING_HIGH"
         candidates = [item for item in levels if item.kind == kind]
         if candidates:
-            level = max(candidates, key=lambda item: (item.known_at, item.level_id))
+            level = max(
+                candidates,
+                key=lambda item: (item.known_at, item.formed_at, item.level_id),
+            )
             buffer = _confirmation_buffer(level, context, profile, tick_size)
     known = level is not None and buffer is not None
     distance = _direction(thesis) * (higher.close - level.price) if known else None

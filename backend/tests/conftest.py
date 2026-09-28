@@ -83,6 +83,38 @@ def make_candles():
 
 
 @pytest.fixture
+def open_session_clock():
+    """Explicit open-session input for brokerage unit tests, at any host time.
+
+    Keep receipt dates/timestamps real so quote freshness and daily accounting
+    retain their own tests. Only the external session classification is pinned;
+    session/deadline tests use their real clock or override this dependency.
+    This fixture is deliberately opt-in, not a global hard-risk bypass.
+    """
+    from dataclasses import replace
+    from datetime import datetime, timezone
+
+    from backend.session_clock import SessionClock, SessionPolicy
+
+    clock = SessionClock(SessionPolicy())
+    open_session = clock.snapshot(datetime(2026, 9, 7, 6, 30, tzinfo=timezone.utc))
+
+    class OpenSessionClock:
+        policy = clock.policy
+
+        def snapshot(self, observed_at):
+            actual = clock.snapshot(observed_at)
+            return replace(
+                open_session,
+                observed_at=actual.observed_at,
+                exchange_time=actual.exchange_time,
+                session_date=actual.session_date,
+            )
+
+    return OpenSessionClock()
+
+
+@pytest.fixture
 def uptrend():
     """60 bars of a smooth, strong uptrend."""
     return build_candles(np.linspace(100, 140, 60))

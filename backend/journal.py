@@ -66,7 +66,9 @@ def _validate_cost_details(cost_details: Dict[str, Any]) -> None:
 class TradeJournal:
     def __init__(self, db_path: str = None):
         if db_path is None:
-            self.db_path = Path.home() / ".kite-agentic-trading" / "journal.db"
+            from .dev_mode import runtime_data_dir
+
+            self.db_path = runtime_data_dir() / "journal.db"
         else:
             self.db_path = Path(db_path)
         self._local = threading.local()
@@ -1329,6 +1331,49 @@ class TradeJournal:
             if (projection := self.get_order_intent_projection(row["intent_id"]))
             is not None
         ]
+
+    def get_operational_position_facts(
+        self, position_key: str
+    ) -> Optional[Dict[str, Any]]:
+        """Export exact durable epoch/order/fill joins for an opt-in observer."""
+        managed = self.get_managed_position(position_key)
+        if managed is None or managed.get("state_corrupt"):
+            return None
+        thesis = self.get_position_thesis(position_key)
+        if not thesis or thesis.get("payload_corrupt"):
+            return None
+        intents = self.get_position_order_intents(position_key)
+        connection = self._get_conn()
+        for intent in intents:
+            intent["order_ids"] = sorted(
+                {
+                    str(row[0])
+                    for row in connection.execute(
+                        "SELECT broker_order_id FROM order_attempts WHERE intent_id = ? "
+                        "AND broker_order_id IS NOT NULL",
+                        (intent["intent_id"],),
+                    )
+                }
+            )
+        order_ids = {order for intent in intents for order in intent["order_ids"]}
+        return {
+            "state": managed["state"]["state"],
+            "direction": thesis["payload"]["direction"],
+            "intents": intents,
+            "fills": self.get_position_fills(position_key, broker_order_ids=order_ids),
+            "state_history": [
+                {
+                    "sequence": row["sequence"],
+                    "state_version": row["state_version"],
+                    "recorded_at": row["created_at"],
+                    "state": self._decode_exit_payload(row["payload"])["state"],
+                }
+                for row in connection.execute(
+                    "SELECT sequence,state_version,created_at,payload FROM position_checkpoints WHERE position_key = ? ORDER BY sequence",
+                    (position_key,),
+                )
+            ],
+        }
 
     def get_exit_management_replay(self, trade_id: str) -> Optional[Dict[str, Any]]:
         """Read only the retained inputs needed to explain a managed trade.

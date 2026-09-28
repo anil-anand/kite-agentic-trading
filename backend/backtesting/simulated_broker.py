@@ -14,6 +14,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from numbers import Real
 from typing import Any, Dict, Mapping, Optional
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -22,6 +23,7 @@ from ..broker_models import (
     BrokerOrder,
     BrokerPosition,
     BrokerPositionKey,
+    BrokerSnapshot,
     ExecutionNamespace,
     FillSnapshot,
     OrderRole,
@@ -462,6 +464,14 @@ class SimulatedBroker:
                 "ambiguity": False,
                 "excursion_quality": "COMPLETE_BARS",
             }
+            if (order.get("signal_info") or {}).get("stopOrderType") == "SL":
+                stop_price = position["sl"]
+                if stop_price is not None:
+                    offset = self.execution_policy.stop_limit_offset_fraction
+                    position["stop_limit_price"] = round(
+                        stop_price * (1 - offset if side == "BUY" else 1 + offset),
+                        self.execution_policy.price_precision,
+                    )
             self.positions[symbol] = position
             self._ensure_protection(position, timestamp)
             return
@@ -1124,38 +1134,101 @@ class SimulatedBroker:
                 }
         return None
 
+    @staticmethod
+    def _session_date(timestamp: datetime):
+        return timestamp.astimezone(ZoneInfo("Asia/Kolkata")).date()
+
     def position_snapshot(self, timestamp: datetime) -> PositionSnapshot:
+        """Cumulative session facts include closed symbols and actual turnover.
+
+        Broker receipt never refreshes an old market mark. Closed-session fills
+        do not contaminate today's accounting; an overnight residual is exposed
+        explicitly so the caller can refuse an unsupported carried-state study.
+        """
         timestamp = self._time(timestamp)
-        positions = []
-        for symbol, position in self.positions.items():
+        day = self._session_date(timestamp)
+        fills = [
+            f
+            for f in self.fills
+            if self._session_date(f["exchange_time"]) == day
+            and f["exchange_time"] <= timestamp
+        ]
+        rows = []
+        for symbol in sorted(set(self.positions) | {f["symbol"] for f in fills}):
+            current = self.positions.get(symbol)
+            symbol_fills = [f for f in fills if f["symbol"] == symbol]
+            buy = [f for f in symbol_fills if f["side"] == "BUY"]
+            sell = [f for f in symbol_fills if f["side"] == "SELL"]
+            bought = sum(f["quantity"] for f in buy)
+            sold = sum(f["quantity"] for f in sell)
+            buy_value = sum(f["quantity"] * f["price"] for f in buy)
+            sell_value = sum(f["quantity"] * f["price"] for f in sell)
             quantity = (
-                position["quantity"]
-                if position["direction"] == "BUY"
-                else -position["quantity"]
+                current["quantity"] * (1 if current["direction"] == "BUY" else -1)
+                if current
+                else 0
             )
-            positions.append(
+            average = current["entry_price"] if current else 0.0
+            mark = self._prices.get(symbol, average)
+            unrealised = quantity * (mark - average)
+            gross = sell_value - buy_value + quantity * mark
+            overnight = quantity - bought + sold
+            rows.append(
                 BrokerPosition(
                     key=self._key_for(symbol),
                     signed_quantity=quantity,
-                    average_price=position["entry_price"],
-                    last_price=self._prices.get(symbol, position["entry_price"]),
-                    realised_gross=position["realized_gross"],
-                    unrealised_gross=None,
-                    pnl=None,
-                    mark_time=self._mark_times.get(symbol, position["entry_time"]),
+                    average_price=average,
+                    last_price=mark,
+                    realised_gross=gross - unrealised if not overnight else None,
+                    unrealised_gross=unrealised,
+                    pnl=gross if not overnight else None,
+                    buy_quantity=bought,
+                    sell_quantity=sold,
+                    buy_price=buy_value / bought if bought else 0.0,
+                    sell_price=sell_value / sold if sold else 0.0,
+                    buy_value=buy_value,
+                    sell_value=sell_value,
+                    day_buy_quantity=bought,
+                    day_sell_quantity=sold,
+                    overnight_quantity=overnight,
+                    mark_time=self._mark_times.get(symbol),
                 )
             )
         return PositionSnapshot(
-            net=tuple(positions),
-            day=tuple(positions),
+            net=tuple(rows),
+            day=tuple(rows),
             quality=SnapshotQuality.COMPLETE,
             fetched_at=timestamp,
+        )
+
+    def broker_snapshot(self, timestamp: datetime) -> BrokerSnapshot:
+        """One internally coherent canonical snapshot for shared risk admission."""
+        positions = self.position_snapshot(timestamp)
+        orders = self.order_snapshot(timestamp)
+        fills = self.fill_snapshot(timestamp)
+        return BrokerSnapshot(
+            namespace=self.namespace,
+            account_id=self.account_id,
+            positions=positions.net,
+            day_positions=positions.day,
+            current_orders=orders.orders,
+            fills=fills.fills,
+            positions_quality=positions.quality,
+            orders_quality=orders.quality,
+            fills_quality=fills.quality,
+            fetched_at=self._time(timestamp),
         )
 
     def order_snapshot(self, timestamp: datetime) -> OrderSnapshot:
         timestamp = self._time(timestamp)
         orders = []
         for item in self.orders.values():
+            if item["submitted_at"] > timestamp or (
+                self._session_date(item["submitted_at"])
+                != self._session_date(timestamp)
+                and item["status"] in {"COMPLETE", "CANCELLED", "REJECTED"}
+            ):
+                continue
             orders.append(
                 BrokerOrder(
                     broker_order_id=item["order_id"],
@@ -1198,6 +1271,9 @@ class SimulatedBroker:
                     received_at=item["received_at"],
                 )
                 for item in self.fills
+                if item["exchange_time"] <= timestamp
+                and self._session_date(item["exchange_time"])
+                == self._session_date(timestamp)
             ),
             quality=SnapshotQuality.COMPLETE,
             fetched_at=timestamp,
