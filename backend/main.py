@@ -35,16 +35,31 @@ _RESEARCH_METHODS = {
     "discover_models",
     "analytics_llm_post_mortem",
     "analytics_what_if",
-    "analytics_exit_quality_report",
-    "analytics_exit_quality_trade",
-    "analytics_exit_management_replay",
-    "analytics_active_position_explanations",
+    "analytics_trade_replay",
     "run_backtest",
     "scan_now",
     "get_historical",
 }
 _RESEARCH_WORKERS = 2
 _BROKER_WORKERS = 4
+_LOCAL_WORKERS = 2
+_LOCAL_QUEUE_SIZE = 8
+# These views use retained local data. A slow broker request must not prevent
+# reading the journal/settings or explaining already-recorded position state.
+_LOCAL_METHODS = {
+    "get_settings",
+    "ticker_status",
+    "journal_get_trades",
+    "journal_get_events",
+    "analytics_strategy_expectancy",
+    "analytics_confluence_validation",
+    "analytics_signal_score_calibration",
+    "analytics_exit_reason_effectiveness",
+    "analytics_exit_quality_report",
+    "analytics_exit_quality_trade",
+    "analytics_exit_management_replay",
+    "analytics_active_position_explanations",
+}
 _OPERATOR_WORKERS = 2
 _LIFECYCLE_WORKERS = 1
 _LIFECYCLE_QUEUE_SIZE = 8
@@ -690,6 +705,7 @@ def main():
         for name, workers, queued in (
             ("research", _RESEARCH_WORKERS, 0),
             ("broker", _BROKER_WORKERS, 0),
+            ("local", _LOCAL_WORKERS, _LOCAL_QUEUE_SIZE),
             ("operator", _OPERATOR_WORKERS, 0),
             # Authentication/startup is serialized and cannot compete with
             # dashboard/market-data reads for the broker workers. Absorb the
@@ -736,6 +752,8 @@ def main():
                 if method in _RESEARCH_METHODS
                 else "operator"
                 if method in _OPERATOR_METHODS
+                else "local"
+                if method in _LOCAL_METHODS
                 else "broker"
             )
             executor, capacity = pools[pool]

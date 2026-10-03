@@ -63,6 +63,98 @@ async function bridgeFixture() {
   return { bridge: module.pythonBridge, children, statuses, timers };
 }
 
+async function readyBridgeFixture() {
+  const fixture = await bridgeFixture();
+  fixture.bridge.start();
+  const child = fixture.children[0];
+  child.send({ event: 'backend:ready', data: { generation: 'read-sharing-test' } });
+  await child.reply();
+  await child.reply({ is_valid: true });
+  await child.reply({ supervisionActive: true });
+  assert.equal(fixture.bridge.isRunning(), true);
+  return { ...fixture, child };
+}
+
+test('overlapping UI mounts share pending reads and always refresh completed results', async () => {
+  const { bridge, child } = await readyBridgeFixture();
+  const initialRequests = child.requests.length;
+  const reads = Array.from({ length: 4 }, () => [bridge.call('dashboard_summary'), bridge.call('get_positions')]);
+  assert.equal(child.requests.length, initialRequests + 2, 'duplicate dashboard mounts must not fill four broker workers');
+  for (const request of child.requests.slice(initialRequests)) {
+    child.send({ id: request.id, result: { method: request.method } });
+  }
+  const snapshots = await Promise.all(reads.flat());
+  assert.equal(snapshots.filter(snapshot => snapshot.method === 'get_positions').length, 4);
+
+  const refresh = bridge.call('get_positions');
+  assert.equal(child.requests.length, initialRequests + 3, 'settled snapshots are not cached');
+  await child.reply({ fresh: true });
+  assert.equal((await refresh).fresh, true);
+  bridge.stop();
+});
+
+test('shared read failures release their slot and can be retried', async () => {
+  const { bridge, child } = await readyBridgeFixture();
+  const initialRequests = child.requests.length;
+  const reads = [bridge.call('journal_get_trades'), bridge.call('journal_get_trades')];
+  const finished = Promise.allSettled(reads);
+  assert.equal(child.requests.length, initialRequests + 1);
+  child.send({ id: child.requests.at(-1).id, error: { code: -32005, message: 'local worker capacity is full' } });
+  const results = await finished;
+  assert.ok(results.every(result => result.status === 'rejected' && /capacity is full/.test(result.reason.message)));
+  const retry = bridge.call('journal_get_trades');
+  assert.equal(child.requests.length, initialRequests + 2);
+  await child.reply([]);
+  assert.equal((await retry).length, 0);
+  bridge.stop();
+});
+
+test('commands never share work and fresh reads do not join snapshots from before a command', async () => {
+  const { bridge, child } = await readyBridgeFixture();
+  const initialRequests = child.requests.length;
+  const before = bridge.call('get_orders');
+  const beforeId = child.requests.at(-1).id;
+  const commands = [bridge.call('cancel_order', { orderId: 'ONE' }), bridge.call('cancel_order', { orderId: 'ONE' })];
+  const commandIds = child.requests.slice(-2).map((request: any) => request.id);
+  assert.equal(new Set(commandIds).size, 2);
+  const during = bridge.call('get_orders');
+  const duringId = child.requests.at(-1).id;
+  assert.equal(child.requests.length, initialRequests + 4);
+  commandIds.forEach((id: number) => child.send({ id, result: { accepted: true } }));
+  await Promise.all(commands);
+  const after = bridge.call('get_orders');
+  const afterId = child.requests.at(-1).id;
+  assert.equal(child.requests.length, initialRequests + 5, 'completion also invalidates reads begun during the command');
+  child.send({ id: beforeId, result: [] });
+  child.send({ id: duringId, result: [] });
+  await Promise.all([before, during]);
+  const duplicate = bridge.call('get_orders');
+  assert.equal(child.requests.length, initialRequests + 5, 'older reads cannot erase the newer in-flight slot');
+  child.send({ id: afterId, result: [{ orderId: 'ONE', status: 'CANCELLED' }] });
+  assert.equal((await after)[0].status, 'CANCELLED');
+  assert.equal((await duplicate)[0].status, 'CANCELLED');
+  bridge.stop();
+});
+
+test('a lost backend rejects shared reads and a new backend performs its own request', async () => {
+  const { bridge, child, children } = await readyBridgeFixture();
+  const reads = [bridge.call('get_positions'), bridge.call('get_positions')];
+  const finished = Promise.allSettled(reads);
+  child.emit('exit', 1, null);
+  assert.ok((await finished).every(result => result.status === 'rejected'));
+  bridge.start();
+  const replacement = children[1];
+  replacement.send({ event: 'backend:ready', data: { generation: 'replacement' } });
+  await replacement.reply();
+  await replacement.reply({ is_valid: true });
+  await replacement.reply({ supervisionActive: true });
+  const current = bridge.call('get_positions');
+  assert.equal(replacement.requests.at(-1).method, 'get_positions');
+  await replacement.reply({ net: [] });
+  assert.equal((await current).net.length, 0);
+  bridge.stop();
+});
+
 test('backend readiness requires trusted rehydration and one handshake per child', async () => {
   const { bridge, children, statuses } = await bridgeFixture();
   bridge.start();

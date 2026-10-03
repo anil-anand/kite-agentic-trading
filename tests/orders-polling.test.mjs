@@ -9,6 +9,7 @@ test('Orders retains uncertain rows, reports transport failures, and shows all w
   let nextResponse;
   let transportFailure = false;
   let cancelFailure = false;
+  let requests = 0;
   const cancelled = [];
   let stateCursor = 0;
   const localState = [];
@@ -48,6 +49,7 @@ test('Orders retains uncertain rows, reports transport failures, and shows all w
     } }],
   });
   const api = { orders: { getAll: async () => {
+    requests++;
     if (transportFailure) throw new Error('offline transport');
     return nextResponse;
   } } };
@@ -145,5 +147,16 @@ test('Orders retains uncertain rows, reports transport failures, and shows all w
   nextResponse = { snapshotQuality: 'UNAVAILABLE', orders: [] };
   await poll();
   assert.match(render(), /Order state unavailable/);
+  let finishSlowRead;
+  nextResponse = new Promise(resolve => { finishSlowRead = resolve; });
+  const pendingPoll = poll();
+  const requestsBeforeTicks = requests;
+  await poll();
+  await poll();
+  assert.equal(requests, requestsBeforeTicks, 'slow broker reads must not accumulate on interval ticks');
   cleanup();
+  finishSlowRead({ snapshotQuality: 'COMPLETE', orders: [row('LATE', 'OPEN')] });
+  await pendingPoll;
+  assert.equal(state.orders.length, 0, 'a response after leaving Orders cannot update the shared account view');
+  assert.match(render(), /Order state unavailable/);
 });

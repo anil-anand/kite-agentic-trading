@@ -226,7 +226,13 @@ def test_malformed_requests_fail_without_crashing_dispatch(payload, code):
 
 @pytest.mark.parametrize(
     "blocking_method",
-    ["execute_signal", "get_historical", "scan_now", "discover_models"],
+    [
+        "execute_signal",
+        "get_historical",
+        "scan_now",
+        "discover_models",
+        "analytics_trade_replay",
+    ],
 )
 def test_blocked_rpc_does_not_delay_emergency_admission(monkeypatch, blocking_method):
     started = threading.Event()

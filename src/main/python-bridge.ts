@@ -6,6 +6,17 @@ import { RPCRequest, RPCResponse, RPCEvent, BackendStatus } from '../shared/type
 import * as channels from '../shared/ipc-channels';
 import { secureStorage } from './secure-storage';
 
+// Only identical, parameter-free UI reads may share pending work. Results are
+// never cached after completion, and trading/authentication commands always
+// get their own RPC. This also covers React's development effect remounts.
+const SHARED_UI_READS = new Set([
+  'get_positions', 'get_orders', 'get_holdings', 'get_margins',
+  'dashboard_summary', 'get_settings', 'ticker_status', 'journal_get_trades',
+  'analytics_strategy_expectancy', 'analytics_confluence_validation',
+  'analytics_signal_score_calibration', 'analytics_exit_reason_effectiveness',
+  'analytics_exit_quality_report', 'analytics_active_position_explanations',
+]);
+
 class PythonBridge {
   private childProcess: ChildProcess | null = null;
   private renderer: { contents: WebContents; trustedUrl: string } | null = null;
@@ -15,6 +26,7 @@ class PythonBridge {
   }
   private requestId = 0;
   private pendingRequests: Map<number, { resolve: (value: any) => void; reject: (error: any) => void }> = new Map();
+  private pendingUiReads = new Map<string, Promise<any>>();
   private restartCount = 0;
   private maxRestarts = 3;
   private isShuttingDown = false;
@@ -154,7 +166,27 @@ class PythonBridge {
   }
 
   public async call(method: string, params: Record<string, unknown> = {}): Promise<any> {
-    return this.callRpc(method, params, true);
+    if (!SHARED_UI_READS.has(method) || Object.keys(params).length > 0) {
+      // A command may change session/account/order state. Reads requested
+      // across that boundary must start fresh, including while it is pending.
+      // Apply this conservatively to every non-shared method so future commands
+      // cannot accidentally reuse a snapshot from before their side effects.
+      this.pendingUiReads.clear();
+      const request = this.callRpc(method, params, true);
+      const invalidate = () => { this.pendingUiReads.clear(); };
+      void request.then(invalidate, invalidate);
+      return request;
+    }
+
+    const pending = this.pendingUiReads.get(method);
+    if (pending) return pending;
+    const request = this.callRpc(method, params, true);
+    this.pendingUiReads.set(method, request);
+    const clear = () => {
+      if (this.pendingUiReads.get(method) === request) this.pendingUiReads.delete(method);
+    };
+    void request.then(clear, clear);
+    return request;
   }
 
   private async callRpc(method: string, params: Record<string, unknown>, requireReady: boolean): Promise<any> {
@@ -178,6 +210,7 @@ class PythonBridge {
   }
 
   private rejectPendingRequests(error: Error): void {
+    this.pendingUiReads.clear();
     for (const [id, req] of this.pendingRequests.entries()) {
       req.reject(error);
       this.pendingRequests.delete(id);

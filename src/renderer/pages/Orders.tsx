@@ -15,10 +15,14 @@ const Orders: React.FC = () => {
   const { cancelOrder } = useKiteAPI();
 
   React.useEffect(() => {
+    let active = true;
+    let fetching = false;
     const fetchOrders = async () => {
-      if (!useTradingStore.getState().auth.isLoggedIn) return;
+      if (!active || fetching || !useTradingStore.getState().auth.isLoggedIn) return;
+      fetching = true;
       try {
         const response = await window.electronAPI?.orders.getAll();
+        if (!active || !useTradingStore.getState().auth.isLoggedIn) return;
         if (!response) throw new Error('Order snapshot unavailable');
         const isLegacyList = Array.isArray(response);
         const quality = isLegacyList ? 'PARTIAL' : response.snapshotQuality ?? 'UNAVAILABLE';
@@ -40,13 +44,16 @@ const Orders: React.FC = () => {
           setOrders(Array.from(merged.values()));
         }
       } catch (e) {
+        if (!active) return;
         setSnapshotQuality('UNAVAILABLE');
         console.error("Failed to fetch orders", e);
+      } finally {
+        fetching = false;
       }
     };
     fetchOrders();
     const interval = setInterval(fetchOrders, 10000);
-    return () => clearInterval(interval);
+    return () => { active = false; clearInterval(interval); };
   }, [setOrders]);
 
   const visibleOrders = orders.filter(order => {
