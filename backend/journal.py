@@ -2332,10 +2332,17 @@ class TradeJournal:
             )
 
     def update_protection_trigger(
-        self, intent_id: str, trigger_price: float, confirmed: bool = False
+        self,
+        intent_id: str,
+        trigger_price: float,
+        confirmed: bool = False,
+        *,
+        rejected: bool = False,
     ) -> Dict[str, Any]:
         """Persist modification uncertainty separately from confirmed protection."""
 
+        if confirmed and rejected:
+            raise ValueError("a modification cannot be both confirmed and rejected")
         if (
             isinstance(trigger_price, bool)
             or not isinstance(trigger_price, (int, float))
@@ -2380,7 +2387,11 @@ class TradeJournal:
                     raise ValueError(
                         "protection modification cannot loosen its trigger"
                     )
-            if confirmed:
+            if rejected:
+                if requested_trigger != trigger_price:
+                    raise ValueError("rejection does not match the requested trigger")
+                recovery.pop("requested_stop_trigger", None)
+            elif confirmed:
                 recovery["sl"] = trigger_price
                 recovery.pop("requested_stop_trigger", None)
                 payload["trigger_price"] = trigger_price
@@ -2400,7 +2411,9 @@ class TradeJournal:
             self._lifecycle_event_inner(
                 conn,
                 intent_id,
-                "protection_trigger_confirmed"
+                "protection_trigger_rejected"
+                if rejected
+                else "protection_trigger_confirmed"
                 if confirmed
                 else "protection_trigger_requested",
                 {"trigger_price": trigger_price, "previous_trigger": confirmed_trigger},

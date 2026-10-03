@@ -637,8 +637,11 @@ def evaluate_exit(
             protection_failed=False,
         )
     )
-    terminal_at = (
-        as_utc(thesis.fill_binding.entry_terminal_at)
+    exposure_at = (
+        as_utc(
+            thesis.fill_binding.entry_first_fill_at
+            or thesis.fill_binding.entry_terminal_at
+        )
         if thesis_identity_ok and thesis and thesis.fill_binding
         else None
     )
@@ -649,7 +652,7 @@ def evaluate_exit(
             isinstance(at, datetime)
             and at.tzinfo is not None
             and at <= event_time
-            and (terminal_at is None or at >= terminal_at)
+            and (exposure_at is None or at >= exposure_at)
             and is_fresh_mark(snapshot, policy.hard_risk_policy)
         )
 

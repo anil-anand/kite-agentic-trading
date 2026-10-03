@@ -118,6 +118,7 @@ def test_breakeven_never_loosens_existing_profit_protection(lifecycle, direction
 
 def test_modify_acknowledgement_does_not_confirm_new_trigger(lifecycle, monkeypatch):
     e = lifecycle
+    e.sdk.quote_price = 103
     e.sdk.after_entry = lambda: e.sdk.fill_entry()
     assert e.engine.execute_signal(e.signal)
     modifications = []

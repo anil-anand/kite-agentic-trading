@@ -63,6 +63,7 @@ def test_confirmed_breakeven_checkpoint_preserves_original_r_and_history(
     lifecycle, monkeypatch
 ):
     e = lifecycle
+    e.sdk.quote_price = 103
     key, _, thesis = _open_with_history(e)
 
     def modify(**kwargs):
@@ -82,6 +83,7 @@ def test_lost_modify_ack_does_not_promote_requested_stop_until_broker_observes_i
     lifecycle, monkeypatch
 ):
     e = lifecycle
+    e.sdk.quote_price = 103
     key, _, thesis = _open_with_history(e)
     modifications = []
 
@@ -229,6 +231,7 @@ def test_late_older_stop_trigger_cannot_roll_back_confirmed_tightening(
     lifecycle, monkeypatch
 ):
     e = lifecycle
+    e.sdk.quote_price = 103
     key, trade, thesis = _open_with_history(e)
     stale_trade = dict(trade)
     stale_stop = dict(e.engine._find_order("O2"))

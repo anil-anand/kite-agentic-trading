@@ -68,6 +68,7 @@ class FillRiskBinding:
     initial_r_per_share: float
     initial_risk_budget: float
     source_fill_ids: tuple[str, ...] = ()
+    entry_first_fill_at: Optional[str] = None
 
     def __post_init__(self) -> None:
         for name in ("entry_vwap", "initial_r_per_share", "initial_risk_budget"):
@@ -85,6 +86,11 @@ class FillRiskBinding:
             raise ValueError("source fill identities must be nonempty and unique")
         if self.entry_terminal_at is not None:
             as_utc(self.entry_terminal_at)
+        if self.entry_first_fill_at is not None:
+            first = as_utc(self.entry_first_fill_at)
+            terminal = as_utc(self.entry_terminal_at)
+            if terminal is not None and first > terminal:
+                raise ValueError("first entry fill cannot follow terminal entry")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -94,6 +100,7 @@ class FillRiskBinding:
             "initial_r_per_share": self.initial_r_per_share,
             "initial_risk_budget": self.initial_risk_budget,
             "source_fill_ids": list(self.source_fill_ids),
+            "entry_first_fill_at": self.entry_first_fill_at,
         }
 
 
@@ -633,6 +640,7 @@ def bind_terminal_fill(
     filled_quantity: int,
     terminal_at: datetime | str | None,
     source_fill_ids: tuple[str, ...] = (),
+    first_fill_at: datetime | str | None = None,
 ) -> EntryThesis:
     """Return the one permitted fill-bound revision of a draft thesis."""
 
@@ -659,6 +667,7 @@ def bind_terminal_fill(
         thesis, fill_price=entry_vwap, filled_quantity=filled_quantity
     )
     timestamp = as_utc(terminal_at)
+    first = as_utc(first_fill_at)
     return replace(
         thesis,
         revision=thesis.revision + 1,
@@ -670,6 +679,7 @@ def bind_terminal_fill(
             initial_r_per_share=provisional.risk_per_share,
             initial_risk_budget=provisional.risk_budget,
             source_fill_ids=tuple(str(item) for item in source_fill_ids),
+            entry_first_fill_at=first.isoformat() if first else None,
         ),
         provisional_risk=provisional,
     )

@@ -28,6 +28,7 @@ class ScriptedSDK:
         self.hide_entry = False
         self.hide_stops = False
         self.after_entry = lambda: None
+        self.quote_price = 100
 
     def positions(self):
         if self.fail_positions:
@@ -58,7 +59,8 @@ class ScriptedSDK:
 
     def quote(self, instruments):
         return {
-            name: {"last_price": 100, "timestamp": now_utc()} for name in instruments
+            name: {"last_price": self.quote_price, "timestamp": now_utc()}
+            for name in instruments
         }
 
     def margins(self, *args, **kwargs):
@@ -388,7 +390,14 @@ def test_legacy_persisted_trade_cannot_manage_same_symbol_after_identity_switch(
     restarted = TradingEngine()
     restarted.reconcile_active_trades()
     restarted.monitor_positions()
-    assert restarted.active_trades["RELIANCE"]["ownership_quarantined"] is True
+    restored = restarted.active_trades["RELIANCE"]
+    if change == "product" and not legacy:
+        # Another product is independent exposure. The missing MIS owner
+        # keeps its accounting obligation without gaining authority over CNC.
+        assert not restored.get("ownership_quarantined")
+        assert restored["broker_reconciliation_pending"]
+    else:
+        assert restored["ownership_quarantined"] is True
     assert len(e.sdk.calls) == 1
 
 

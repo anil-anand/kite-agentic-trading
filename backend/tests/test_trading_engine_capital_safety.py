@@ -525,6 +525,19 @@ def test_tighten_to_breakeven_modifies_broker_side_stop(monkeypatch):
     import backend.trading_engine as te
 
     fake_client = FakeKiteClient()
+    fake_client.positions = {
+        "net": [
+            {
+                "tradingsymbol": "RELIANCE",
+                "exchange": "NSE",
+                "product": "MIS",
+                "quantity": 10,
+                "average_price": 100,
+                "last_price": 103,
+                "timestamp": datetime.datetime.now(datetime.timezone.utc),
+            }
+        ]
+    }
     fake_client.orders = [
         {
             "order_id": "STOP1",
@@ -579,6 +592,19 @@ def test_tighten_unknown_keeps_the_last_confirmed_stop(monkeypatch):
     import backend.trading_engine as te
 
     fake_client = FakeKiteClient()
+    fake_client.positions = {
+        "net": [
+            {
+                "tradingsymbol": "RELIANCE",
+                "exchange": "NSE",
+                "product": "MIS",
+                "quantity": 10,
+                "average_price": 100,
+                "last_price": 103,
+                "timestamp": datetime.datetime.now(datetime.timezone.utc),
+            }
+        ]
+    }
     fake_client.orders = [
         {
             "order_id": "STOP1",

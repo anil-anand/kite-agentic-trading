@@ -450,6 +450,10 @@ class TradeAnalytics:
             execution_outcome_code=trade.get("exit_reason"),
             quality=financial_quality,
         )
+        counters = (managed or {}).get("state", {}).get("counters", {})
+        result["coverage"]["entry_excursion_coverage"] = counters.get(
+            "entry_excursion_coverage", "INCOMPLETE"
+        )
         if not verified_outcome(trade):
             result["eligible"] = False
             result["exclusion_reason"] = "UNVERIFIED_FINANCIAL_OUTCOME"
@@ -535,17 +539,18 @@ class TradeAnalytics:
             return []
         entry, quantity = binding["entry_vwap"], binding["filled_quantity"]
         sign = 1 if thesis["direction"] == "BUY" else -1
-        terminal_at = as_utc(binding.get("entry_terminal_at"))
-        if terminal_at is None:
+        first_fill_at = as_utc(
+            binding.get("entry_first_fill_at") or binding.get("entry_terminal_at")
+        )
+        if first_fill_at is None:
             return []
         fills = journal.get_position_fills(
             managed["position_key"],
             broker_order_ids=journal.get_position_order_ids(managed["position_key"]),
         )
         reductions = []
+        entries = []
         for fill in fills:
-            if fill["side"] == thesis["direction"]:
-                continue
             price = fill.get("fill_price")
             try:
                 at = as_utc(fill.get("exchange_time"))
@@ -558,7 +563,8 @@ class TradeAnalytics:
                 or price <= 0
             ):
                 return [{} for _ in decisions]
-            reductions.append((at, fill["quantity"], price))
+            destination = entries if fill["side"] == thesis["direction"] else reductions
+            destination.append((at, fill["quantity"], price))
         path = []
         for row in decisions:
             record = row.get("payload") or {}
@@ -574,7 +580,7 @@ class TradeAnalytics:
                 continue
             if (
                 at is None
-                or at < terminal_at
+                or at < first_fill_at
                 or not isinstance(mark, (int, float))
                 or not math.isfinite(mark)
                 or mark <= 0
@@ -594,6 +600,39 @@ class TradeAnalytics:
                     "realized_gross": sum(
                         sign * size * (price - entry) for _, size, price in filled
                     ),
+                }
+            )
+        # During partial entry, quantity is reconstructed from actual timed
+        # executions. Price-path R still uses the immutable final VWAP/R; cash
+        # excursion uses only capital that was exposed at each observation.
+        observations = (
+            (managed.get("state") or {})
+            .get("counters", {})
+            .get("entry_quote_observations", [])
+        )
+        for observation in observations:
+            at = as_utc(observation.get("observed_at"))
+            mark = observation.get("mark")
+            if at is None or at < first_fill_at or not isinstance(mark, (int, float)):
+                continue
+            entered = [item for item in entries if item[0] <= at]
+            exited = [item for item in reductions if item[0] <= at]
+            entered_quantity = sum(item[1] for item in entered)
+            residual = entered_quantity - sum(item[1] for item in exited)
+            if residual <= 0 or entered_quantity > quantity:
+                continue
+            # Express the entry-cost difference as a cash adjustment so the
+            # common metric can use final VWAP without inventing entry capital.
+            adjustment = sign * sum(
+                size * (entry - price) for _, size, price in entered
+            )
+            realized = sign * sum(size * (price - entry) for _, size, price in exited)
+            path.append(
+                {
+                    "timestamp": at.isoformat(),
+                    "mark_price": mark,
+                    "residual_quantity": residual,
+                    "realized_gross": realized + adjustment,
                 }
             )
         return path

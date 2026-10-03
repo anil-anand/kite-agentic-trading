@@ -306,6 +306,7 @@ def test_missing_open_snapshot_restores_thesis_and_confirmed_execution_obligatio
     lifecycle, monkeypatch, exit_pending
 ):
     e = lifecycle
+    e.sdk.quote_price = 103
     e.sdk.after_entry = lambda: e.sdk.fill_entry()
     assert e.engine.execute_signal(e.signal)
     key = e.engine.active_trades["RELIANCE"]["exit_management_position_key"]

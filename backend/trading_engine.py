@@ -2,10 +2,12 @@ import datetime
 import json
 import math
 import queue
+import sqlite3
 import sys
 import threading
 import time
 import uuid
+from copy import deepcopy
 from dataclasses import replace
 from functools import wraps
 from typing import Mapping, Optional
@@ -16,12 +18,14 @@ from .broker_models import (
     BrokerPositionKey,
     ExecutionNamespace,
     OrderRole,
+    OrderSubmissionRejected,
     fill_to_backend_dict,
     normalize_fills_response,
     normalize_orders_response,
     normalize_positions_response,
     order_to_backend_dict,
     position_to_backend_dict,
+    unavailable_fill_snapshot,
 )
 from .config import config_manager
 from .entry_ordering import ordered_entry_signals, round_entry_price_to_tick
@@ -124,6 +128,7 @@ class TradingEngine:
         # call private helpers (_place_exit_order, _cancel_protective_stop) that
         # also need to hold the lock — reentrant acquisition avoids deadlocks.
         self._trade_lock = threading.RLock()
+        self._checkpoint_write_lock = threading.Lock()
         # Serializes entry admission/submission without blocking the unrelated
         # hard-risk supervisor on a global position-state lock.
         self._entry_submission_lock = threading.RLock()
@@ -167,6 +172,9 @@ class TradingEngine:
         self._entry_control_version = 0
         self._lifecycle_lock = threading.RLock()
         self._management_thread = None
+        self._critical_management_thread = None
+        self._fill_read_lock = threading.Lock()
+        self._fill_read = None
         self._normal_management_thread = None
         self._last_positions: list[dict] = []
         self._position_management_locks: dict[str, threading.RLock] = {}
@@ -282,12 +290,37 @@ class TradingEngine:
         return normalize_orders_response(kite_client.get_orders())
 
     def _fill_snapshot(self):
-        if hasattr(kite_client, "get_fills_snapshot"):
-            try:
-                return kite_client.get_fills_snapshot(critical=True)
-            except TypeError:
-                return kite_client.get_fills_snapshot()
-        return normalize_fills_response(kite_client.get_trades())
+        # History is useful for accounting, but cannot hold a position's
+        # management lock indefinitely. At most one history read is in flight.
+        with self._fill_read_lock:
+            pending = self._fill_read
+            if pending is None:
+                pending = {"done": threading.Event()}
+                self._fill_read = pending
+                client = kite_client
+
+                def fetch():
+                    try:
+                        if hasattr(client, "get_fills_snapshot"):
+                            try:
+                                result = client.get_fills_snapshot(critical=True)
+                            except TypeError:
+                                result = client.get_fills_snapshot()
+                        else:
+                            result = normalize_fills_response(client.get_trades())
+                        pending["result"] = result
+                    except Exception as exc:
+                        pending["result"] = unavailable_fill_snapshot(exc)
+                    finally:
+                        pending["done"].set()
+
+                threading.Thread(target=fetch, daemon=True).start()
+        if not pending["done"].wait(0.1):
+            return unavailable_fill_snapshot("fill history read is pending")
+        with self._fill_read_lock:
+            if self._fill_read is pending:
+                self._fill_read = None
+        return pending["result"]
 
     def _broker_snapshot(self, *, critical: bool = True):
         try:
@@ -333,9 +366,17 @@ class TradingEngine:
                     self._push_log(
                         f"Exit checkpoint failed for {symbol}: {exc}", level="error"
                     )
-            config_manager.save_active_trades(snapshot)
+            self._write_trade_checkpoint()
         except Exception as e:
             self._push_log(f"Failed to persist active trades: {e}", level="warning")
+
+    def _write_trade_checkpoint(self) -> None:
+        # Serialize snapshot creation with the atomic write. A slow older
+        # observation must not overwrite a newly durable emergency outbox.
+        with self._checkpoint_write_lock:
+            with self._trade_lock:
+                snapshot = deepcopy(self.active_trades)
+            config_manager.save_active_trades(snapshot)
 
     def _register_entry_thesis(
         self,
@@ -416,6 +457,36 @@ class TradingEngine:
                 "reason": "ENTRY_THESIS_CAPTURED",
                 "payload": {
                     "order": dict(order_kwargs),
+                    "journal_metadata": {
+                        **{
+                            field: signal.get(field)
+                            for field in (
+                                "reasoning",
+                                "signal_score",
+                                "estimated_probability",
+                                "calibration_sample_size",
+                                "universe_version",
+                                "screener_ranking",
+                            )
+                        },
+                        "signal_id": signal.get("id"),
+                        "confluence_snapshot": {
+                            "entry_thesis_id": thesis.thesis_id,
+                            "selected_evidence": [
+                                item.to_dict() for item in thesis.selected_evidence
+                            ],
+                            "input_reference": thesis.input_reference.to_dict(),
+                        },
+                        "indicator_snapshot": {
+                            "features": signal.get("indicators"),
+                            "raw_signals": signal.get("raw_signals"),
+                            "regime": signal.get("regime"),
+                            "portfolio_state": {
+                                "open_positions": risk_manager.open_positions,
+                                "daily_pnl": risk_manager.daily_pnl,
+                            },
+                        },
+                    },
                     # Phase-2 recovery reconstructs an owner from this
                     # durable payload when a process dies after broker
                     # acknowledgement but before the compatibility JSON
@@ -656,6 +727,7 @@ class TradingEngine:
             filled_quantity=quantity,
             terminal_at=terminal_at,
             source_fill_ids=fill_ids,
+            first_fill_at=entry_time,
         )
         protection = state.protection
         if residual == 0:
@@ -748,6 +820,13 @@ class TradingEngine:
             bound_thesis=bound,
         )
         self._entry_theses[position_key] = bound
+        with self._trade_lock:
+            owner = dict(self.active_trades.get(bound.symbol, {}))
+        # Quotes retained while the final VWAP/R were unknown become usable
+        # after binding. Their original timestamps still exclude pre-fill data.
+        self._record_shadow_quote_observation(
+            position_key, trade=owner, observations=[]
+        )
         return event is not LifecycleEvent.RECONCILIATION_REQUIRED
 
     @_serialized_exit_state
@@ -1371,27 +1450,98 @@ class TradingEngine:
                 )
             }
         )
-        if mode == "legacy_control":
+        if mode == "legacy_control" or thesis is None:
+            return
+        counters = checkpoint.get("counters", {})
+        pending = list(counters.get("entry_quote_observations", []))
+        if thesis.fill_binding is None:
+            if state.exposure.value not in {"ENTRY_PENDING", "RECOVERY_REQUIRED"}:
+                return
+            received = [
+                {**item, "observed_at": as_utc(item["observed_at"]).isoformat()}
+                for item in observations
+                if as_utc(item["observed_at"]) >= as_utc(thesis.created_at)
+            ]
+            if not received:
+                return
+            combined = pending + received
+            limit = 4096
+            coverage = (
+                "INCOMPLETE"
+                if len(combined) > limit
+                or counters.get("entry_excursion_coverage") == "INCOMPLETE"
+                or any(item.get("coverage_incomplete") for item in received)
+                else "OBSERVED_PARTIAL_ENTRY"
+            )
+            event_id = f"entry-quotes:{position_key}:{state.version}"
+            self._commit_phase5_checkpoint(
+                position_key=position_key,
+                state=reduce_lifecycle(
+                    state,
+                    LifecycleEvent.STATE_OBSERVED,
+                    event_id=event_id,
+                    occurred_at=now_utc(),
+                ),
+                event_id=event_id,
+                event_type="ENTRY_QUOTES_OBSERVED",
+                details={"observations": received},
+                counters={
+                    "entry_quote_observations": combined[-limit:],
+                    "entry_excursion_coverage": coverage,
+                },
+            )
             return
         if (
-            state.exposure.value not in {"OPEN", "EXIT_PENDING"}
-            or not state.known_quantity
-            or thesis is None
-            or thesis.fill_binding is None
+            state.exposure.value
+            not in {
+                "OPEN",
+                "EXIT_PENDING",
+                "RECOVERY_REQUIRED",
+                "FLAT_PENDING_RECONCILIATION",
+            }
             or thesis.binding_status.value != "BOUND"
         ):
             return
         binding = thesis.fill_binding
-        terminal_at = as_utc(binding.entry_terminal_at)
-        if terminal_at is None:
+        first_fill_at = as_utc(binding.entry_first_fill_at or binding.entry_terminal_at)
+        if first_fill_at is None:
             return
+        # A quote worker can receive the partial-entry batch after binding.
+        # Keep those original samples for quantity-aware analytics as well.
+        terminal_at = as_utc(binding.entry_terminal_at)
+        late_partial = [
+            {**item, "observed_at": as_utc(item["observed_at"]).isoformat()}
+            for item in observations
+            if first_fill_at <= as_utc(item["observed_at"])
+            and terminal_at is not None
+            and as_utc(item["observed_at"]) < terminal_at
+        ]
+        entry_counters = {}
+        if late_partial:
+            for item in late_partial:
+                if item not in pending:
+                    pending.append(item)
+            entry_counters = {
+                "entry_quote_observations": pending[-4096:],
+                "entry_excursion_coverage": "INCOMPLETE"
+                if len(pending) > 4096
+                or counters.get("entry_excursion_coverage") == "INCOMPLETE"
+                else "OBSERVED_PARTIAL_ENTRY",
+            }
+        if not state.known_quantity:
+            # A queued raw entry batch can still be normalized after an early
+            # flatten, but new flat-position ticks do not establish excursions.
+            observations = []
+        observations = [*pending, *observations]
         memory = self._shadow_management_from_checkpoint(checkpoint)
         changed = {}
         retained = []
         direction = 1 if thesis.direction == "BUY" else -1
-        for observation in sorted(observations, key=lambda item: item["observed_at"]):
-            at = observation["observed_at"]
-            if at < terminal_at:
+        for observation in sorted(
+            observations, key=lambda item: as_utc(item["observed_at"])
+        ):
+            at = as_utc(observation["observed_at"])
+            if at < first_fill_at:
                 continue
             value = direction * (observation["mark"] - binding.entry_vwap)
             value /= binding.initial_r_per_share
@@ -1405,7 +1555,7 @@ class TradingEngine:
                     changed[field] = excursion
                     changed[f"observed_{name}_at"] = at.isoformat()
             retained.append({**observation, "observed_at": at.isoformat()})
-        if not changed:
+        if not changed and not entry_counters:
             return
         memory = replace(memory, **changed, observed_extrema_source="timestamped_mark")
         event_id = f"quote-extrema:{position_key}:{state.version}"
@@ -1421,7 +1571,7 @@ class TradingEngine:
             event_id=event_id,
             event_type="QUOTE_EXTREMA_OBSERVED",
             details={"observations": retained, "instrument_id": thesis.instrument_id},
-            counters={"exit_policy": memory.to_dict()},
+            counters={"exit_policy": memory.to_dict(), **entry_counters},
             extrema={
                 name: getattr(memory, name)
                 for name in ("observed_mfe_r", "observed_mae_r")
@@ -2092,7 +2242,9 @@ class TradingEngine:
             order_ids.update(getter(position_key))
         return order_ids
 
-    def _accounting_fills(self, symbol: str, trade: dict) -> tuple[BrokerFill, ...]:
+    def _accounting_fills(
+        self, symbol: str, trade: dict, *, live: bool = True
+    ) -> tuple[BrokerFill, ...]:
         """Union current and retained executions solely for trade accounting.
 
         Retained facts do not make an unavailable current broker snapshot
@@ -2102,7 +2254,7 @@ class TradingEngine:
 
         live_error = None
         try:
-            live_fills = self._fill_snapshot().require_complete().fills
+            live_fills = self._fill_snapshot().require_complete().fills if live else ()
         except Exception as exc:
             live_fills = ()
             live_error = exc
@@ -2578,6 +2730,9 @@ class TradingEngine:
     def _exit_attempt_can_continue(self, trade: dict) -> bool:
         """Whether a latched reduction can safely resume its same intent."""
 
+        if trade.get("exit_preparation_failed") or trade.get("degraded_exit"):
+            return True
+
         projection = self._lifecycle_projection(trade.get("exit_intent_id"))
         latest = (projection or {}).get("latest_attempt") or {}
         # An intent without an attempt can only be a crash/handoff/residual
@@ -2694,8 +2849,8 @@ class TradingEngine:
             ]
             if len(matches) == 1:
                 open_map[symbol] = matches[0]
-            elif any(
-                p.get("quantity", 0) != 0 and p.get("tradingsymbol") == symbol
+            elif len(matches) > 1 or any(
+                p.get("quantity", 0) != 0 and self._same_position_scope(trade, p)
                 for p in positions
             ):
                 trade["ownership_quarantined"] = True
@@ -3081,6 +3236,37 @@ class TradingEngine:
             str(trade.get(field)) == str(value) for field, value in identity.items()
         )
 
+    @staticmethod
+    def _same_position_scope(trade: dict, position: dict) -> bool:
+        """An unrelated product/account row is not an ownership contradiction."""
+        return all(
+            str(trade.get(field)) == str(position.get(field))
+            for field in (
+                "tradingsymbol",
+                "namespace",
+                "account_id",
+                "exchange",
+                "product",
+            )
+        )
+
+    def _owned_open_positions(self, positions: list[dict]) -> dict[str, dict]:
+        """Project broker rows onto owners, retaining their separate epochs."""
+        with self._trade_lock:
+            owners = list(self.active_trades.items())
+        result = {}
+        for symbol, trade in owners:
+            matches = [
+                p
+                for p in positions
+                if p.get("quantity", 0) and self._trade_matches_position(trade, p)
+            ]
+            if len(matches) == 1:
+                result[symbol] = matches[0]
+            elif len(matches) > 1:
+                self._quarantine_identity_mismatch(symbol, trade)
+        return result
+
     def _resolve_legacy_ownership(self, symbol: str, trade: dict) -> bool:
         """Migrate only through canonical, durable journal entry ownership.
 
@@ -3238,6 +3424,15 @@ class TradingEngine:
             trade["ownership_quarantined"] = True
             return True
         pos = open_map.get(symbol)
+        if trade.get("degraded_exit") or trade.get("exit_preparation_failed"):
+            # Preparation failure and the checkpoint outbox both preempt stop
+            # replacement across restart, even before SQLite has an intent ID.
+            trade["exit_pending"] = True
+            trade["broker_reconciliation_pending"] = True
+            if pos:
+                self._place_exit_order(pos, symbol, trade.get("exit_reason", ""))
+                trade.update(self.active_trades.get(symbol, trade))
+            return True
         if not pos and trade.get("entry_state") == "RECOVERY_REQUIRED":
             self._recover_pending_entry(symbol, {}, trade)
             trade.update(self.active_trades.get(symbol, trade))
@@ -3410,12 +3605,14 @@ class TradingEngine:
                 return True
         if stop_id and str(stop_id) not in open_orders:
             protection_status = self._protection_status(stop_id)
-            if protection_status == "UNKNOWN":
+            if protection_status in {"UNKNOWN", "ABSENT"}:
                 trade["broker_reconciliation_pending"] = True
                 trade["recovery_state"] = "PROTECTION_STATE_UNKNOWN"
                 return True
-            if protection_status == "COMPLETE":
-                residual = self._find_live_position_by_symbol(symbol)
+            if protection_status in self._TERMINAL_ORDER_STATUSES:
+                residual = self._find_reconciled_residual(
+                    symbol, trade, self._find_order(stop_id)
+                )
                 if residual is None:
                     trade["broker_reconciliation_pending"] = True
                     trade["recovery_state"] = "STOP_COMPLETE_RECONCILIATION"
@@ -3701,6 +3898,12 @@ class TradingEngine:
             batch = self._quote_events.setdefault(
                 key, {"trade": trade, "low": observation, "high": observation}
             )
+            if trade.get("entry_state") == "RECOVERY_REQUIRED":
+                raw = batch.setdefault("entry_observations", [])
+                if len(raw) < 4096:
+                    raw.append(observation)
+                else:
+                    batch["coverage_incomplete"] = True
             if mark < batch["low"]["mark"]:
                 batch["low"] = observation
             if mark > batch["high"]["mark"]:
@@ -3730,9 +3933,11 @@ class TradingEngine:
             batches = self._quote_events
             self._quote_events = {}
         for key, batch in batches.items():
-            observations = [batch["low"]]
-            if batch["high"] != batch["low"]:
+            observations = batch.get("entry_observations") or [batch["low"]]
+            if batch["high"] not in observations:
                 observations.append(batch["high"])
+            if batch.get("coverage_incomplete"):
+                observations[0] = {**observations[0], "coverage_incomplete": True}
             try:
                 self._record_shadow_quote_observation(
                     key, trade=batch["trade"], observations=observations
@@ -3868,6 +4073,14 @@ class TradingEngine:
                 if decision.action is HardRiskAction.FLATTEN_ACCOUNT:
                     self._latch_account_flatten(decision.primary_reason_code.value)
                 if (
+                    not self._critical_management_thread
+                    or not self._critical_management_thread.is_alive()
+                ):
+                    self._critical_management_thread = threading.Thread(
+                        target=self._dispatch_hard_reductions, daemon=True
+                    )
+                    self._critical_management_thread.start()
+                if (
                     not self._management_thread
                     or not self._management_thread.is_alive()
                 ):
@@ -3886,6 +4099,62 @@ class TradingEngine:
             interval = min(30.0, max(0.25, interval))
             self._supervisor_wakeup.wait(interval)
             self._supervisor_wakeup.clear()
+
+    def _dispatch_hard_reductions(self) -> None:
+        """Dispatch current hard obligations independently of accounting IO.
+
+        The existing per-position locks and durable attempts serialize this
+        worker with ordinary monitoring. Fill history is never a prerequisite.
+        """
+        with self._trade_lock:
+            if not (
+                self.active_trades
+                or self._hard_flatten_reason
+                or self._operator_close_keys
+            ):
+                return
+        try:
+            positions = self._positions(critical=True)
+            if self._hard_flatten_reason:
+                self._cancel_flatten_entries()
+            session = self._session_clock().snapshot(now_utc())
+            for position in positions:
+                if not position.get("quantity"):
+                    continue
+                symbol = position["tradingsymbol"]
+                with self._trade_lock:
+                    owner = dict(self.active_trades.get(symbol, {}))
+                if owner and not self._trade_matches_position(owner, position):
+                    continue
+                reason = None
+                if self._hard_flatten_reason and self._in_flatten_scope(position):
+                    reason = self._hard_flatten_reason
+                elif position.get("position_key") in self._operator_close_keys:
+                    reason = HardRiskReason.OPERATOR_POSITION_CLOSE.value
+                elif owner.get("exit_pending") and self._is_hard_exit_reason(
+                    owner.get("exit_reason", "")
+                ):
+                    reason = owner["exit_reason"]
+                elif owner:
+                    decision = evaluate_hard_risk(
+                        HardRiskSnapshot(
+                            session=session,
+                            signed_quantity=int(position["quantity"]),
+                            direction=owner["direction"],
+                            mark_price=position.get("last_price"),
+                            mark_time=position.get("mark_time"),
+                            hard_stop_price=owner.get("sl"),
+                            protection_failed=owner.get("recovery_state")
+                            == "EMERGENCY_REDUCTION_REQUIRED",
+                        ),
+                        self._hard_risk_policy(),
+                    )
+                    if decision.action is HardRiskAction.EXIT_POSITION:
+                        reason = decision.primary_reason_code.value
+                if reason:
+                    self._place_exit_order(position, symbol, reason)
+        except Exception as exc:
+            self._push_log(f"Critical reduction requires reconciliation: {exc}")
 
     def _management_cycle(self) -> None:
         try:
@@ -5101,13 +5370,6 @@ class TradingEngine:
             # fetch a later position evaluation and mislabel it as the entry
             # rationale; it remains available separately as a later market
             # observation in future phases.
-            evaluation = {
-                "entry_thesis_id": thesis.thesis_id,
-                "selected_evidence": [
-                    item.to_dict() for item in thesis.selected_evidence
-                ],
-                "input_reference": thesis.input_reference.to_dict(),
-            }
             # Retain the legacy post-fill assessment call for compatibility
             # diagnostics (and broker-event races it currently observes), but
             # never store it as the entry rationale.  Its separate label keeps
@@ -5218,6 +5480,12 @@ class TradingEngine:
 
             journal_entry_recorded = False
             try:
+                metadata = self._entry_journal_metadata(
+                    {"entry_intent_id": entry_result.intent_id}
+                )
+                metadata.setdefault("indicator_snapshot", {})[
+                    "post_fill_observation"
+                ] = post_fill_observation
                 journal.open_trade(
                     trade_id=trade_id,
                     tradingsymbol=symbol,
@@ -5231,24 +5499,7 @@ class TradingEngine:
                     else actual_quantity,
                     stop_loss=signal["stopLoss"],
                     target=signal["target"],
-                    signal_id=signal.get("id"),
-                    reasoning=signal.get("reasoning"),
-                    signal_score=signal.get("signal_score"),
-                    estimated_probability=signal.get("estimated_probability"),
-                    calibration_sample_size=signal.get("calibration_sample_size"),
-                    confluence_snapshot=evaluation,
-                    indicator_snapshot={
-                        "features": signal.get("indicators"),
-                        "raw_signals": signal.get("raw_signals"),
-                        "regime": signal.get("regime"),
-                        "post_fill_observation": post_fill_observation,
-                        "portfolio_state": {
-                            "open_positions": risk_manager.open_positions,
-                            "daily_pnl": risk_manager.daily_pnl,
-                        },
-                    },
-                    universe_version=signal.get("universe_version"),
-                    screener_ranking=signal.get("screener_ranking"),
+                    **metadata,
                     signal_entry_price=signal["entryPrice"],
                     namespace=namespace,
                     account_id=account_id,
@@ -5485,11 +5736,6 @@ class TradingEngine:
                 # must continue after flatten, including on subsequent sessions.
                 self._cancel_flatten_entries()
 
-            # Get symbols of currently open positions to track manual closures
-            open_symbols = {
-                p["tradingsymbol"] for p in positions_net if p["quantity"] != 0
-            }
-
             with self._trade_lock:
                 ownership_records = list(self.active_trades.items())
             for symbol, trade in ownership_records:
@@ -5501,6 +5747,10 @@ class TradingEngine:
                     self._persist_execution_linkage(trade)
                 else:
                     self._record_lifecycle_fills(symbol, trade)
+
+            # Absence is relative to the exact managed product/account/token.
+            # A delivery holding cannot keep an intraday owner's stop alive.
+            open_symbols = set(self._owned_open_positions(positions_net))
 
             # Entry outcome/accounting obligations are independent of whether a
             # position row happens to be non-zero this polling cycle.  In
@@ -5533,14 +5783,13 @@ class TradingEngine:
                     # outcome/fills are still unknown.  Keep ownership for a
                     # later fill instead of ordinary external-close cleanup.
                     continue
-                if cleanup_trade.get("recovery_state") == "STOP_COMPLETE_FLAT_PENDING":
-                    if not self._journal_external_close(symbol):
-                        # A completed stop is a broker event, not proof that the
-                        # fill ledger can yet be allocated to this trade.
-                        continue
-                if self._cancel_protective_stop(
+                if not self._cancel_protective_stop(symbol):
+                    continue
+                if cleanup_trade.get("trade_id") and not self._journal_external_close(
                     symbol
-                ) and self._retire_phase5_position(cleanup_trade):
+                ):
+                    continue
+                if self._retire_phase5_position(cleanup_trade):
                     with self._trade_lock:
                         removed = self.active_trades.pop(symbol, None)
                     if removed:
@@ -5618,6 +5867,9 @@ class TradingEngine:
                 self._push_log(
                     f"Detected external closure for {symbol}. Removing from tracking."
                 )
+                # Retire the reducer before accounting: missing execution
+                # prices must never leave a sell stop against a flat position.
+                stop_cancelled = self._cancel_protective_stop(symbol)
                 journaled = self._journal_external_close(symbol)
                 if not journaled and self.active_trades.get(symbol, {}).get("trade_id"):
                     with self._trade_lock:
@@ -5629,7 +5881,6 @@ class TradingEngine:
                                 "ACCOUNTING_RECONCILIATION_PENDING"
                             )
                     continue
-                stop_cancelled = self._cancel_protective_stop(symbol)
                 with self._trade_lock:
                     current = self.active_trades.get(symbol)
                 retired = bool(
@@ -5694,6 +5945,8 @@ class TradingEngine:
                     sl = trade.get("sl")
                     target = trade.get("target")
 
+                if not self._same_position_scope(trade, p):
+                    continue
                 if not self._trade_matches_position(trade, p):
                     self._quarantine_identity_mismatch(symbol, trade)
                     self._push_log(
@@ -5919,7 +6172,12 @@ class TradingEngine:
         return candidates[0] if candidates else {}
 
     def _find_reconciled_residual(
-        self, symbol: str, trade: dict, observed_order: Optional[dict] = None
+        self,
+        symbol: str,
+        trade: dict,
+        observed_order: Optional[dict] = None,
+        *,
+        critical: bool = False,
     ) -> Optional[dict]:
         """Reject a lagging position response that contradicts known executions.
 
@@ -5931,6 +6189,7 @@ class TradingEngine:
             position_key = self._trade_position_key(symbol, trade)
             owned_ids = self._owned_lifecycle_order_ids(position_key, trade)
             orders = self._orders()
+            orders.extend(trade.get("degraded_handoff_orders", {}).values())
             terminal_fact = getattr(
                 self._order_lifecycle.journal, "get_terminal_order_fact", None
             )
@@ -5949,7 +6208,7 @@ class TradingEngine:
         except Exception:
             return None
         try:
-            fills = self._accounting_fills(symbol, trade)
+            fills = self._accounting_fills(symbol, trade, live=not critical)
         except Exception:
             fills = ()
         direction = trade.get("direction")
@@ -6066,6 +6325,14 @@ class TradingEngine:
             return "ABSENT"
         return str(order.get("status", "UNKNOWN")).upper()
 
+    def _entry_journal_metadata(self, trade: dict) -> dict:
+        """Read the accepted entry projection, including after terminal recovery."""
+        intent_id = trade.get("entry_intent_id")
+        if not intent_id:
+            return {}
+        intent = journal.get_order_intent(intent_id)
+        return (intent or {}).get("payload", {}).get("journal_metadata", {})
+
     def _journal_recovered_entry(
         self,
         symbol: str,
@@ -6085,6 +6352,7 @@ class TradingEngine:
             return trade_id
         try:
             journal.open_trade(
+                **self._entry_journal_metadata(trade),
                 trade_id=trade_id,
                 tradingsymbol=symbol,
                 exchange=fill.key.exchange,
@@ -6277,6 +6545,7 @@ class TradingEngine:
             # The next branch places exactly one replacement only after the old
             # partial stop is terminally observed.
             status = cancelled_status
+            stop_order = cancelled
 
         if status in {
             "REJECTED",
@@ -6286,7 +6555,7 @@ class TradingEngine:
             "ABSENT",
             "COMPLETE",
         }:
-            if status == "COMPLETE":
+            if stop_id:
                 live = self._find_reconciled_residual(symbol, trade, stop_order)
                 if live is None:
                     return False
@@ -6925,6 +7194,8 @@ class TradingEngine:
 
     def _adopt_position(self, p: dict):
         """Reserve one canonical owner before submitting adopted protection."""
+        if p.get("exchange") != "NSE" or p.get("product") != "MIS":
+            return
         symbol = p["tradingsymbol"]
         avg_price = p.get("average_price", 0)
         if not self._is_valid_management_price(avg_price):
@@ -7046,9 +7317,7 @@ class TradingEngine:
         # Get current positions for P&L and LTP data
         try:
             positions = self._positions()
-            position_map = {
-                p["tradingsymbol"]: p for p in positions if p["quantity"] != 0
-            }
+            position_map = self._owned_open_positions(positions)
         except Exception as e:
             for symbol in symbols_to_evaluate:
                 record(
@@ -7196,6 +7465,18 @@ class TradingEngine:
                 "mins_held": mins_held,
             }
 
+            # Every available review consumes its schedule, regardless of the
+            # resulting hold, tightening, or exit. Unavailable data above does
+            # not advance this clock.
+            with self._trade_lock:
+                current["last_reeval_time"] = now
+                trade_id = current.get("trade_id")
+            if trade_id:
+                try:
+                    journal.log_event(trade_id, "thesis_reevaluation", control_details)
+                except Exception:
+                    pass
+
             # Rule 1: Strong opposing signal — thesis fully invalidated
             if opposing >= 2 and supporting == 0:
                 reason = f"Thesis invalidated for {symbol}: {opposing} opposing signals, 0 supporting. Exiting."
@@ -7268,27 +7549,6 @@ class TradingEngine:
                 control_context,
                 **control_details,
             )
-
-            with self._trade_lock:
-                trade = self.active_trades.get(symbol)
-                if trade:
-                    trade["last_reeval_time"] = now
-                trade_id = trade.get("trade_id") if trade else None
-
-            if trade_id:
-                try:
-                    journal.log_event(
-                        trade_id,
-                        "thesis_reevaluation",
-                        {
-                            "supporting": supporting,
-                            "opposing": opposing,
-                            "ltp": ltp,
-                            "mins_held": mins_held,
-                        },
-                    )
-                except Exception:
-                    pass
 
         self._persist_trades()
 
@@ -7392,6 +7652,16 @@ class TradingEngine:
             return False
         tick_size = self._get_tick_size(symbol, exchange)
         trigger_price = self._round_to_tick(entry_price, tick_size)
+        position = self._find_live_position_by_symbol(symbol, trade)
+        if (
+            not position
+            or not self._has_fresh_position_mark(position)
+            or (position["quantity"] > 0) != (direction == "BUY")
+        ):
+            return False
+        mark = position["last_price"]
+        if trigger_price >= mark if direction == "BUY" else trigger_price <= mark:
+            return False
         stop_tx = "SELL" if direction == "BUY" else "BUY"
         buffer_pct = 0.01
 
@@ -7425,6 +7695,19 @@ class TradingEngine:
             if order.get("order_type") == "SL":
                 modification["price"] = limit_price
             execution_gateway.modify_order(**modification)
+        except OrderSubmissionRejected as exc:
+            # A definite rejection has no pending broker mutation. Retire the
+            # requested trigger durably before allowing another modification.
+            if intent_id:
+                self._order_lifecycle.journal.update_protection_trigger(
+                    intent_id, trigger_price, rejected=True
+                )
+            with self._trade_lock:
+                trade.pop("requested_stop_trigger", None)
+                trade["recovery_state"] = "TIGHTEN_MODIFICATION_REJECTED"
+            self._push_log(f"Breakeven modification rejected for {symbol}: {exc}")
+            self._persist_trades()
+            return False
         except Exception as e:
             # A mutation timeout can have reached the broker, but it cannot
             # justify claiming the tighter local stop is effective.  Preserve
@@ -7516,7 +7799,10 @@ class TradingEngine:
         """Cancel working entry capacity even when the position is still zero."""
         orders = self._orders()
         open_keys = {p["position_key"] for p in self._positions() if p.get("quantity")}
-        self._reconcile_durable_attempts(orders)
+        try:
+            self._reconcile_durable_attempts(orders)
+        except (sqlite3.Error, OSError) as exc:
+            self._push_log(f"Order observations await storage recovery: {exc}")
         with self._trade_lock:
             reducers = {
                 str(trade[field])
@@ -8320,6 +8606,8 @@ class TradingEngine:
                             f"Hard-risk exit for {symbol} durably latched while position management is busy.",
                             level="warning",
                         )
+            except (sqlite3.Error, OSError) as exc:
+                self._mark_exit_storage_failure(symbol, exc)
             finally:
                 self._supervisor_wakeup.set()
             return
@@ -8394,8 +8682,6 @@ class TradingEngine:
                     level="warning",
                 )
                 return
-            if existing.get("exit_pending") and not existing.get("exit_intent_id"):
-                return
             tracked = self.active_trades.get(symbol)
             if tracked:
                 # Latch before the cancellation handoff.  A subsequent healthy
@@ -8429,12 +8715,192 @@ class TradingEngine:
                 )
             tracked = self.active_trades[symbol]
             tracked["exit_intent_id"] = intent["intent_id"]
+            tracked.pop("exit_preparation_failed", None)
             if intent["intent_type"] == IntentType.FLATTEN.value:
                 tracked["exit_reason"] = intent["reason"]
                 tracked["exit_market_required"] = True
             return dict(tracked), intent
 
     def _place_exit_order_owned(self, position: dict, symbol: str, reason: str):
+        try:
+            if not self._import_degraded_exit(symbol):
+                return
+            return self._place_exit_order_durable(position, symbol, reason)
+        except (sqlite3.Error, OSError) as exc:
+            self._mark_exit_storage_failure(symbol, exc)
+            with self._trade_lock:
+                trade = dict(self.active_trades.get(symbol, {}))
+            if self._is_hard_exit_reason(trade.get("exit_reason", reason)):
+                try:
+                    self._place_degraded_exit(symbol, trade)
+                except Exception as fallback_error:
+                    self._push_log(
+                        f"Hard reduction for {symbol} awaits durable preparation: {fallback_error}",
+                        level="error",
+                    )
+
+    def _mark_exit_storage_failure(self, symbol: str, exc: Exception) -> None:
+        with self._trade_lock:
+            trade = self.active_trades.get(symbol)
+            if trade:
+                trade["exit_preparation_failed"] = True
+                trade["exit_pending"] = True
+                trade["broker_reconciliation_pending"] = True
+                trade["recovery_state"] = "EXIT_PREPARATION_FAILED"
+        self._reconciliation_pending = True
+        self._persist_trades()
+        self._push_log(
+            f"Exit preparation requires storage recovery for {symbol}: {exc}"
+        )
+
+    def _import_degraded_exit(self, symbol: str) -> bool:
+        """Transfer the checkpoint outbox to SQLite without resubmitting it."""
+        with self._trade_lock:
+            trade = self.active_trades.get(symbol, {})
+            outbox = trade.get("degraded_exit")
+        if not outbox:
+            return True
+        intent = journal.create_order_intent(**outbox["intent"])
+        attempt = journal.prepare_order_attempt(
+            intent_id=intent["intent_id"],
+            attempt_id=outbox["attempt_id"],
+            attempt_tag=outbox["attempt_tag"],
+            payload=outbox["order"],
+        )
+        if attempt["attempt_id"] != outbox["attempt_id"]:
+            raise ValueError("another attempt conflicts with the degraded reduction")
+        if outbox.get("broker_order_id"):
+            journal.record_order_attempt_state(
+                attempt["attempt_id"],
+                "ACKNOWLEDGED",
+                broker_order_id=outbox["broker_order_id"],
+            )
+        elif outbox.get("state") == "REJECTED":
+            journal.record_order_attempt_state(attempt["attempt_id"], "REJECTED")
+        # SUBMITTING/UNKNOWN stays unresolved until the broker tag is observed.
+        with self._trade_lock:
+            trade["exit_intent_id"] = intent["intent_id"]
+            trade["exit_attempt_id"] = attempt["attempt_id"]
+            trade["exit_attempt_tag"] = attempt["attempt_tag"]
+            if outbox.get("broker_order_id"):
+                trade["exit_order_id"] = outbox["broker_order_id"]
+            trade.pop("degraded_exit", None)
+        self._reconcile_durable_attempts(self._orders())
+        self._persist_trades()
+        return True
+
+    def _place_degraded_exit(self, symbol: str, trade: dict) -> None:
+        """Use the atomic JSON checkpoint as an outbox during SQLite failure.
+
+        Only a hard reduction may use this path. It still requires readable
+        lifecycle ownership, terminal cancellation, a consistent residual, and
+        a durable attempt tag BEFORE dispatch. If both stores fail, retain the
+        obligation and retry preparation; never send an unrecorded mutation.
+        """
+        if trade.get("degraded_exit"):
+            return
+        key = self._trade_position_key(symbol, trade)
+        for intent in journal.get_position_order_intents(key):
+            projection = journal.get_order_intent_projection(intent["intent_id"])
+            latest = (projection or {}).get("latest_attempt") or {}
+            if not latest or latest.get("state") in {"FILLED", "CANCELLED", "REJECTED"}:
+                continue
+            if intent["intent_type"] in {"EXIT", "FLATTEN"}:
+                # This includes a broker acceptance whose acknowledgement
+                # could not be written. Its existing tag owns reconciliation.
+                return
+            if not latest.get("broker_order_id"):
+                return
+        orders = self._orders()
+        owned_ids = self._owned_lifecycle_order_ids(key, trade)
+        for order in orders:
+            if not self._trade_matches_position(trade, order):
+                continue
+            if str(order.get("status", "")).upper() in self._TERMINAL_ORDER_STATUSES:
+                continue
+            order_id = str(order["order_id"])
+            if order_id not in owned_ids:
+                # Preserve the same external-order baseline as normal handoff.
+                trade.setdefault("external_handoff_baselines", {}).setdefault(
+                    order_id,
+                    int(order.get("filled_quantity", 0))
+                    if not trade.get("entry_order_id")
+                    else 0,
+                )
+                trade.setdefault("external_handoff_orders", {})[order_id] = order
+            with self._trade_lock:
+                self.active_trades[symbol].update(trade)
+            self._write_trade_checkpoint()
+            terminal = self._cancel_order_terminal(order_id)
+            if not terminal:
+                return
+            trade.setdefault("degraded_handoff_orders", {})[order_id] = terminal
+            if order_id not in owned_ids:
+                trade["external_handoff_orders"][order_id] = terminal
+        with self._trade_lock:
+            self.active_trades[symbol].update(trade)
+        self._write_trade_checkpoint()
+        residual = self._find_reconciled_residual(symbol, trade, critical=True)
+        if residual is None or not residual:
+            return
+        side = "SELL" if residual["quantity"] > 0 else "BUY"
+        quantity = abs(int(residual["quantity"]))
+        intent = journal.find_active_order_intent(key, {"EXIT", "FLATTEN"})
+        intent_id = (intent or {}).get("intent_id") or str(uuid.uuid4())
+        order = {
+            "variety": "regular",
+            "exchange": residual["exchange"],
+            "tradingsymbol": symbol,
+            "transaction_type": side,
+            "quantity": quantity,
+            "product": residual["product"],
+            "order_type": "MARKET",
+        }
+        outbox = {
+            "intent": {
+                "intent_id": intent_id,
+                "position_key": key,
+                "trade_id": trade.get("trade_id"),
+                "intent_type": (intent or {}).get("intent_type", "FLATTEN"),
+                "role": "REDUCTION",
+                "side": side,
+                "quantity": (intent or {}).get("quantity", quantity),
+                "reason": trade["exit_reason"],
+                "payload": {"recovery_trade": trade, "reason": trade["exit_reason"]},
+                "latched": True,
+            },
+            "attempt_id": str(uuid.uuid4()),
+            "attempt_tag": self._order_lifecycle._new_attempt_tag(),
+            "state": "SUBMITTING",
+            "order": order,
+        }
+        with self._trade_lock:
+            current = self.active_trades[symbol]
+            current["degraded_exit"] = outbox
+        try:
+            self._write_trade_checkpoint()
+        except Exception:
+            # No broker request happened. Allow preparation to retry locally.
+            with self._trade_lock:
+                current.pop("degraded_exit", None)
+            raise
+        try:
+            order_id = execution_gateway.place_order(
+                **order,
+                order_role=OrderRole.REDUCTION,
+                critical=True,
+                attempt_tag=outbox["attempt_tag"],
+            )
+            outbox.update(state="ACKNOWLEDGED", broker_order_id=str(order_id))
+            with self._trade_lock:
+                current["exit_order_id"] = str(order_id)
+        except OrderSubmissionRejected:
+            outbox["state"] = "REJECTED"
+        except Exception:
+            outbox["state"] = "UNKNOWN"
+        self._persist_trades()
+
+    def _place_exit_order_durable(self, position: dict, symbol: str, reason: str):
         prepared = self._prepare_exit_intent(position, symbol, reason)
         if prepared is None:
             return
@@ -8640,7 +9106,7 @@ class TradingEngine:
             ),
             read_order=self._find_order,
             read_residual=lambda observed_stop: self._find_reconciled_residual(
-                symbol, existing or None, observed_stop
+                symbol, existing or None, observed_stop, critical=hard
             ),
             submit_order=submit_reduction,
             trade_id=existing.get("trade_id"),
@@ -8726,6 +9192,11 @@ class TradingEngine:
             lock.release()
 
     def _sync_exit_pending_status_owned(self, symbol: str, orders: list = None):
+        try:
+            self._import_degraded_exit(symbol)
+        except (sqlite3.Error, OSError) as exc:
+            self._mark_exit_storage_failure(symbol, exc)
+            return
         with self._trade_lock:
             trade = self.active_trades.get(symbol)
             if not trade:
@@ -8752,7 +9223,13 @@ class TradingEngine:
                     current["broker_reconciliation_pending"] = True
                     current["recovery_state"] = "EXIT_INTENT_RECONCILIATION"
                 else:
-                    current["exit_pending"] = False
+                    # A failed preparation is an obligation, not a submitted
+                    # order. Preserve it through a price rebound and retry.
+                    if current.get("exit_reason") or current.get("degraded_exit"):
+                        current["exit_pending"] = True
+                        current["exit_preparation_failed"] = True
+                    else:
+                        current["exit_pending"] = False
                     return
         if orders is None:
             orders = self._orders()
@@ -9337,11 +9814,7 @@ class TradingEngine:
     def _reconcile_journal_trades(self):
         """Periodically check journal OPEN or UNRECONCILED trades and fix them using broker executions."""
         try:
-            open_positions = {
-                p["tradingsymbol"]: p
-                for p in self._positions()
-                if p.get("quantity", 0) != 0
-            }
+            open_positions = [p for p in self._positions() if p.get("quantity", 0)]
         except Exception as e:
             self._push_log(
                 f"Reconcile job: failed to fetch positions: {e}", level="warning"
@@ -9354,7 +9827,9 @@ class TradingEngine:
             return
 
         for t in journal_trades:
-            if t["status"] == "OPEN" and t["tradingsymbol"] not in open_positions:
+            if t["status"] == "OPEN" and not any(
+                self._trade_matches_position(t, p) for p in open_positions
+            ):
                 # Ghost open position in journal
                 self._push_log(
                     f"Reconcile job: Found ghost OPEN trade for {t['tradingsymbol']}. Attempting to reconcile."
