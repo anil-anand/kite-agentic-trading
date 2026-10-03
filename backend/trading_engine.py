@@ -2385,6 +2385,8 @@ class TradingEngine:
                     trade[order_field] = str(order_id)
                 if prefix == "exit":
                     recovery = (intent.get("payload") or {}).get("recovery_trade") or {}
+                    if intent.get("intent_type") == IntentType.FLATTEN.value:
+                        trade["exit_market_required"] = True
                     for field in (
                         "external_handoff_baselines",
                         "external_handoff_orders",
@@ -7944,19 +7946,41 @@ class TradingEngine:
     def _place_exit_order(self, position: dict, symbol: str, reason: str = ""):
         lock = self._management_lock(symbol)
         if not lock.acquire(blocking=False):
-            self._supervisor_wakeup.set()
+            try:
+                if (
+                    self._is_hard_exit_reason(reason)
+                    or (self._hard_flatten_reason and self._in_flatten_scope(position))
+                    or position.get("position_key") in self._operator_close_keys
+                ):
+                    prepared = self._prepare_exit_intent(position, symbol, reason)
+                    if prepared:
+                        self._push_log(
+                            f"Hard-risk exit for {symbol} durably latched while position management is busy.",
+                            level="warning",
+                        )
+            finally:
+                self._supervisor_wakeup.set()
             return
         try:
             return self._place_exit_order_owned(position, symbol, reason)
         finally:
             lock.release()
 
-    def _place_exit_order_owned(self, position: dict, symbol: str, reason: str):
-        if self._hard_flatten_reason and self._in_flatten_scope(position):
-            reason = self._hard_flatten_reason
-        elif position.get("position_key") in self._operator_close_keys:
-            reason = HardRiskReason.OPERATOR_POSITION_CLOSE.value
+    def _prepare_exit_intent(
+        self, position: dict, symbol: str, reason: str
+    ) -> Optional[tuple[dict, dict]]:
+        """Latch a reduction without waiting for position-management broker I/O.
+
+        The short trade lock makes the durable intent and its local linkage one
+        transition. Reduction preparation uses SQLite uniqueness, never the
+        coordinator's broker-operation lock. No broker call belongs here.
+        """
+
         with self._trade_lock:
+            if self._hard_flatten_reason and self._in_flatten_scope(position):
+                reason = self._hard_flatten_reason
+            elif position.get("position_key") in self._operator_close_keys:
+                reason = HardRiskReason.OPERATOR_POSITION_CLOSE.value
             existing = dict(self.active_trades.get(symbol, {}))
             if (
                 existing.get("exit_pending")
@@ -8018,33 +8042,44 @@ class TradingEngine:
                 tracked["exit_pending"] = True
                 tracked["exit_reason"] = reason
 
-        try:
-            position_key = self._trade_position_key(symbol, existing, position)
-        except ValueError as exc:
-            self._quarantine_identity_mismatch(symbol, existing)
-            self._push_log(f"Refusing exit for {symbol}: {exc}", level="warning")
-            return
+            try:
+                position_key = self._trade_position_key(symbol, existing, position)
+            except ValueError as exc:
+                self._quarantine_identity_mismatch(symbol, existing)
+                self._push_log(f"Refusing exit for {symbol}: {exc}", level="warning")
+                return
 
-        hard = self._is_hard_exit_reason(reason)
-        intent = self._order_lifecycle.prepare_intent(
-            position_key=position_key,
-            intent_type=IntentType.FLATTEN if hard else IntentType.EXIT,
-            role=OrderRole.REDUCTION,
-            side="SELL" if position["quantity"] > 0 else "BUY",
-            quantity=abs(int(position["quantity"])),
-            payload={"recovery_trade": existing, "reason": reason},
-            trade_id=existing.get("trade_id"),
-            reason=reason,
-            latched=True,
-            existing_intent_id=existing.get("exit_intent_id"),
-        )
-        if hard:
-            intent = self._order_lifecycle.journal.escalate_order_intent(
-                intent["intent_id"], reason
+            hard = self._is_hard_exit_reason(reason)
+            intent = self._order_lifecycle.latch_reduction_intent(
+                position_key=position_key,
+                intent_type=IntentType.FLATTEN if hard else IntentType.EXIT,
+                role=OrderRole.REDUCTION,
+                side="SELL" if position["quantity"] > 0 else "BUY",
+                quantity=abs(int(position["quantity"])),
+                payload={"recovery_trade": existing, "reason": reason},
+                trade_id=existing.get("trade_id"),
+                reason=reason,
+                existing_intent_id=existing.get("exit_intent_id"),
             )
-        existing["exit_intent_id"] = intent["intent_id"]
-        with self._trade_lock:
-            self.active_trades[symbol]["exit_intent_id"] = intent["intent_id"]
+            if hard:
+                intent = self._order_lifecycle.journal.escalate_order_intent(
+                    intent["intent_id"], reason
+                )
+            tracked = self.active_trades[symbol]
+            tracked["exit_intent_id"] = intent["intent_id"]
+            if intent["intent_type"] == IntentType.FLATTEN.value:
+                tracked["exit_reason"] = intent["reason"]
+                tracked["exit_market_required"] = True
+            return dict(tracked), intent
+
+    def _place_exit_order_owned(self, position: dict, symbol: str, reason: str):
+        prepared = self._prepare_exit_intent(position, symbol, reason)
+        if prepared is None:
+            return
+        existing, intent = prepared
+        position_key = intent["position_key"]
+        reason = existing["exit_reason"]
+        hard = self._is_hard_exit_reason(reason)
         phase5_key = existing.get("exit_management_position_key")
         if phase5_key == position_key:
             try:
@@ -8192,6 +8227,14 @@ class TradingEngine:
                 self._order_lifecycle.observe_order(intent["intent_id"], terminal_exit)
 
         def submit_reduction(attempt_tag: str, fresh: dict) -> str:
+            # A hard trigger can arrive while this owner's normal handoff is
+            # waiting on cancellation. Honor that escalation before dispatch.
+            with self._trade_lock:
+                current = self.active_trades.get(symbol, {})
+                urgent = hard or self._is_hard_exit_reason(
+                    current.get("exit_reason", "")
+                )
+                market_required = current.get("exit_market_required")
             ltp = fresh.get("last_price")
             tx_type = fresh["transaction_type"]
             order_kwargs = {
@@ -8202,11 +8245,9 @@ class TradingEngine:
                 "quantity": fresh["quantity"],
                 "product": fresh.get("product", position["product"]),
                 "order_role": OrderRole.REDUCTION,
-                "critical": hard,
+                "critical": urgent,
             }
-            if self._is_valid_management_price(ltp) and not (
-                hard or existing.get("exit_market_required")
-            ):
+            if self._is_valid_management_price(ltp) and not (urgent or market_required):
                 order_kwargs["order_type"] = "LIMIT"
                 order_kwargs["price"] = self._get_exit_limit_price(
                     symbol, order_kwargs["exchange"], ltp, tx_type
@@ -8278,6 +8319,8 @@ class TradingEngine:
                 current["exit_attempt_id"] = result.attempt_id
             if result.attempt_tag:
                 current["exit_attempt_tag"] = result.attempt_tag
+            if self._is_hard_exit_reason(current.get("exit_reason", "")):
+                reason = current["exit_reason"]
             current["exit_reason"] = reason
             if result.broker_order_id:
                 current["exit_order_id"] = result.broker_order_id
@@ -8346,61 +8389,73 @@ class TradingEngine:
                     current["exit_pending"] = True
                     current["broker_reconciliation_pending"] = True
                     current["recovery_state"] = "EXIT_INTENT_RECONCILIATION"
-                    return
                 else:
                     current["exit_pending"] = False
                     return
         if orders is None:
             orders = self._orders()
+        # Flatness can settle a handoff with no submitted attempt, or an exit
+        # omitted from today's order book whose terminal fact was retained.
+        # Unknown/working attempts still block cleanup in the order check.
+        live_before_cleanup = self._find_live_position_by_symbol(symbol, trade)
+        if live_before_cleanup is not None and not live_before_cleanup:
+            # External/stop fills may flatten before our working exit does.
+            # Cancel that still-live exit before it can open the other side.
+            phase5_key = trade.get("exit_management_position_key")
+            if phase5_key:
+                try:
+                    self._record_phase5_flat_observed(
+                        phase5_key,
+                        event_id=f"flat-observed:{intent_id or order_id}",
+                    )
+                except Exception as exc:
+                    self._push_log(
+                        f"Flat-state persistence failed for {symbol}: {exc}",
+                        level="error",
+                    )
+            if not self._flat_trade_orders_terminal(symbol, trade):
+                return
+            if any(
+                self._trade_matches_position(trade, order)
+                and str(order.get("status", "")).upper()
+                not in self._TERMINAL_ORDER_STATUSES
+                for order in self._orders()
+            ):
+                # An unowned working order can reopen this broker position.
+                return
+            if trade.get("entry_state") == "RECOVERY_REQUIRED":
+                self._recover_pending_entry(symbol, {}, dict(trade))
+                return
+            if trade.get("trade_id") and not self._journal_external_close(symbol):
+                trade["broker_reconciliation_pending"] = True
+                trade["recovery_state"] = "ACCOUNTING_RECONCILIATION_PENDING"
+                return
+            if not self._retire_phase5_position(trade):
+                return
+            self._complete_lifecycle_intent(intent_id, "FLAT_ORDER_CLEAN")
+            closed_phase5_key = None
+            with self._trade_lock:
+                if self.active_trades.get(symbol) is trade:
+                    closed_phase5_key = trade.get("exit_management_position_key")
+                    self.active_trades.pop(symbol, None)
+            if closed_phase5_key:
+                try:
+                    self._record_phase5_closed(
+                        closed_phase5_key,
+                        event_id=f"flat-confirmed:{intent_id or order_id}",
+                    )
+                except Exception as exc:
+                    self._push_log(
+                        f"Closure-state persistence failed for {symbol}: {exc}",
+                        level="error",
+                    )
+            return
+        if not order_id:
+            return
         for order in orders:
             if str(order.get("order_id")) != str(order_id):
                 continue
             status = str(order.get("status", "")).upper()
-            live_before_cleanup = self._find_live_position_by_symbol(symbol, trade)
-            if live_before_cleanup is not None and not live_before_cleanup:
-                # External/stop fills may flatten before our working exit does.
-                # Cancel that still-live exit before it can open the other side.
-                phase5_key = trade.get("exit_management_position_key")
-                if phase5_key:
-                    try:
-                        self._record_phase5_flat_observed(
-                            phase5_key,
-                            event_id=f"flat-observed:{order_id}",
-                        )
-                    except Exception as exc:
-                        self._push_log(
-                            f"Flat-state persistence failed for {symbol}: {exc}",
-                            level="error",
-                        )
-                if not self._flat_trade_orders_terminal(symbol, trade):
-                    return
-                if trade.get("entry_state") == "RECOVERY_REQUIRED":
-                    self._recover_pending_entry(symbol, {}, dict(trade))
-                    return
-                if trade.get("trade_id") and not self._journal_external_close(symbol):
-                    trade["broker_reconciliation_pending"] = True
-                    trade["recovery_state"] = "ACCOUNTING_RECONCILIATION_PENDING"
-                    return
-                if not self._retire_phase5_position(trade):
-                    return
-                self._complete_lifecycle_intent(intent_id, "FLAT_ORDER_CLEAN")
-                closed_phase5_key = None
-                with self._trade_lock:
-                    if self.active_trades.get(symbol) is trade:
-                        closed_phase5_key = trade.get("exit_management_position_key")
-                        self.active_trades.pop(symbol, None)
-                if closed_phase5_key:
-                    try:
-                        self._record_phase5_closed(
-                            closed_phase5_key,
-                            event_id=f"flat-confirmed:{order_id}",
-                        )
-                    except Exception as exc:
-                        self._push_log(
-                            f"Closure-state persistence failed for {symbol}: {exc}",
-                            level="error",
-                        )
-                return
             if status not in self._TERMINAL_ORDER_STATUSES and intent_id:
                 projection = self._lifecycle_projection(intent_id)
                 latest = (projection or {}).get("latest_attempt") or {}

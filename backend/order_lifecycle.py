@@ -181,6 +181,18 @@ class OrderLifecycleCoordinator:
         with self._position_lock(kwargs["position_key"]):
             return self._ensure_intent(**kwargs)
 
+    def latch_reduction_intent(self, **kwargs) -> dict[str, Any]:
+        """Record reduction urgency independently of in-flight broker operations.
+
+        SQLite's unique active-reduction index serializes this write, even
+        while a stop modification owns the position lock. Preparing attempts
+        and handing off protection still use the ordinary serialized path.
+        """
+
+        if kwargs["intent_type"] not in {IntentType.EXIT, IntentType.FLATTEN}:
+            raise ValueError("only reduction intents can bypass the position lock")
+        return self._ensure_intent(**kwargs, latched=True)
+
     def submit(
         self,
         *,
