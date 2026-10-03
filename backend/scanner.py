@@ -79,7 +79,9 @@ class Scanner:
         self.candle_cache = {}
         self.last_cache_time = {}
         self.last_scanned_candle = {}
+        self.last_analysis_candle = {}
         self._market_context_service = MarketContextService()
+        self._analysis_context_service = MarketContextService()
         self._market_context_policy = self._market_context_service.policy
         self._market_session_policy = SessionPolicy()
         self._market_context_lock = threading.Lock()
@@ -212,6 +214,7 @@ class Scanner:
         decision_at=None,
         *,
         context_settings: Mapping[str, Any] | None = None,
+        analysis_only: bool = False,
     ) -> MarketContext:
         """Build causal context from the pinned or current feature configuration.
 
@@ -228,7 +231,13 @@ class Scanner:
         # Operator trading hours constrain admission/supervision, not the
         # exchange's candle grid or full-session VWAP history.
         with self._market_context_lock:
-            if context_settings is not None:
+            if analysis_only:
+                if policy != self._analysis_context_service.policy:
+                    self._analysis_context_service = MarketContextService(
+                        policy, self._market_session_policy
+                    )
+                service = self._analysis_context_service
+            elif context_settings is not None:
                 # Pinned open positions keep their own regime progression when
                 # a Settings save changes the entry scanner's feature policy.
                 service = self._pinned_context_services.get(policy)
@@ -254,6 +263,7 @@ class Scanner:
             source_as_of=df.attrs.get(
                 "source_as_of", df.attrs.get("received_at", event_time)
             ),
+            analysis_only=analysis_only,
         )
 
     def get_market_context(
@@ -281,7 +291,7 @@ class Scanner:
         )
 
     def scan_watchlist(
-        self, symbols: List[str], on_signal=None
+        self, symbols: List[str], on_signal=None, *, analysis_only: bool = False
     ) -> List[Dict[str, Any]]:
         import concurrent.futures
 
@@ -306,23 +316,30 @@ class Scanner:
             if df.empty:
                 return []
 
-            context = self._market_context(token, df)
+            context = self._market_context(token, df, analysis_only=analysis_only)
             if (
-                not context.normal_decision_eligible
+                not (
+                    context.normal_decision_eligible
+                    or context.analysis_decision_eligible
+                )
                 or "VOLUME_UNAVAILABLE" in context.primary_quality.issues
                 or context.primary_frame().empty
             ):
                 return []
 
-            evaluate_on_incomplete = strategy_config.get(
-                "evaluateOnIncompleteCandle", False
+            evaluate_on_incomplete = (
+                strategy_config.get("evaluateOnIncompleteCandle", False)
+                and not analysis_only
+            )
+            scanned_candles = (
+                self.last_analysis_candle if analysis_only else self.last_scanned_candle
             )
 
             if not evaluate_on_incomplete and context.primary_bar:
                 # Corrections change provenance, not the decision event. Never
                 # trade an already-consumed candle again on a later revision.
                 latest_candle_id = context.primary_bar.end
-                last_scanned = self.last_scanned_candle.get(symbol)
+                last_scanned = scanned_candles.get(symbol)
                 if last_scanned is not None and latest_candle_id <= last_scanned:
                     return []
 
@@ -345,7 +362,7 @@ class Scanner:
                 signal["id"] = str(uuid.uuid4())
 
             if not evaluate_on_incomplete and context.primary_bar:
-                self.last_scanned_candle[symbol] = context.primary_bar.end
+                scanned_candles[symbol] = context.primary_bar.end
             return symbol_aggregated_signals
 
         def process_symbol(symbol: str) -> List[Dict[str, Any]]:

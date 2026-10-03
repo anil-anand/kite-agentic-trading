@@ -647,7 +647,8 @@ def test_start_reconcile_failure_pauses_entries_but_keeps_supervision(monkeypatc
 
     engine.start("confirm")
     try:
-        assert engine.running is False
+        assert engine.running is True
+        assert engine.status()["scanOnly"] is True
         assert engine.status()["entryPaused"] is True
         assert engine.status()["supervisionActive"] is True
     finally:

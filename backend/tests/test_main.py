@@ -302,6 +302,131 @@ def test_saturated_research_pool_rejects_without_queuing_operator_control(monkey
     main_module.main()
 
 
+def test_start_agent_is_admitted_while_all_broker_workers_are_busy(monkeypatch):
+    started = [threading.Event() for _ in range(main_module._BROKER_WORKERS)]
+    done = [threading.Event() for _ in started]
+    release = threading.Event()
+    start_done = threading.Event()
+    responses = {}
+
+    def handle(req):
+        if req["method"] == "get_positions":
+            started[req["id"]].set()
+            assert release.wait(3)
+        return {"id": req["id"], "result": {"accepted": True}}
+
+    def write(response):
+        responses[response["id"]] = response
+        if response["id"] == 100:
+            start_done.set()
+        elif response["id"] < len(done):
+            done[response["id"]].set()
+
+    def requests():
+        try:
+            for i in range(len(started)):
+                yield json.dumps({"id": i, "method": "get_positions"})
+                assert started[i].wait(1)
+            yield json.dumps({"id": 100, "method": "start_agent"})
+            assert start_done.wait(1)
+            assert responses[100]["result"]["accepted"]
+            assert not any(event.is_set() for event in done)
+        finally:
+            release.set()
+        assert all(event.wait(1) for event in done)
+
+    monkeypatch.setattr(main_module, "_handle_request", handle)
+    monkeypatch.setattr(main_module, "_write_response", write)
+    monkeypatch.setattr(main_module.sys, "stdin", requests())
+    main_module.main()
+
+
+def test_lifecycle_queue_is_bounded_and_stop_bypasses_it(monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+    responses = {}
+    count = main_module._LIFECYCLE_WORKERS + main_module._LIFECYCLE_QUEUE_SIZE
+    done = [threading.Event() for _ in range(count)]
+
+    def handle(req):
+        if req["method"] == "check_session":
+            entered.set()
+            assert release.wait(3)
+        return {"id": req["id"], "result": {"accepted": True}}
+
+    def write(response):
+        responses[response["id"]] = response
+        if response["id"] < count:
+            done[response["id"]].set()
+
+    def requests():
+        try:
+            yield json.dumps({"id": 0, "method": "check_session"})
+            assert entered.wait(1)
+            for i in range(1, count):
+                yield json.dumps({"id": i, "method": "start_agent"})
+            yield json.dumps({"id": count, "method": "start_agent"})
+            assert responses[count]["error"]["code"] == -32005
+            yield json.dumps({"id": count + 1, "method": "stop_agent"})
+            assert responses[count + 1]["result"]["accepted"]
+            assert len(responses) == 2
+        finally:
+            release.set()
+        assert all(event.wait(1) for event in done)
+
+    monkeypatch.setattr(main_module, "_handle_request", handle)
+    monkeypatch.setattr(main_module, "_write_response", write)
+    monkeypatch.setattr(main_module.sys, "stdin", requests())
+    main_module.main()
+
+
+def test_queued_start_keeps_admission_version_when_stop_arrives_later(monkeypatch):
+    from backend.trading_engine import TradingEngine
+
+    engine = TradingEngine()
+    monkeypatch.setattr(main_module, "trading_engine", engine)
+    monkeypatch.setattr(engine, "_push_state_update", lambda: None)
+    monkeypatch.setattr(engine, "_log_entry_pause", lambda: None)
+    admitted_version = engine._entry_control_version
+    entered, release = threading.Event(), threading.Event()
+    done = {i: threading.Event() for i in (1, 2, 3)}
+    responses = {}
+    original_handle = main_module._handle_request
+
+    def handle(req):
+        if req["method"] == "check_session":
+            entered.set()
+            assert release.wait(3)
+            return {"id": 1, "result": {"is_valid": True}}
+        if req["method"] == "start_agent":
+            assert req["_entry_control_version"] == admitted_version
+        return original_handle(req)
+
+    def write(response):
+        responses[response["id"]] = response
+        done[response["id"]].set()
+
+    def requests():
+        try:
+            yield json.dumps({"id": 1, "method": "check_session"})
+            assert entered.wait(1)
+            yield json.dumps(
+                {"id": 2, "method": "start_agent", "_entry_control_version": 999}
+            )
+            yield json.dumps({"id": 3, "method": "stop_agent"})
+            assert done[3].wait(1)
+        finally:
+            release.set()
+        assert all(event.wait(1) for event in done.values())
+
+    monkeypatch.setattr(main_module, "_handle_request", handle)
+    monkeypatch.setattr(main_module, "_write_response", write)
+    monkeypatch.setattr(main_module.sys, "stdin", requests())
+    main_module.main()
+    assert "superseded" in responses[2]["error"]["message"]
+    assert not engine.running and engine.thread is None
+
+
 @pytest.mark.parametrize(
     "obligation", ["local", "durable", "order", "position", "unknown"]
 )
@@ -352,7 +477,7 @@ def test_logout_reads_terminal_orders_before_confirming_flat_positions():
     ):
         engine._has_residual_obligations.return_value = False
         engine._pending_lifecycle_obligations.return_value = []
-        engine.stop.side_effect = lambda: calls.append("pause")
+        engine.stop.side_effect = lambda **kwargs: calls.append("pause")
         engine._order_snapshot.return_value.require_complete.side_effect = lambda: (
             calls.append("orders") or SimpleNamespace(orders=[])
         )

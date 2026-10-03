@@ -268,7 +268,7 @@ def test_scanner_restores_live_signal_identity_and_retries_volume_recovery(monke
     contexts = iter([incomplete, context])
     scanner.strategies = {"fixture": _MutatingStrategy()}
     scanner.playbooks = [_Playbook()]
-    monkeypatch.setattr(scanner, "_market_context", lambda *args: next(contexts))
+    monkeypatch.setattr(scanner, "_market_context", lambda *args, **kw: next(contexts))
     monkeypatch.setattr(
         scanner, "_fetch_candles", lambda *args: (context.primary_frame(), False)
     )

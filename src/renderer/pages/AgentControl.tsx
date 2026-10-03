@@ -1,6 +1,6 @@
 import React from 'react';
 import { useTradingStore } from '../stores/trading-store';
-import SignalCard from '../components/SignalCard';
+import AgentEntryNotice from '../components/AgentEntryNotice';
 import { useKiteAPI } from '../hooks/useKiteAPI';
 import { Check, X, Loader2 } from 'lucide-react';
 import { buildStrategySettings, STRATEGY_IDS } from '../utils/strategy-settings';
@@ -121,17 +121,14 @@ const AgentControl: React.FC = () => {
           disabled={controlPending}
           className={`px-8 py-3 rounded-lg font-bold shadow-lg transition-all ${agentState.running ? 'bg-loss-dark hover:bg-loss text-white' : 'bg-profit-dark hover:bg-profit text-white animate-pulse-slow'}`}
         >
-          {controlPending ? 'UPDATING…' : agentState.running ? 'PAUSE ENTRIES' : 'START AGENT'}
+          {controlPending ? 'UPDATING…' : agentState.scanOnly ? 'STOP SCANNING' : agentState.running ? 'PAUSE ENTRIES' : 'START AGENT'}
         </button>
       </div>
 
       {controlError && <div role="alert" className="rounded border border-loss-dark p-3 text-loss-light">{controlError}</div>}
-      {(agentState.reconciliationPending || agentState.lifecycleRecoveryPending || agentState.controlStateInvalid || agentState.protectionFailureHalt) && (
-        <div role="alert" className="rounded border border-amber-700/60 p-3 text-amber-200">Entries are blocked while broker state, protection, or saved control state requires recovery.</div>
-      )}
+      <AgentEntryNotice />
       <p className="text-sm text-amber-200">
-        {agentState.supervisionActive ? (agentState.running ? 'Position supervision active.' : 'Entries paused; position supervision remains active.') : 'Position supervision is not yet verified.'}
-        {agentState.statusMessage && ` ${agentState.statusMessage}`}
+        {agentState.statusMessage || (agentState.supervisionActive ? 'Position supervision active.' : 'Position supervision is not yet verified.')}
       </p>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 relative">
@@ -184,7 +181,7 @@ const AgentControl: React.FC = () => {
           {/* Pad the header itself instead of the parent so it blocks scrolling cards behind it */}
           <div className="sticky top-[89px] bg-surface-800 z-20 p-6 pb-4 border-b border-surface-700 rounded-t-xl">
             <div className="flex justify-between items-center">
-              <h2 className="text-lg font-semibold text-white">Live Signals</h2>
+              <h2 className="text-lg font-semibold text-white">{agentState.scanOnly ? 'Scan-only Signals' : 'Live Signals'}</h2>
               <span className="text-xs text-surface-400">Grouped by Confluence</span>
             </div>
           </div>
@@ -260,9 +257,11 @@ const AgentControl: React.FC = () => {
                       const isCalibrated = probRaw !== null && probRaw !== undefined;
                       const prob = isCalibrated ? probRaw : 0;
                       const isProbHigh = isCalibrated ? prob >= 0.60 : true; // Uncalibrated is allowed to explore
-                      const entriesEnabled = agentState.running && !agentState.entryPaused && !agentState.reconciliationPending && !agentState.lifecycleRecoveryPending && !agentState.controlStateInvalid && !agentState.protectionFailureHalt && !agentState.hardFlattenReason;
+                      const entriesEnabled = !bestSignal.analysisOnly && agentState.running && !agentState.entryPaused && !agentState.reconciliationPending && !agentState.lifecycleRecoveryPending && !agentState.controlStateInvalid && !agentState.protectionFailureHalt && !agentState.hardFlattenReason;
                       const willAutoEnter = entriesEnabled && agentState.mode === 'auto' && isProbHigh;
-                      const autoEnterReason = !entriesEnabled
+                      const autoEnterReason = bestSignal.analysisOnly
+                        ? 'Analysis only'
+                        : !entriesEnabled
                         ? 'Entries paused or awaiting recovery'
                         : agentState.mode !== 'auto'
                         ? 'Mode is not Auto'
@@ -285,13 +284,19 @@ const AgentControl: React.FC = () => {
                       );
                     })()}
 
+                    {bestSignal.analysisOnly && (
+                      <p className="text-xs text-amber-200">
+                        Analysis only{bestSignal.analysisAsOf ? ` · Candles through ${new Date(bestSignal.analysisAsOf).toLocaleString()}` : ''}
+                      </p>
+                    )}
                     <div className="flex gap-2 mt-2 pt-3 border-t border-surface-700">
                       <button
+                        disabled={bestSignal.analysisOnly || agentState.entryPaused || !agentState.running}
                         onClick={() => {
                           window.electronAPI?.invoke('agent:execute-signal', bestSignal);
                           group.signals.forEach(s => useTradingStore.getState().removeSignal(s.id));
                         }}
-                        className="flex-1 bg-profit-dark hover:bg-profit flex items-center justify-center gap-2 py-2 rounded transition-colors text-white text-sm font-medium"
+                        className="flex-1 bg-profit-dark hover:bg-profit flex items-center justify-center gap-2 py-2 rounded transition-colors text-white text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed"
                       >
                         <Check size={16} /> Take Trade
                       </button>

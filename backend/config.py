@@ -1,4 +1,5 @@
 import datetime
+import hashlib
 import json
 import os
 import tempfile
@@ -501,6 +502,21 @@ class ConfigManager:
                     record[field] = timestamp.isoformat()
             serializable[symbol] = record
         self._atomic_write_json(path, serializable)
+
+    def archive_inactive_trade(self, symbol: str, trade: dict, verification: dict):
+        """Retain the old tracking record and flatness evidence before removal."""
+        payload = {"tradingsymbol": symbol, "trade": trade}
+        record_id = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()
+        path = self.config_dir / "retired_active_trades.json"
+        with self._state_file_lock:
+            archived = json.loads(path.read_text()) if path.exists() else {}
+            if not isinstance(archived, dict):
+                raise ValueError("Retired trade archive is invalid")
+            if record_id not in archived:
+                archived[record_id] = {**payload, "verification": verification}
+                self._atomic_write_json(path, archived)
 
     @staticmethod
     def _atomic_write_json(path: Path, data):

@@ -219,12 +219,27 @@ class MarketContext:
     transition_candidate: Optional[str]
     transition_age: int
     context_policy: Optional[ContextPolicy] = None
+    analysis_only: bool = False
 
     @property
     def normal_decision_eligible(self) -> bool:
         """Whether normal completed-candle management can consume this input."""
 
-        return self.primary_quality.usable and self.primary_bar is not None
+        return (
+            not self.analysis_only
+            and self.primary_quality.usable
+            and self.primary_bar is not None
+        )
+
+    @property
+    def analysis_decision_eligible(self) -> bool:
+        """Allow old completed candles for explicitly non-executable research."""
+        return (
+            self.analysis_only
+            and self.primary_bar is not None
+            and self.primary_quality.status
+            in {ContextQuality.VALID, ContextQuality.STALE}
+        )
 
     def primary_frame(self) -> pd.DataFrame:
         """Return a new DataFrame; no cached frame is shared with strategies."""
@@ -267,6 +282,7 @@ class MarketContext:
             }
 
         return {
+            **({"analysis_only": True} if self.analysis_only else {}),
             "snapshot_id": self.snapshot_id,
             "instrument_id": self.instrument_id,
             "session_id": self.session_id,
@@ -372,6 +388,7 @@ class MarketContextService:
         received_at: Optional[datetime] = None,
         *,
         source_as_of: Optional[datetime] = None,
+        analysis_only: bool = False,
     ) -> MarketContext:
         """Build as of a decision, preserving observation and request cutoffs.
 
@@ -442,7 +459,10 @@ class MarketContextService:
             complete_frame
         )
         raw_regime, raw_features = _raw_regime(complete_frame)
-        if not primary_quality.usable:
+        observations_usable = primary_quality.usable or (
+            analysis_only and primary_quality.status is ContextQuality.STALE
+        )
+        if not observations_usable:
             session_vwap, atr, dynamics, participation = _continuous_observations(
                 _empty_frame()
             )
@@ -452,7 +472,7 @@ class MarketContextService:
             str(instrument_id),
             primary_bar,
             raw_regime,
-            primary_quality.usable,
+            observations_usable,
             decision_at,
         )
         snapshot_id = _snapshot_id(
@@ -461,6 +481,7 @@ class MarketContextService:
             input_hash,
             json.dumps(
                 {
+                    **({"analysis_only": True} if analysis_only else {}),
                     "policy": asdict(self.policy),
                     "session_policy": {
                         **asdict(self.session_clock.policy),
@@ -479,6 +500,7 @@ class MarketContextService:
         )
         return MarketContext(
             snapshot_id=snapshot_id,
+            analysis_only=analysis_only,
             instrument_id=str(instrument_id),
             session_id=session_id,
             decision_event_time=decision_at,

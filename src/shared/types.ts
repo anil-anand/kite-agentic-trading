@@ -262,6 +262,8 @@ export interface Signal {
   riskReward: number;
   reasoning: string;
   timestamp: string;
+  analysisOnly?: boolean;
+  analysisAsOf?: string;
   indicators: Record<string, number>;
 }
 
@@ -276,7 +278,9 @@ export interface AgentState {
   lastScanTime: string | null;
   status: 'idle' | 'scanning' | 'placing_order' | 'monitoring' | 'supervising' | 'stopped' | 'error';
   statusMessage: string;
-  effectiveMode?: AgentMode | 'paused';
+  effectiveMode?: AgentMode | 'paused' | 'scan_only';
+  scanOnly?: boolean;
+  entryBlockReasons?: string[];
   entryPaused?: boolean;
   supervisionActive?: boolean;
   protectionFailureHalt?: boolean;

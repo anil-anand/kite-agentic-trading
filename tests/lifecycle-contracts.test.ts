@@ -146,6 +146,33 @@ test('logout retains the trusted session when backend cannot release supervision
   assert.deepEqual(calls, ['logout', 'logout', 'clear-token']);
 });
 
+test('session checks wait for backend readiness and share overlapping refreshes', async () => {
+  let ready = false;
+  let finish: (result: unknown) => void = () => {};
+  const calls: string[] = [];
+  const module = await bundledModule('src/main/auth-manager.ts', {
+    electron: {},
+    './python-bridge': { pythonBridge: {
+      isRunning: () => ready,
+      call: async (method: string) => {
+        calls.push(method);
+        if (method === 'check_session') return new Promise(resolve => { finish = resolve; });
+        return {};
+      },
+    } },
+    './secure-storage': { secureStorage: { hasSecretsFile: () => true, loadCredentials: () => ({}) } },
+  });
+  assert.equal(await module.authManager.checkSession(), false);
+  assert.deepEqual(calls, []);
+  ready = true;
+  const first = module.authManager.checkSession();
+  const second = module.authManager.checkSession();
+  await flush();
+  assert.deepEqual(calls, ['set_credentials', 'check_session']);
+  finish({ is_valid: true });
+  assert.deepEqual(await Promise.all([first, second]), [true, true]);
+});
+
 test('root subscriptions preserve backend mode, invalidate lost supervision, and remove only their listeners', async () => {
   const listeners = new Map<string, Set<(...args: any[]) => void>>();
   const effects: (() => (() => void) | undefined)[] = [];

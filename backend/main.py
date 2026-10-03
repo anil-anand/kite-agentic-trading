@@ -46,6 +46,8 @@ _RESEARCH_METHODS = {
 _RESEARCH_WORKERS = 2
 _BROKER_WORKERS = 4
 _OPERATOR_WORKERS = 2
+_LIFECYCLE_WORKERS = 1
+_LIFECYCLE_QUEUE_SIZE = 8
 _FAST_CONTROL_METHODS = {
     "stop_agent",
     "agent_status",
@@ -88,7 +90,7 @@ def _validate_request(req):
 def _assert_logout_safe():
     """Pause admission before proving authentication is no longer needed."""
 
-    trading_engine.stop()
+    trading_engine.stop(reason="logout requested")
     if (
         trading_engine._has_residual_obligations()
         or trading_engine._pending_lifecycle_obligations()
@@ -144,7 +146,7 @@ def _verify_candidate_account(candidate):
 
 
 def _install_candidate_session(candidate, access_token, account_id):
-    trading_engine.stop()
+    trading_engine.stop(reason="broker session is being restored")
     # Both the old and candidate connections have the same verified account.
     # Do not call init()/set_access_token(): those clear account_id to UNKNOWN
     # while the risk worker can still be reading the shared client.
@@ -348,7 +350,11 @@ def _handle_request(req):
 
         elif method == "start_agent":
             mode = params.get("mode", "auto")
-            return success(trading_engine.start(mode))
+            return success(
+                trading_engine.start(
+                    mode, expected_control_version=req.get("_entry_control_version")
+                )
+            )
 
         elif method == "stop_agent":
             return success(trading_engine.stop())
@@ -679,12 +685,16 @@ def main():
             concurrent.futures.ThreadPoolExecutor(
                 max_workers=workers, thread_name_prefix=f"{name}-rpc"
             ),
-            threading.BoundedSemaphore(workers),
+            threading.BoundedSemaphore(workers + queued),
         )
-        for name, workers in (
-            ("research", _RESEARCH_WORKERS),
-            ("broker", _BROKER_WORKERS),
-            ("operator", _OPERATOR_WORKERS),
+        for name, workers, queued in (
+            ("research", _RESEARCH_WORKERS, 0),
+            ("broker", _BROKER_WORKERS, 0),
+            ("operator", _OPERATOR_WORKERS, 0),
+            # Authentication/startup is serialized and cannot compete with
+            # dashboard/market-data reads for the broker workers. Absorb the
+            # small startup burst without creating unbounded queued work.
+            ("lifecycle", _LIFECYCLE_WORKERS, _LIFECYCLE_QUEUE_SIZE),
         )
     }
 
@@ -711,12 +721,18 @@ def main():
                 _write_response(invalid)
                 continue
             method = req["method"]
+            if method == "start_agent":
+                # A queued Start cannot supersede a later Stop/emergency.
+                # Always overwrite any client-supplied value at admission.
+                req["_entry_control_version"] = trading_engine._entry_control_version
             if method in _FAST_CONTROL_METHODS:
                 _write_response(handle_request(req))
                 continue
 
             pool = (
-                "research"
+                "lifecycle"
+                if method in _LIFECYCLE_METHODS
+                else "research"
                 if method in _RESEARCH_METHODS
                 else "operator"
                 if method in _OPERATOR_METHODS
@@ -728,7 +744,13 @@ def main():
                     _request_error(req, -32005, f"{pool} worker capacity is full")
                 )
                 continue
-            executor.submit(run_worker, req, capacity)
+            try:
+                executor.submit(run_worker, req, capacity)
+            except Exception:
+                capacity.release()
+                _write_response(
+                    _request_error(req, -32005, "Request worker unavailable")
+                )
     finally:
         for executor, _ in pools.values():
             executor.shutdown(wait=False)

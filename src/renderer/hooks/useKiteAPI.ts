@@ -142,6 +142,8 @@ export const useKiteAPI = ({ subscribe = false }: { subscribe?: boolean } = {}) 
           supervisionActive: false,
           entryPaused: true,
           effectiveMode: 'paused',
+          scanOnly: false,
+          entryBlockReasons: ['Backend connection is recovering'],
           reconciliationPending: true,
           status: data?.error ? 'error' : 'stopped',
           statusMessage: data?.error || 'Backend recovering; supervision is not yet verified.',

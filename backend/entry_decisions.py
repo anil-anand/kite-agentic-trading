@@ -141,7 +141,10 @@ def evaluate_production_entries(
         raise ValueError("entry decision time must match the as-of market context")
     if not isinstance(raw_frame, pd.DataFrame):
         raise TypeError("raw_frame must be a DataFrame")
-    if not market_context.normal_decision_eligible:
+    if not (
+        market_context.normal_decision_eligible
+        or market_context.analysis_decision_eligible
+    ):
         return []
     if any(
         bar.end > event_time or bar.available_at > event_time
@@ -156,6 +159,9 @@ def evaluate_production_entries(
 
     strategy_config = deepcopy(dict(strategy_config))
     family_mapping = dict(family_mapping)
+    evaluate_on_incomplete_candle = (
+        evaluate_on_incomplete_candle and not market_context.analysis_only
+    )
     decision_frame = (
         _observed_incomplete_frame(raw_frame, market_context, event_time)
         if evaluate_on_incomplete_candle
@@ -265,5 +271,9 @@ def evaluate_production_entries(
             }
         )
         decisions.append(decision)
+
+        if market_context.analysis_only:
+            decision["analysisOnly"] = True
+            decision["analysisAsOf"] = market_context.primary_bar.end.isoformat()
 
     return decisions

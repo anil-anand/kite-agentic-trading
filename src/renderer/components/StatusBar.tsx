@@ -22,7 +22,7 @@ const StatusBar: React.FC = () => {
   const marketOpen = isMarketOpen();
   
   const isConnected = auth.isLoggedIn && connectionStatus === 'connected';
-  const entriesBlocked = agentState.reconciliationPending || agentState.lifecycleRecoveryPending || agentState.controlStateInvalid || agentState.protectionFailureHalt || agentState.hardFlattenPending || dashboard?.killSwitchActive;
+  const entriesBlocked = agentState.scanOnly || !!agentState.entryBlockReasons?.length || agentState.reconciliationPending || agentState.lifecycleRecoveryPending || agentState.controlStateInvalid || agentState.protectionFailureHalt || agentState.hardFlattenPending || dashboard?.killSwitchActive;
 
   return (
     <div className="h-8 bg-surface-950 border-t border-surface-800 flex items-center justify-between px-4 text-xs font-mono">

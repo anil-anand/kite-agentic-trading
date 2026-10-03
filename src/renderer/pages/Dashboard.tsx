@@ -3,6 +3,7 @@ import { useTradingStore } from '../stores/trading-store';
 import { useKiteAPI } from '../hooks/useKiteAPI';
 import PnLDisplay from '../components/PnLDisplay';
 import PositionCard from '../components/PositionCard';
+import AgentEntryNotice from '../components/AgentEntryNotice';
 import { Activity } from 'lucide-react';
 import type { ActivePositionExplanation, Position } from '@shared/types';
 import { matchPositionExplanation } from '../utils/position-explanations';
@@ -148,9 +149,7 @@ const Dashboard: React.FC = () => {
     <div className="p-6 space-y-6 h-full overflow-auto">
       <h1 className="text-2xl font-bold text-white">Dashboard</h1>
       {operatorError && <div role="alert" className="rounded border border-loss-dark p-3 text-loss-light">{operatorError}</div>}
-      {(agentState.reconciliationPending || agentState.lifecycleRecoveryPending || agentState.controlStateInvalid || agentState.protectionFailureHalt) && (
-        <div role="alert" className="rounded border border-amber-700/60 bg-amber-900/20 p-3 text-sm text-amber-200">Entries are blocked while broker state, protection, or saved control state requires recovery.</div>
-      )}
+      <AgentEntryNotice />
       {((positionQuality && positionQuality !== 'COMPLETE') || summaryQuality ||
         (dashboard?.reconciliationStatus && dashboard.reconciliationStatus !== 'RECONCILED')) && (
         <div className="rounded border border-amber-700/60 bg-amber-900/20 p-3 text-sm text-amber-200">
@@ -219,12 +218,12 @@ const Dashboard: React.FC = () => {
             <div className="flex items-center justify-between mb-4">
               <span className="text-surface-300">Status</span>
               <span className={`px-2 py-1 rounded text-xs font-bold ${agentState.running ? 'bg-profit-fade text-profit-light' : 'bg-surface-700 text-surface-400'}`}>
-                {agentState.running ? 'RUNNING' : agentState.supervisionActive ? 'ENTRIES PAUSED' : 'SUPERVISION UNVERIFIED'}
+                {agentState.scanOnly ? 'SCAN ONLY' : agentState.running ? 'RUNNING' : agentState.supervisionActive ? 'ENTRIES PAUSED' : 'SUPERVISION UNVERIFIED'}
               </span>
             </div>
             <div className="flex items-center justify-between mb-4">
               <span className="text-surface-300">Mode</span>
-              <span className="text-white capitalize">{agentState.effectiveMode ?? agentState.mode}</span>
+              <span className="text-white capitalize">{agentState.effectiveMode?.replace('_', ' ') ?? agentState.mode}</span>
             </div>
             <dl className="mb-4 space-y-2 text-xs text-surface-300">
               <div className="flex justify-between"><dt>Position supervision</dt><dd>{agentState.supervisionActive ? 'ACTIVE' : 'UNVERIFIED'}</dd></div>
@@ -237,7 +236,7 @@ const Dashboard: React.FC = () => {
               disabled={controlPending}
               className={`w-full py-2 rounded font-bold transition-colors ${agentState.running ? 'bg-loss-dark hover:bg-loss text-white' : 'bg-profit-dark hover:bg-profit text-white'}`}
             >
-              {controlPending ? 'Updating…' : agentState.running ? 'Pause Entries' : 'Start Agent'}
+              {controlPending ? 'Updating…' : agentState.scanOnly ? 'Stop Scanning' : agentState.running ? 'Pause Entries' : 'Start Agent'}
             </button>
             <button
               onClick={handleEmergencyFlatten}
@@ -246,9 +245,8 @@ const Dashboard: React.FC = () => {
             >
               {flattenSubmitting || agentState.hardFlattenPending ? 'Flatten pending reconciliation…' : 'Emergency Flatten Account'}
             </button>
-            {agentState.hardFlattenReason && <p className="mt-3 text-xs text-amber-200">Account entry halt: {agentState.hardFlattenReason}</p>}
             {agentState.statusMessage && <p className="mt-3 text-xs text-surface-300">{agentState.statusMessage}</p>}
-            {!agentState.running && agentState.supervisionActive && (
+            {!agentState.running && agentState.supervisionActive && !agentState.statusMessage && (
               <p className="mt-3 text-xs text-amber-200">Entries paused; position supervision remains active.</p>
             )}
           </div>

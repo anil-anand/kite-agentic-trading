@@ -6,6 +6,7 @@ import { secureStorage } from './secure-storage';
 
 class AuthManager {
   private loginWindow: BrowserWindow | null = null;
+  private sessionCheck: Promise<boolean> | null = null;
 
   public async setupSecureStorage(): Promise<void> {
     if (!secureStorage.hasSecretsFile()) {
@@ -108,6 +109,16 @@ class AuthManager {
   }
 
   public async checkSession(): Promise<boolean> {
+    // The bridge owns trusted startup rehydration. Renderer mounts can happen
+    // before it finishes; the ready event will trigger a fresh status check.
+    if (!pythonBridge.isRunning()) return false;
+    if (!this.sessionCheck) {
+      this.sessionCheck = this.verifySession().finally(() => { this.sessionCheck = null; });
+    }
+    return this.sessionCheck;
+  }
+
+  private async verifySession(): Promise<boolean> {
     try {
       await this.setupSecureStorage();
       const response = await pythonBridge.call('check_session');

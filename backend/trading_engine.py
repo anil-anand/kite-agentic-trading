@@ -104,6 +104,10 @@ def _best_effort_exit_observation(method):
 class TradingEngine:
     def __init__(self):
         self.running = False
+        self._scan_only = False
+        self._last_reconciliation_report = None
+        self._entry_pause_reason = "the agent has not been started"
+        self._last_pause_log = None
         self.thread = None
         self.mode = "auto"  # auto or confirm
         self.interval = 60  # seconds
@@ -135,8 +139,9 @@ class TradingEngine:
         self._protection_failure_halt = False
 
         # Entry scanning and hard-risk supervision have separate lifecycles.
-        # ``running`` is retained as the compatible "new entries enabled" flag;
-        # stopping the agent pauses entries but never turns off supervision of
+        # ``running`` describes the scanner; admission also checks scan-only,
+        # session, recovery and risk gates independently.
+        # Stopping the agent pauses entries but never turns off supervision of
         # already-owned/recovering broker exposure.
         self._supervision_active = False
         self._supervisor_thread = None
@@ -2647,6 +2652,8 @@ class TradingEngine:
                 self._pending_lifecycle_obligations()
             )
             self._reconciliation_pending = self._lifecycle_recovery_pending
+            if self._last_reconciliation_report is not None:
+                self._report_reconciliation({})
             return
 
         self._reserved_entry_margin = sum(
@@ -2665,9 +2672,12 @@ class TradingEngine:
             with self._trade_lock:
                 for trade in self.active_trades.values():
                     trade["broker_reconciliation_pending"] = True
-                    trade["recovery_state"] = "BROKER_STATE_UNAVAILABLE"
+                    if not trade.get("ownership_quarantined"):
+                        trade["recovery_state"] = "BROKER_STATE_UNAVAILABLE"
             self._persist_trades()
-            self._push_log(f"Reconcile: failed to fetch positions: {e}", level="error")
+            self._log_reconciliation(
+                f"Reconcile pending: failed to fetch positions: {e}", level="error"
+            )
             return
 
         open_map = {}
@@ -2698,9 +2708,12 @@ class TradingEngine:
             with self._trade_lock:
                 for trade in self.active_trades.values():
                     trade["broker_reconciliation_pending"] = True
-                    trade["recovery_state"] = "ORDER_STATE_UNAVAILABLE"
+                    if not trade.get("ownership_quarantined"):
+                        trade["recovery_state"] = "ORDER_STATE_UNAVAILABLE"
             self._persist_trades()
-            self._push_log("Reconcile: failed to fetch open orders", level="error")
+            self._log_reconciliation(
+                "Reconcile pending: failed to fetch open orders", level="error"
+            )
             return
         open_orders = {
             str(order.get("order_id"))
@@ -2721,7 +2734,25 @@ class TradingEngine:
                     if symbol in self._pending_entries:
                         reconciled[symbol] = trade
                         continue
-                keep = self._reconcile_one(symbol, trade, open_map, open_orders)
+                try:
+                    retired = self._retire_inactive_legacy_trade(
+                        symbol, trade, positions, current_orders
+                    )
+                    trade.pop("legacy_cleanup_error", None)
+                except Exception as exc:
+                    # Verification/archive failure is retryable; do not turn
+                    # it into a permanent identity quarantine with no retry.
+                    if trade.get("legacy_cleanup_error") != str(exc):
+                        self._push_log(
+                            f"Saved tracking cleanup for {symbol} is pending: {exc}",
+                            level="warning",
+                        )
+                    trade["legacy_cleanup_error"] = str(exc)
+                    retired = False
+                if retired:
+                    keep = False
+                else:
+                    keep = self._reconcile_one(symbol, trade, open_map, open_orders)
             except Exception as e:
                 # A single malformed record must not abort reconciliation of the
                 # rest — skip it and keep going.
@@ -2748,13 +2779,105 @@ class TradingEngine:
         self._reconciliation_pending = any(
             trade.get("broker_reconciliation_pending")
             or trade.get("exit_state_recovery_required")
+            or trade.get("ownership_quarantined")
             for trade in reconciled.values()
         )
         self._lifecycle_recovery_pending = bool(self._pending_lifecycle_obligations())
         self._persist_trades()
-        self._push_log(
-            f"Reconcile complete: {len(reconciled)} active trade(s) resumed."
+        self._report_reconciliation(open_map)
+
+    def _recovery_details(self) -> list[str]:
+        with self._trade_lock:
+            trades = {
+                symbol: dict(trade) for symbol, trade in self.active_trades.items()
+            }
+        details = []
+        for symbol, trade in sorted(trades.items()):
+            if not any(
+                trade.get(field)
+                for field in (
+                    "broker_reconciliation_pending",
+                    "exit_state_recovery_required",
+                    "ownership_quarantined",
+                    "cleanup_pending",
+                )
+            ):
+                continue
+            reason = str(trade.get("recovery_state") or "broker verification pending")
+            if reason == "LEGACY_IDENTITY_UNRESOLVED":
+                reason = "saved trade is missing verified account/instrument identity"
+            else:
+                reason = reason.replace("_", " ").lower()
+            details.append(f"{symbol}: {reason}")
+        return details
+
+    def _log_reconciliation(self, message: str, level: str = "info") -> None:
+        # The supervisor retries every few seconds. Log transitions, not polls.
+        report = (message, level)
+        if report != self._last_reconciliation_report:
+            self._last_reconciliation_report = report
+            self._push_log(message, level=level)
+
+    def _report_reconciliation(self, open_map: dict) -> None:
+        details = self._recovery_details()
+        if self._reconciliation_pending or self._lifecycle_recovery_pending or details:
+            detail = "; ".join(details) or "durable order recovery pending"
+            self._log_reconciliation(
+                f"Reconcile pending: {len(open_map)} verified open position(s); {detail}. "
+                "Saved recovery records are not confirmed open trades.",
+                level="warning",
+            )
+        else:
+            self._log_reconciliation(
+                f"Reconcile complete: {len(open_map)} verified open position(s)."
+            )
+
+    def _entry_block_reasons(self) -> list[str]:
+        reasons = self._recovery_details()
+        if self._reconciliation_pending and not reasons:
+            reasons.append("Broker reconciliation is pending")
+        if self._lifecycle_recovery_pending:
+            reasons.append("Order recovery is pending")
+        if self._control_state_invalid:
+            reasons.append("Saved operator controls require recovery")
+        if self._protection_failure_halt:
+            reasons.append("Protective stop recovery is required")
+        if self._hard_flatten_reason:
+            reasons.append(
+                f"Account halt: {self._hard_halt_description(self._hard_flatten_reason)}"
+            )
+        if getattr(risk_manager, "kill_switch_active", False):
+            reasons.append("The daily-loss halt is active")
+        if getattr(risk_manager, "reconciliation_status", "RECONCILED") != "RECONCILED":
+            reasons.append("Broker risk accounting is not reconciled")
+        if not self._session_clock().snapshot(now_utc()).entries_allowed:
+            reasons.append("The exchange entry window is closed")
+        return reasons
+
+    @staticmethod
+    def _hard_halt_description(reason: str) -> str:
+        return {
+            HardRiskReason.SESSION_FORCED_FLAT.value: "the session square-off deadline has been reached",
+            HardRiskReason.RISK_DAILY_LOSS.value: "the daily-loss limit has been reached",
+            HardRiskReason.OPERATOR_EMERGENCY_FLATTEN.value: "emergency account flatten was requested",
+        }.get(reason, reason.replace("_", " ").lower())
+
+    def _pause_message(self, reasons=None) -> str:
+        restrictions = self._entry_block_reasons() if reasons is None else reasons
+        message = f"New entries paused: {self._entry_pause_reason}."
+        if restrictions:
+            message += " Entry restrictions: " + "; ".join(restrictions) + "."
+        return message + (
+            " Position supervision remains active."
+            if self._supervision_active
+            else " Position supervision is not yet active."
         )
+
+    def _log_entry_pause(self):
+        message = self._pause_message()
+        if message != self._last_pause_log:
+            self._last_pause_log = message
+            self._push_log(message)
 
     def _cancel_stop_if_live(self, trade: dict, open_orders: set):
         stop_id = trade.get("stop_order_id")
@@ -2763,6 +2886,160 @@ class TradingEngine:
                 execution_gateway.cancel_order(variety="regular", order_id=stop_id)
             except Exception:
                 pass
+
+    def _retire_inactive_legacy_trade(
+        self, symbol: str, trade: dict, positions: list, orders: list
+    ) -> bool:
+        """Remove obsolete legacy tracking after fresh broker proof of inactivity.
+
+        This relinquishes tracking only, not an unknown durable order intent,
+        and never invents an exit fill, execution time or realized P&L.
+        """
+        if self._has_canonical_identity(trade) or trade.get("entry_state") not in (
+            None,
+            "OPEN",
+        ):
+            return False
+        if trade.get("recovery_state") not in (
+            None,
+            "LEGACY_IDENTITY_UNRESOLVED",
+            "BROKER_STATE_UNAVAILABLE",
+            "ORDER_STATE_UNAVAILABLE",
+        ):
+            return False
+        if any(
+            trade.get(field)
+            for field in (
+                "entry_intent_id",
+                "protection_intent_id",
+                "exit_intent_id",
+                "reservation_id",
+                "reserved_margin",
+                "exit_state_recovery_required",
+            )
+        ):
+            return False
+        scope = (
+            getattr(getattr(kite_client, "namespace", None), "value", None),
+            getattr(kite_client, "account_id", None),
+        )
+        if not scope[0] or scope[1] in (None, "", "UNKNOWN", "TEST_COMPAT"):
+            return False
+        if any(
+            trade.get(field) not in (None, "", "UNKNOWN", value)
+            for field, value in zip(("namespace", "account_id"), scope)
+        ):
+            return False
+        position_key = trade.get("exit_management_position_key")
+        if position_key:
+            managed = journal.get_managed_position(position_key)
+            if not managed or managed.get("provenance") != "LEGACY_PARTIAL":
+                return False
+        linked_orders = {
+            str(trade[field])
+            for field in (
+                "entry_order_id",
+                "stop_order_id",
+                "exit_order_id",
+                "protection_attempt_order_id",
+            )
+            if trade.get(field)
+        }
+
+        def has_exposure(position_rows, order_rows):
+            return any(
+                row.get("tradingsymbol") == symbol and row.get("quantity", 0) != 0
+                for row in position_rows
+            ) or any(
+                (
+                    row.get("tradingsymbol") == symbol
+                    or str(row.get("order_id")) in linked_orders
+                )
+                and str(row.get("status", "")).upper()
+                not in self._TERMINAL_ORDER_STATUSES
+                for row in order_rows
+            )
+
+        if has_exposure(positions, orders):
+            return False
+        # No legacy cleanup may bypass a submission whose outcome is unknown.
+        for intent in self._order_lifecycle.journal.list_unresolved_order_intents():
+            parts = str(intent.get("position_key", "")).split(":", 6)
+            if (
+                len(parts) != 7
+                or parts[4] == symbol
+                or (
+                    trade.get("trade_id")
+                    and intent.get("trade_id") == trade["trade_id"]
+                )
+            ):
+                return False
+
+        started_at = now_utc()
+        # Orders first, then positions: a working entry that fills between
+        # reads must be seen either as a working order or as exposure.
+        order_snapshot = self._order_snapshot(critical=True).require_complete()
+        position_snapshot = self._position_snapshot(critical=True).require_complete()
+        verified_at = now_utc()
+        if (
+            any(
+                not started_at <= snapshot.fetched_at <= verified_at
+                or (verified_at - snapshot.fetched_at).total_seconds() > 30
+                for snapshot in (order_snapshot, position_snapshot)
+            )
+            or position_snapshot.fetched_at < order_snapshot.fetched_at
+        ):
+            return False
+        if scope != (
+            getattr(getattr(kite_client, "namespace", None), "value", None),
+            getattr(kite_client, "account_id", None),
+        ):
+            return False
+        if any(
+            (item.key.namespace.value, item.key.account_id) != scope
+            for item in (*position_snapshot.net, *order_snapshot.orders)
+        ):
+            return False
+        current_orders = [
+            order_to_backend_dict(order) for order in order_snapshot.orders
+        ]
+        if has_exposure(
+            [position_to_backend_dict(position) for position in position_snapshot.net],
+            current_orders,
+        ):
+            return False
+        # Missing same-day order IDs can be a propagation gap. An old legacy
+        # record can outlive the broker's daily order book; that is not a live
+        # order obligation when today's complete book and positions are clear.
+        missing_ids = linked_orders - {
+            str(order.get("order_id")) for order in current_orders
+        }
+        entered_at = as_utc(trade.get("entry_time"))
+        if (missing_ids or not linked_orders) and (
+            entered_at is None
+            or entered_at.astimezone(EXCHANGE_TIMEZONE).date()
+            >= verified_at.astimezone(EXCHANGE_TIMEZONE).date()
+        ):
+            return False
+        config_manager.archive_inactive_trade(
+            symbol,
+            trade,
+            {
+                "reason": "BROKER_CONFIRMED_INACTIVE_LEGACY_TRACKING",
+                "verified_at": verified_at.isoformat(),
+                "namespace": scope[0],
+                "account_id": scope[1],
+                "orders_snapshot_id": order_snapshot.snapshot_id,
+                "positions_snapshot_id": position_snapshot.snapshot_id,
+                "orders_fetched_at": order_snapshot.fetched_at.isoformat(),
+                "positions_fetched_at": position_snapshot.fetched_at.isoformat(),
+            },
+        )
+        self._push_log(
+            f"Removed inactive saved tracking for {symbol}: broker confirms no open "
+            "position or working orders. Historical record archived."
+        )
+        return True
 
     @staticmethod
     def _has_canonical_identity(trade: dict) -> bool:
@@ -3325,6 +3602,8 @@ class TradingEngine:
     def _entry_admission_allowed(self) -> tuple[bool, str]:
         """Check the authoritative entry gate without altering supervision."""
 
+        if self._scan_only:
+            return False, "the agent is running in scan-only mode"
         # Direct legacy test/maintenance callers that have not started an
         # engine retain their established behavior. Once supervision is active,
         # this is the authoritative pause/session gate for every entry route.
@@ -3487,17 +3766,27 @@ class TradingEngine:
         """Persist an account-level hard obligation until terminal cleanup."""
 
         if self._hard_flatten_reason != reason:
-            self._push_log(f"Hard-risk flatten latched: {reason}", level="warning")
-        if self._hard_flatten_reason == HardRiskReason.OPERATOR_EMERGENCY_FLATTEN.value:
-            reason = self._hard_flatten_reason
-        changed = self._hard_flatten_reason != reason
-        self._hard_flatten_reason = reason
-        if changed:
-            self._entry_control_version += 1
-            self._hard_flatten_pending = True
-        self.running = False
-        self._entry_stop.set()
+            self._push_log(
+                f"Account safety action: {self._hard_halt_description(reason)}.",
+                level="warning",
+            )
         with self._trade_lock:
+            if (
+                self._hard_flatten_reason
+                == HardRiskReason.OPERATOR_EMERGENCY_FLATTEN.value
+            ):
+                reason = self._hard_flatten_reason
+            changed = self._hard_flatten_reason != reason
+            self._hard_flatten_reason = reason
+            if changed:
+                self._entry_control_version += 1
+                self._hard_flatten_pending = True
+            # Hard controls still pause live admission immediately. A run that
+            # already has no entry authority can continue its chart analysis.
+            if not self._scan_only:
+                self.running = False
+                self._entry_stop.set()
+                self._entry_pause_reason = self._hard_halt_description(reason)
             # An admission that has reserved capacity but has not yet prepared
             # a durable broker intent must be cancelled locally. Once an
             # intent exists, Phase 2 recovery owns its exact broker outcome.
@@ -3725,7 +4014,7 @@ class TradingEngine:
         """Resume recovery after trusted backend rehydration, never entries."""
 
         if self._supervision_active:
-            self.stop()
+            self.stop(reason="broker session restored; waiting for Start Agent")
             self._reconciliation_pending = True
             self._supervisor_wakeup.set()
             return self.status()
@@ -3739,99 +4028,103 @@ class TradingEngine:
                 f"Supervision resume requires reconciliation: {exc}", level="error"
             )
         self.running = False
+        self._scan_only = False
+        self._entry_pause_reason = "broker session restored; waiting for Start Agent"
         self._entry_stop.set()
         self._activate_supervision()
         self._push_state_update()
+        self._log_entry_pause()
         return self.status()
 
-    def start(self, mode: str = "auto") -> dict:
+    def start(self, mode: str = "auto", *, expected_control_version=None) -> dict:
         with self._lifecycle_lock:
-            return self._start(mode)
+            if (
+                expected_control_version is not None
+                and expected_control_version != self._entry_control_version
+            ):
+                raise ValueError(
+                    "Start request was superseded by a later pause or safety action"
+                )
+            return self._start(mode, expected_control_version)
 
-    def _start(self, mode: str) -> dict:
+    def _start(self, mode: str, expected_control_version=None) -> dict:
         if mode not in {"auto", "confirm"}:
             raise ValueError("mode must be auto or confirm")
 
         self.mode = mode
         if self.running and self._supervision_active:
             return self.status()
-        if self._supervision_active:
-            self.running = not (
-                self._reconciliation_pending
-                or self._lifecycle_recovery_pending
-                or self._hard_flatten_reason
-                or self._control_state_invalid
-                or self._protection_failure_halt
-                or getattr(risk_manager, "kill_switch_active", False)
+        control_version = (
+            self._entry_control_version
+            if expected_control_version is None
+            else expected_control_version
+        )
+        if not self._supervision_active:
+            # Recovery gates orders, but does not prevent read-only scanning.
+            risk_reconcile_failed = False
+            try:
+                self._load_control_state()
+                risk_manager.reconcile_state()
+            except Exception as exc:
+                risk_reconcile_failed = True
+                self._reconciliation_pending = True
+                self._push_log(
+                    f"Risk manager reconcile on start failed: {exc}", level="error"
+                )
+
+            try:
+                self.reconcile_active_trades()
+            except Exception as exc:
+                self._reconciliation_pending = True
+                self._push_log(
+                    f"Reconcile active trades on start failed: {exc}", level="error"
+                )
+
+            self._reconciliation_pending = (
+                self._reconciliation_pending or risk_reconcile_failed
             )
-            if self.running:
-                self._entry_stop.clear()
-                if not self.thread or not self.thread.is_alive():
-                    self.thread = threading.Thread(target=self._run_loop, daemon=True)
-                    self.thread.start()
+
+        if control_version != self._entry_control_version:
+            self._activate_supervision()
             self._push_state_update()
             return self.status()
-        control_version = self._entry_control_version
-        # Reconciliation occurs before new entries are enabled.  A failure does
-        # not turn off the supervisor, but it does keep entry admission paused.
-        risk_reconcile_failed = False
-        try:
-            self._load_control_state()
-            risk_manager.reconcile_state()
-        except Exception as exc:
-            risk_reconcile_failed = True
-            self._reconciliation_pending = True
-            self._push_log(
-                f"Risk manager reconcile on start failed: {exc}", level="error"
-            )
 
-        try:
-            self.reconcile_active_trades()
-        except Exception as exc:
-            self._reconciliation_pending = True
-            self._push_log(
-                f"Reconcile active trades on start failed: {exc}", level="error"
-            )
-
-        self._reconciliation_pending = (
-            self._reconciliation_pending or risk_reconcile_failed
-        )
-
+        if not self._supervision_active:
+            scanner.last_scanned_candle.clear()
+        scanner.last_analysis_candle.clear()
+        # Pin read-only mode for this run. Recovery completing or the market
+        # reopening must not silently promote historical analysis to trading.
+        scan_only = bool(self._entry_block_reasons())
+        with self._trade_lock:
+            if control_version == self._entry_control_version:
+                self._scan_only = scan_only
+                self._entry_stop.clear()
+                self.running = True
         self._activate_supervision()
-
-        scanner.last_scanned_candle.clear()
-        self._entry_stop.clear()
-        self.running = not (
-            self._protection_failure_halt
-            or self._hard_flatten_reason
-            or getattr(risk_manager, "kill_switch_active", False)
-            or self._reconciliation_pending
-            or self._lifecycle_recovery_pending
-            or self._control_state_invalid
-            or control_version != self._entry_control_version
-        )
         if self.running and (not self.thread or not self.thread.is_alive()):
             self.thread = threading.Thread(target=self._run_loop)
             self.thread.daemon = True
             self.thread.start()
-        elif not self.running:
+        if self._scan_only and self.running:
             self._push_log(
-                "Entry start acknowledged, but entries remain paused pending "
-                "reconciliation/protection recovery. Supervision is active.",
-                level="warning",
+                "Agent started in scan-only mode using the latest available completed "
+                "candles. New entries are disabled; position supervision remains active."
             )
         self._push_state_update()
         self._push_log(f"Trading engine entry mode set to {mode}")
         return self.status()
 
-    def stop(self) -> dict:
+    def stop(self, reason: str = "pause requested by user") -> dict:
         """Pause new entries; never relinquish existing risk supervision."""
 
-        self.running = False
-        self._entry_control_version += 1
-        self._entry_stop.set()
+        with self._trade_lock:
+            self.running = False
+            self._scan_only = False
+            self._entry_control_version += 1
+            self._entry_stop.set()
+            self._entry_pause_reason = reason
         self._push_state_update()
-        self._push_log("New entries paused; position supervision remains active")
+        self._log_entry_pause()
         return self.status()
 
     def set_mode(self, mode: str) -> dict:
@@ -3842,7 +4135,9 @@ class TradingEngine:
         return self.status()
 
     def status(self) -> dict:
-        entry_paused = not self.running
+        reasons = self._entry_block_reasons()
+        scan_only = self.running and self._scan_only
+        entry_paused = not self.running or scan_only or bool(reasons)
         if self.running:
             state = "scanning"
         elif self._supervision_active:
@@ -3852,7 +4147,21 @@ class TradingEngine:
         return {
             "running": self.running,
             "mode": self.mode,
-            "effectiveMode": self.mode if self.running else "paused",
+            "effectiveMode": "scan_only"
+            if scan_only
+            else self.mode
+            if self.running
+            else "paused",
+            "scanOnly": scan_only,
+            "entryBlockReasons": reasons,
+            "statusMessage": (
+                "Scanning latest available completed candles. New entries are disabled "
+                "for this run; stop and start the agent to recheck trading eligibility."
+                if scan_only
+                else self._pause_message(reasons)
+                if not self.running
+                else ""
+            ),
             "entryPaused": entry_paused,
             "supervisionActive": self._supervision_active,
             "status": state,
@@ -3874,14 +4183,7 @@ class TradingEngine:
             "event": "agent:state-update",
             "data": {
                 **self.status(),
-                "running": self.running,
-                "mode": self.mode,
                 "status": status,
-                "effectiveMode": self.mode if self.running else "paused",
-                "entryPaused": not self.running,
-                "supervisionActive": self._supervision_active,
-                "protectionFailureHalt": self._protection_failure_halt,
-                "reconciliationPending": self._reconciliation_pending,
             },
         }
         with _stdout_lock:
@@ -3986,6 +4288,10 @@ class TradingEngine:
 
     def scan_and_trade(self):
         can_trade, reason = risk_manager.can_trade()
+        entry_allowed, entry_reason = self._entry_admission_allowed()
+        if not entry_allowed:
+            can_trade, reason = False, entry_reason
+        analysis_only = not can_trade
         if not can_trade:
             if not getattr(self, "_notified_cannot_trade", False):
                 self._push_log(
@@ -4070,7 +4376,10 @@ class TradingEngine:
                 with batch_lock:
                     batch_signals.append(signal)
 
-        scanner.scan_watchlist(list(universe), on_signal=handle_new_signal)
+        scan_options = {"analysis_only": True} if analysis_only else {}
+        scanner.scan_watchlist(
+            list(universe), on_signal=handle_new_signal, **scan_options
+        )
         for signal in ordered_entry_signals(batch_signals, universe):
             probability = signal.get("estimated_probability")
             if (
@@ -4118,6 +4427,14 @@ class TradingEngine:
     def _execute_signal_inner(self, signal: dict):
         """Core execution logic. Called with the symbol reserved in _pending_entries."""
         symbol = signal["tradingsymbol"]
+        if signal.get("analysisOnly") or (signal.get("market_context") or {}).get(
+            "analysis_only"
+        ):
+            self._push_log(
+                f"Entry rejected for {symbol}: scan-only signals cannot be traded",
+                level="warning",
+            )
+            return False
         entry_allowed, entry_reason = self._entry_admission_allowed()
         if not entry_allowed:
             self._push_log(
