@@ -229,7 +229,7 @@ def test_operator_close_manages_untracked_position_in_confirm_mode(controls, par
     assert len(env.sdk.calls) == (2 if partial else 1)
 
 
-def test_account_flatten_manages_same_symbol_products_sequentially(controls):
+def test_account_flatten_manages_same_symbol_products_independently(controls):
     env = controls
     open_managed_position(env)
     cnc = deepcopy(env.sdk.position_rows[0])
@@ -248,13 +248,13 @@ def test_account_flatten_manages_same_symbol_products_sequentially(controls):
     assert env.sdk.calls[-1]["product"] == "MIS"
     assert env.sdk.calls[-1]["quantity"] == 10
     assert not env.engine.active_trades["RELIANCE"].get("ownership_quarantined")
-    fill_reduction(env, "O3")
-    env.engine.monitor_positions()
-    env.engine.monitor_positions()
-    assert env.sdk.calls[-1]["product"] == "CNC"
-    assert env.sdk.calls[-1]["quantity"] == 3
-    assert len(env.sdk.calls) == 4
+    assert env.sdk.calls[-2]["product"] == "CNC"
+    assert env.sdk.calls[-2]["quantity"] == 3
     fill_reduction(env, "O4")
+    env.engine.monitor_positions()
+    env.engine.monitor_positions()
+    assert len(env.sdk.calls) == 4
+    fill_reduction(env, "O3")
     for _ in range(3):
         env.engine.monitor_positions()
     assert env.engine.active_trades == {}

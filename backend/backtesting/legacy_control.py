@@ -265,22 +265,7 @@ class LegacyControlRunner(CandidateRunner):
             }
             self.legacy_records.append(record)
             if reason:
-                response = self.coordinator.handoff_with_broker_adapter(
-                    broker=self.broker,
-                    position_key=managed.broker_position_key,
-                    role=OrderRole.REDUCTION,
-                    side="SELL" if long else "BUY",
-                    requested_quantity=position["quantity"],
-                    payload={
-                        "tradingsymbol": symbol,
-                        "timestamp": at.isoformat(),
-                        "reason": reason,
-                        "role": OrderRole.REDUCTION.value,
-                    },
-                    stop_order_id=position.get("stop_order_id"),
-                    reason=reason,
-                    hard=False,
-                )
+                response = self._submit_reduction(symbol, at, reason)
                 managed.coordinator_intent_id = response.intent_id
                 managed.state = reduce_lifecycle(
                     managed.state,

@@ -5,6 +5,7 @@ import uuid
 from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, replace
+from functools import wraps
 from typing import Any, Dict, Optional, Tuple
 
 import pandas as pd
@@ -97,9 +98,19 @@ class _ExposureState:
     marks: Dict[Tuple[str, ...], float]
 
 
+def _serialized_account_state(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._admission_lock:
+            return method(self, *args, **kwargs)
+
+    return wrapped
+
+
 class RiskManager:
     def __init__(self, *, dependencies: Optional[RiskDependencies] = None):
         self._dependencies = dependencies
+        self._risk_scope = None
         self._accounting = (
             dependencies.accounting if dependencies else accounting_service
         )
@@ -123,6 +134,34 @@ class RiskManager:
         self._entry_reservations: Dict[str, EntryReservation] = {}
 
         self._load_state()
+
+    def bind_account(self, namespace, account_id):
+        """Select verified account memory before enabling any supervision."""
+        if self._dependencies:
+            return
+        namespace = getattr(namespace, "value", namespace)
+        if not namespace or account_id in (None, "", "UNKNOWN"):
+            raise ValueError("risk state requires a verified account")
+        scope = (str(namespace), str(account_id))
+        with self._admission_lock:
+            if self._risk_scope == scope:
+                return
+            if self._risk_scope is not None:
+                self._save_state()
+            self._risk_scope = scope
+            self.date_str = self._exchange_now().date().isoformat()
+            self.win_count = self.loss_count = self.open_positions = 0
+            self._entry_reservations.clear()
+            self._correlation_cache.clear()
+            self._last_corr_date = None
+            self._load_state()
+
+    def journal_scope(self):
+        return (
+            {"namespace": self._risk_scope[0], "account_id": self._risk_scope[1]}
+            if self._risk_scope
+            else {}
+        )
 
     @classmethod
     def for_research(
@@ -211,12 +250,16 @@ class RiskManager:
             return counts
         from .journal import journal
 
-        return journal.get_todays_trade_counts()
+        return journal.get_todays_trade_counts(**self.journal_scope())
 
     def _validate_snapshot_scope(self, snapshot: BrokerSnapshot) -> None:
         if not self._dependencies:
-            return
-        if snapshot.namespace is ExecutionNamespace.LIVE:
+            if self._risk_scope and self._risk_scope != (
+                snapshot.namespace.value,
+                snapshot.account_id,
+            ):
+                raise ValueError("risk snapshot belongs to another account")
+        if self._dependencies and snapshot.namespace is ExecutionNamespace.LIVE:
             raise ValueError("isolated risk cannot consume a LIVE broker snapshot")
         for item in (
             *snapshot.positions,
@@ -228,9 +271,7 @@ class RiskManager:
                 item.key.namespace is not snapshot.namespace
                 or item.key.account_id != snapshot.account_id
             ):
-                raise ValueError(
-                    "isolated snapshot contains another account or namespace"
-                )
+                raise ValueError("snapshot contains another account or namespace")
 
     def _snapshot_entry_ready(self, snapshot: BrokerSnapshot) -> bool:
         self._validate_snapshot_scope(snapshot)
@@ -242,6 +283,10 @@ class RiskManager:
             if self._dependencies
             else config_manager.load_daily_risk_state()
         )
+        if not self._dependencies and self._risk_scope:
+            key = config_manager._operator_state_key(*self._risk_scope)
+            session = state.get("active_sessions", {}).get(key)
+            state = state.get("scopes", {}).get(key, {}).get(session, {})
         if state:
             # A restart after midnight is not evidence that yesterday's
             # exposure/flatten orders are terminal. Retain the old session
@@ -287,7 +332,9 @@ class RiskManager:
         if self._dependencies:
             self._dependencies.save_state(state)
         else:
-            config_manager.save_daily_risk_state(state)
+            if self._risk_scope:
+                state.update(self.journal_scope())
+                config_manager.save_daily_risk_state(state)
 
     def rotate_session_if_verified(
         self,
@@ -422,6 +469,7 @@ class RiskManager:
             return True
         return False
 
+    @_serialized_account_state
     def reconcile_state(self, snapshot: Optional[BrokerSnapshot] = None):
         if snapshot is None:
             if self._dependencies:
@@ -433,6 +481,7 @@ class RiskManager:
             snapshot = kite_client.get_broker_snapshot()
         from .utils import push_log
 
+        self._validate_snapshot_scope(snapshot)
         self._apply_conservative_hard_loss(
             snapshot.day_positions,
             snapshot.positions_fetched_at or snapshot.fetched_at,
@@ -614,12 +663,34 @@ class RiskManager:
             return time_to_square_off or max_loss_hit
         return False
 
-    def update_from_position_snapshot(self, snapshot: PositionSnapshot):
+    def _validate_position_scope(self, snapshot: PositionSnapshot):
+        if self._risk_scope and any(
+            (item.key.namespace.value, item.key.account_id) != self._risk_scope
+            for item in (*snapshot.net, *snapshot.day)
+        ):
+            raise ValueError("risk positions belong to another account")
         if self._dependencies and any(
             item.key.namespace is ExecutionNamespace.LIVE
             for item in (*snapshot.net, *snapshot.day)
         ):
             raise ValueError("isolated risk cannot consume LIVE positions")
+
+    @_serialized_account_state
+    def observe_position_risk(self, snapshot: PositionSnapshot):
+        """Latch fresh hard-loss evidence without promoting estimated fees."""
+        self._validate_position_scope(snapshot)
+        self.reconciliation_status = "RECONCILIATION_STALE"
+        if self._apply_conservative_hard_loss(
+            snapshot.day,
+            snapshot.fetched_at,
+            positions_complete=snapshot.quality is SnapshotQuality.COMPLETE,
+        ):
+            self._save_state()
+
+    @_serialized_account_state
+    def update_from_position_snapshot(self, snapshot: PositionSnapshot):
+        self._validate_position_scope(snapshot)
+        self.reconciliation_status = "RECONCILIATION_STALE"
         self._apply_conservative_hard_loss(
             snapshot.day,
             snapshot.fetched_at,
@@ -658,6 +729,7 @@ class RiskManager:
         )
         self._save_state()
 
+    @_serialized_account_state
     def update_from_broker_snapshot(self, snapshot: BrokerSnapshot) -> None:
         """Refresh risk from one cumulative, order-grouped broker snapshot."""
 

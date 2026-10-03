@@ -162,12 +162,15 @@ def _verify_candidate_account(candidate):
 
 def _install_candidate_session(candidate, access_token, account_id):
     trading_engine.stop(reason="broker session is being restored")
-    # Both the old and candidate connections have the same verified account.
-    # Do not call init()/set_access_token(): those clear account_id to UNKNOWN
-    # while the risk worker can still be reading the shared client.
-    kite_client.kite = candidate
-    kite_client.access_token = access_token
-    kite_client.account_id = account_id
+    # Bind risk and operator memory with the verified connection. This covers
+    # both a session refresh and a settled account switch after logout.
+    with trading_engine._trade_lock:
+        risk_manager.bind_account(kite_client.namespace, account_id)
+        kite_client.kite = candidate
+        kite_client.access_token = access_token
+        kite_client.account_id = account_id
+        trading_engine._load_control_state()
+        trading_engine._last_positions = []
 
 
 def handle_request(req):

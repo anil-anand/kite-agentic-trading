@@ -31,6 +31,7 @@ from ..broker_models import (
     PositionSnapshot,
     SnapshotQuality,
 )
+from ..reduction_policy import ReductionOrderPolicy
 from ..trading_costs import TradingCostCalculator, cost_calculator
 
 
@@ -1035,6 +1036,15 @@ class SimulatedBroker:
         side = payload.get("transaction_type") or payload.get("side")
         symbol = str(payload["tradingsymbol"])
         role = OrderRole(str(payload.get("role", "REDUCTION")).upper())
+        if role is OrderRole.REDUCTION and payload.get("reduction_policy"):
+            payload = {
+                **payload,
+                **ReductionOrderPolicy(**payload["reduction_policy"]).order_fields(
+                    side=side,
+                    mark=payload.get("last_price"),
+                    market_required=payload.get("market_required", False),
+                ),
+            }
         order_type = str(payload.get("order_type", "MARKET")).upper()
         if order_type == "SL-LIMIT":
             order_type = "SL"

@@ -336,7 +336,6 @@ class TradeAnalytics:
         managed = journal.get_managed_position_for_trade(trade_id)
         checkpoint = (managed or {}).get("state") or {}
         counters = checkpoint.get("counters") or {}
-        extrema = checkpoint.get("extrema") or {}
         management = counters.get("exit_policy") or {}
         intents = (
             journal.get_position_order_intents(managed["position_key"])
@@ -426,6 +425,33 @@ class TradeAnalytics:
         exposure_path = self._retained_exposure_path(
             journal, managed, thesis, decisions
         )
+        if trade.get("status") == "CLOSED":
+            allocated_entry = sum(
+                fill["quantity"]
+                for fill in fills
+                if fill["side"] == trade.get("direction")
+            )
+            allocated_exit = sum(
+                fill["quantity"]
+                for fill in fills
+                if fill["side"] != trade.get("direction")
+            )
+            if (
+                allocated_entry != binding.get("filled_quantity")
+                or allocated_exit != allocated_entry
+            ):
+                exposure_path = []
+        # Checkpoint extrema may include ticks received after the actual exit
+        # but before local flatness. Only timed, fill-bounded samples are final.
+        price_path = [
+            {
+                "timestamp": point["timestamp"],
+                "high": point["mark_price"],
+                "low": point["mark_price"],
+            }
+            for point in exposure_path
+            if point.get("mark_price") is not None
+        ]
         result = calculate_exit_quality(
             direction=str(trade.get("direction") or ""),
             entry_price=binding.get("entry_vwap"),
@@ -434,12 +460,7 @@ class TradeAnalytics:
             realized_gross=trade.get("gross_pnl"),
             realized_net=trade.get("net_pnl"),
             exposure_path=exposure_path,
-            observed_mfe_r=management.get(
-                "observed_mfe_r", extrema.get("observed_mfe_r")
-            ),
-            observed_mae_r=management.get(
-                "observed_mae_r", extrema.get("observed_mae_r")
-            ),
+            price_path=price_path,
             entry_at=trade.get("entry_time"),
             decision_at=initiating.get("occurred_at"),
             intent_at=(reduction or {}).get("created_at"),
@@ -451,6 +472,9 @@ class TradeAnalytics:
             quality=financial_quality,
         )
         counters = (managed or {}).get("state", {}).get("counters", {})
+        result["coverage"]["excursion_coverage"] = (
+            "PARTIAL_FILL_BOUNDED_OBSERVATIONS" if price_path else "UNAVAILABLE"
+        )
         result["coverage"]["entry_excursion_coverage"] = counters.get(
             "entry_excursion_coverage", "INCOMPLETE"
         )
@@ -588,7 +612,10 @@ class TradeAnalytics:
                 path.append({})
                 continue
             filled = [item for item in reductions if item[0] <= at]
-            residual = quantity - sum(item[1] for item in filled)
+            entered = [item for item in entries if item[0] <= at]
+            residual = sum(item[1] for item in entered) - sum(
+                item[1] for item in filled
+            )
             if residual <= 0 or residual != actual.get("known_quantity"):
                 path.append({})
                 continue
@@ -605,10 +632,15 @@ class TradeAnalytics:
         # During partial entry, quantity is reconstructed from actual timed
         # executions. Price-path R still uses the immutable final VWAP/R; cash
         # excursion uses only capital that was exposed at each observation.
-        observations = (
-            (managed.get("state") or {})
-            .get("counters", {})
-            .get("entry_quote_observations", [])
+        observations = list(
+            (
+                (managed.get("state") or {})
+                .get("counters", {})
+                .get("entry_quote_observations", [])
+            )
+        )
+        observations.extend(
+            journal.get_position_quote_observations(managed["position_key"])
         )
         for observation in observations:
             at = as_utc(observation.get("observed_at"))

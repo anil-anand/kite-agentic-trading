@@ -106,10 +106,17 @@ def persisted_risk(monkeypatch):
         "kill_switch_active": True,
         "reconciliation_status": "RECONCILED",
     }
-    monkeypatch.setattr(config_manager, "load_daily_risk_state", lambda: dict(state))
+    key = config_manager._operator_state_key("LIVE", "acct-A")
+    document = {
+        "scopes": {key: {state["date"]: state}},
+        "active_sessions": {key: state["date"]},
+    }
+    monkeypatch.setattr(config_manager, "load_daily_risk_state", lambda: document)
     monkeypatch.setattr(config_manager, "save_daily_risk_state", state.update)
     monkeypatch.setattr(rm, "get_ist_now", lambda: session().exchange_time)
-    return RiskManager(), state
+    manager = RiskManager()
+    manager.bind_account("LIVE", "acct-A")
+    return manager, state
 
 
 def test_next_day_restart_preserves_previous_loss_latch(persisted_risk):

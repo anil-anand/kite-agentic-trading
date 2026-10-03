@@ -403,7 +403,8 @@ def test_paper_spools_complete_history_and_keeps_exact_pending_intent_links(tmp_
     linked = [row for row in report["intents"] if row["origin"] == "CANDIDATE"]
     assert len(linked) == 1
     assert len(linked[0]["decision_ids"]) == 16
-    assert len(linked[0]["order_ids"]) == 1
+    # The first working market attempt hits the shared 15-second deadline.
+    assert len(linked[0]["order_ids"]) == 2
     assert len(report["fills"]) == 2
     assert not report["censored_positions"]
     events = list(session.recorder.events)

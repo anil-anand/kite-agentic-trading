@@ -72,7 +72,11 @@ def test_confirmed_failure_dispatches_once_then_partial_fills_reconcile(tmp_path
         _event(runner, index, 100)
     assert runner.positions[SYMBOL].state.exposure is ExposureState.CLOSED
     reductions = [o for o in runner.broker.orders.values() if o["role"] == "REDUCTION"]
-    assert len(reductions) == 1
+    # Each timed-out residual is cancelled before its MARKET replacement.
+    assert [order["quantity"] for order in reductions] == [10, 5, 3, 2, 1]
+    assert reductions[0]["order_type"] == "LIMIT"
+    assert all(order["order_type"] == "MARKET" for order in reductions[1:])
+    assert all(order["status"] == "CANCELLED" for order in reductions[:-1])
     assert runner.broker.trades[0]["exit_reason"] == "THESIS_BREAKOUT_FAILED"
     assert runner.broker.cash == pytest.approx(
         runner.broker.initial_capital + runner.broker.trades[0]["net_pnl"]

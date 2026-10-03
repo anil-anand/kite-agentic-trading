@@ -1,4 +1,5 @@
 import math
+import threading
 import uuid
 from dataclasses import replace
 from datetime import datetime
@@ -43,6 +44,10 @@ class KiteClient:
             cls._instance.access_token = None
             cls._instance.account_id = "UNKNOWN"
             cls._instance.namespace = ExecutionNamespace.LIVE
+            cls._instance._quote_read_lock = threading.Lock()
+            cls._instance._quote_read = None
+            cls._instance._accounting_fill_lock = threading.Lock()
+            cls._instance._accounting_fill_read = None
         return cls._instance
 
     def init(self, api_key: str):
@@ -92,12 +97,13 @@ class KiteClient:
         if not self.kite:
             return unavailable_position_snapshot("Kite client is not initialized")
         try:
+            namespace, account_id = self.namespace, self.account_id
             priority = Priority.CRITICAL if critical else Priority.RECONCILE
             res = broker_gateway.execute(self.kite.positions, priority=priority)
             snapshot = normalize_positions_response(
                 res,
-                namespace=self.namespace,
-                account_id=self.account_id,
+                namespace=namespace,
+                account_id=account_id,
             )
             return self._attach_timestamped_marks(snapshot, critical=critical)
         except Exception as exc:
@@ -121,14 +127,37 @@ class KiteClient:
             f"{position.key.exchange}:{position.key.tradingsymbol}"
             for position in positions
         ]
-        try:
-            quotes = (
-                self.get_quote(instruments, critical=True)
-                if critical
-                else self.get_quote(instruments)
-            )
-        except Exception:
+        # Quotes enrich valuation, but must never hold up position supervision.
+        # One bounded, in-flight read prevents a stuck endpoint from accumulating
+        # workers. Keep its account scope so a session change cannot reuse marks.
+        scope = (self.namespace, self.account_id, self.access_token)
+        with self._quote_read_lock:
+            pending = self._quote_read
+            if pending is None:
+                pending = {"done": threading.Event(), "scope": scope}
+                self._quote_read = pending
+
+                def fetch():
+                    try:
+                        pending["result"] = (
+                            self.get_quote(instruments, critical=True)
+                            if critical
+                            else self.get_quote(instruments)
+                        )
+                    except Exception:
+                        pending["result"] = None
+                    finally:
+                        pending["done"].set()
+
+                threading.Thread(target=fetch, daemon=True).start()
+        if not pending["done"].wait(0.05):
             return snapshot
+        with self._quote_read_lock:
+            if self._quote_read is pending:
+                self._quote_read = None
+        if pending["scope"] != scope:
+            return snapshot
+        quotes = pending.get("result")
         if not isinstance(quotes, dict):
             return snapshot
         enriched = []
@@ -179,12 +208,13 @@ class KiteClient:
         if not self.kite:
             return unavailable_order_snapshot("Kite client is not initialized")
         try:
+            namespace, account_id = self.namespace, self.account_id
             priority = Priority.CRITICAL if critical else Priority.RECONCILE
             res = broker_gateway.execute(self.kite.orders, priority=priority)
             return normalize_orders_response(
                 res,
-                namespace=self.namespace,
-                account_id=self.account_id,
+                namespace=namespace,
+                account_id=account_id,
                 roles_by_order_id=config_manager.get_app_order_roles(),
             )
         except Exception as exc:
@@ -254,12 +284,13 @@ class KiteClient:
         if not self.kite:
             return unavailable_fill_snapshot("Kite client is not initialized")
         try:
+            namespace, account_id = self.namespace, self.account_id
             priority = Priority.CRITICAL if critical else Priority.RECONCILE
             res = broker_gateway.execute(self.kite.trades, priority=priority)
             return normalize_fills_response(
                 res,
-                namespace=self.namespace,
-                account_id=self.account_id,
+                namespace=namespace,
+                account_id=account_id,
             )
         except Exception as exc:
             return unavailable_fill_snapshot(exc)
@@ -270,7 +301,30 @@ class KiteClient:
     def get_broker_snapshot(self, *, critical: bool = False) -> BrokerSnapshot:
         positions = self.get_positions_snapshot(critical=critical)
         orders = self.get_current_orders_snapshot(critical=critical)
-        fills = self.get_fills_snapshot(critical=critical)
+        # Startup/account reconciliation also must finish with degraded facts
+        # when history is blocked, so protection supervision can start.
+        with self._accounting_fill_lock:
+            pending = self._accounting_fill_read
+            if pending is None:
+                pending = {"done": threading.Event()}
+                self._accounting_fill_read = pending
+
+                def fetch():
+                    try:
+                        pending["result"] = self.get_fills_snapshot(critical=critical)
+                    except Exception as exc:
+                        pending["result"] = unavailable_fill_snapshot(exc)
+                    finally:
+                        pending["done"].set()
+
+                threading.Thread(target=fetch, daemon=True).start()
+        if pending["done"].wait(0.1):
+            fills = pending["result"]
+            with self._accounting_fill_lock:
+                if self._accounting_fill_read is pending:
+                    self._accounting_fill_read = None
+        else:
+            fills = unavailable_fill_snapshot("fill history read is pending")
         return BrokerSnapshot(
             namespace=self.namespace,
             account_id=self.account_id,

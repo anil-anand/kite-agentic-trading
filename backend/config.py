@@ -569,9 +569,20 @@ class ConfigManager:
         return trades
 
     def save_daily_risk_state(self, state: dict):
-        """Persist the daily risk state to disk."""
+        """Persist independent account/session records without adopting legacy state."""
         path = self.config_dir / "daily_risk_state.json"
-        self._atomic_write_json(path, state)
+        namespace, account = state.get("namespace"), state.get("account_id")
+        with self._state_file_lock:
+            if namespace and account and account != "UNKNOWN":
+                document = self.load_daily_risk_state()
+                key = self._operator_state_key(namespace, account)
+                document.setdefault("scopes", {}).setdefault(key, {})[state["date"]] = (
+                    deepcopy(state)
+                )
+                document.setdefault("active_sessions", {})[key] = state["date"]
+                self._atomic_write_json(path, document)
+            else:
+                self._atomic_write_json(path, state)
 
     def load_daily_risk_state(self) -> dict:
         """Load persisted daily risk state."""

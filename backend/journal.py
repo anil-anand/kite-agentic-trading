@@ -21,7 +21,11 @@ from backend.exit_management.models import (
     PositionState,
     thaw,
 )
-from backend.exit_management.thesis import EntryThesis, ThesisBindingStatus
+from backend.exit_management.thesis import (
+    EntryThesis,
+    ThesisBindingStatus,
+    bind_terminal_fill,
+)
 from backend.financial_eligibility import verified_outcome_sql
 from backend.time_utils import EXCHANGE_TIMEZONE, as_utc, now_utc
 
@@ -865,6 +869,26 @@ class TradeJournal:
             ).fetchone()
         )
 
+    def get_position_quote_observations(
+        self, position_key: str
+    ) -> List[Dict[str, Any]]:
+        """Return retained timestamped samples, including pre-reconciliation ticks."""
+        rows = (
+            self._get_conn()
+            .execute(
+                "SELECT details FROM position_lifecycle_events WHERE position_key = ? "
+                "AND event_type IN ('QUOTE_EXTREMA_OBSERVED', 'ENTRY_QUOTES_OBSERVED') "
+                "ORDER BY sequence",
+                (position_key,),
+            )
+            .fetchall()
+        )
+        return [
+            sample
+            for row in rows
+            for sample in json.loads(row["details"]).get("observations", [])
+        ]
+
     def get_position_lifecycle_event(self, event_id: str) -> Optional[Dict[str, Any]]:
         """Find a previously committed source event across later checkpoints."""
         conn = self._get_conn()
@@ -1002,15 +1026,27 @@ class TradeJournal:
             "WHERE thesis_id = ? AND revision = ?",
             (thesis.thesis_id, current_revision),
         ).fetchone()
-        if (
-            current is None
-            or current["binding_status"] != ThesisBindingStatus.DRAFT.value
-        ):
-            raise ValueError("a terminal fill binding cannot replace a bound thesis")
+        if current is None:
+            raise ValueError("current entry thesis is unavailable")
         draft = self._decode_exit_payload(current["payload"])
         if draft is None or self._exit_payload_hash(draft) != current["payload_hash"]:
             raise ValueError("cannot bind a corrupt entry thesis")
-        draft = EntryThesis.from_dict(draft).to_dict()
+        original = EntryThesis.from_dict(draft)
+        if original.binding_status is ThesisBindingStatus.BOUND:
+            binding = thesis.fill_binding
+            repaired = bind_terminal_fill(
+                original,
+                entry_vwap=binding.entry_vwap,
+                filled_quantity=binding.filled_quantity,
+                terminal_at=binding.entry_terminal_at,
+                first_fill_at=binding.entry_first_fill_at,
+                source_fill_ids=binding.source_fill_ids,
+            )
+            if repaired != thesis:
+                raise ValueError(
+                    "bound thesis permits only missing execution provenance repair"
+                )
+        draft = original.to_dict()
         binding_fields = {
             "revision",
             "binding_status",
@@ -3433,7 +3469,9 @@ class TradeJournal:
         )
         return [dict(row) for row in cursor.fetchall()]
 
-    def get_todays_trade_counts(self) -> Dict[str, Any]:
+    def get_todays_trade_counts(
+        self, *, namespace=None, account_id=None
+    ) -> Dict[str, Any]:
         """Count entries by execution day, or observation day while time is unknown.
 
         Missing execution time does not release a consumed admission slot. The
@@ -3456,7 +3494,10 @@ class TradeJournal:
             SELECT tradingsymbol, entry_time, entry_observed_at, entry_order_id
             FROM trades
             WHERE COALESCE(entry_time, entry_observed_at) IS NOT NULL
-        """
+              AND (? IS NULL OR namespace = ?)
+              AND (? IS NULL OR account_id = ?)
+        """,
+            (namespace, namespace, account_id, account_id),
         )
 
         counts = {"total": 0, "by_symbol": {}, "entry_order_ids": set()}
@@ -3475,14 +3516,18 @@ class TradeJournal:
 
         return counts
 
-    def get_last_exit_time(self, symbol: str) -> Optional[datetime]:
+    def get_last_exit_time(
+        self, symbol: str, *, namespace=None, account_id=None
+    ) -> Optional[datetime]:
         """Returns the last time a trade was exited for a given symbol."""
         conn = self._get_conn()
         unresolved = conn.execute(
             """SELECT 1 FROM trades WHERE tradingsymbol = ?
                AND status IN ('CLOSED', 'RECONCILIATION_PENDING')
-               AND exit_time IS NULL LIMIT 1""",
-            (symbol,),
+               AND exit_time IS NULL
+               AND (? IS NULL OR namespace = ?)
+               AND (? IS NULL OR account_id = ?) LIMIT 1""",
+            (symbol, namespace, namespace, account_id, account_id),
         ).fetchone()
         if unresolved:
             raise ValueError(f"Exit execution time unresolved for {symbol}")
@@ -3490,8 +3535,10 @@ class TradeJournal:
             """
             SELECT exit_time FROM trades
             WHERE tradingsymbol = ? AND exit_time IS NOT NULL
+              AND (? IS NULL OR namespace = ?)
+              AND (? IS NULL OR account_id = ?)
             """,
-            (symbol,),
+            (symbol, namespace, namespace, account_id, account_id),
         )
         normalized = []
         for row in cursor.fetchall():

@@ -42,14 +42,17 @@ class FakeJournal:
         self._by_symbol = by_symbol or {}
         self._last_exit = last_exit
 
-    def get_todays_trade_counts(self):
+    def get_todays_trade_counts(self, *, namespace, account_id):
         return {"total": self._total, "by_symbol": self._by_symbol}
 
-    def get_last_exit_time(self, symbol):
+    def get_last_exit_time(self, symbol, *, namespace, account_id):
         return self._last_exit
 
 
 class FakeKite:
+    namespace = "LIVE"
+    account_id = "gateway-test"
+
     def place_order(self, **kwargs):
         return "12345"
 

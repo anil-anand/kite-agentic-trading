@@ -16,6 +16,7 @@ from .accounting import accounting_service
 from .broker_models import (
     BrokerFill,
     BrokerPositionKey,
+    BrokerSnapshot,
     ExecutionNamespace,
     OrderRole,
     OrderSubmissionRejected,
@@ -50,6 +51,7 @@ from .exit_management.thesis import (
 from .journal import journal
 from .kite_client import kite_client
 from .order_lifecycle import AttemptState, IntentType, OrderLifecycleCoordinator
+from .reduction_policy import ReductionOrderPolicy
 from .risk_manager import risk_manager
 from .risk_rules import (
     HardRiskAction,
@@ -61,6 +63,7 @@ from .risk_rules import (
 )
 from .scan_progress import ScanProgress
 from .scanner import scanner
+from .scoped_reductions import ScopedReductions
 from .session_clock import SessionClock, SessionPolicy
 from .time_utils import EXCHANGE_TIMEZONE, as_utc, now_utc
 from .utils import DateTimeEncoder
@@ -118,6 +121,11 @@ class TradingEngine:
         self.mode = "auto"  # auto or confirm
         self.interval = 60  # seconds
         self.active_trades = {}  # tradingsymbol -> { sl, target, direction, entry_price, entry_time, original_strategy, stop_order_id, exit_pending, exit_order_id }
+        self._scoped_reductions = ScopedReductions(
+            self,
+            submit_order=lambda **kwargs: execution_gateway.place_order(**kwargs),
+            current_scope=self._current_broker_scope,
+        )
         self._instrument_map = {}  # cached symbol -> instrument_token map
         self._entry_fill_timeout_seconds = 15
         self._entry_fill_poll_seconds = 1
@@ -322,11 +330,27 @@ class TradingEngine:
                 self._fill_read = None
         return pending["result"]
 
-    def _broker_snapshot(self, *, critical: bool = True):
-        try:
-            return kite_client.get_broker_snapshot(critical=critical)
-        except TypeError:
-            return kite_client.get_broker_snapshot()
+    def _broker_snapshot(self, *, critical: bool = True, positions=None):
+        """Compose essential facts with a bounded optional fill-history read."""
+        positions = positions or self._position_snapshot(critical=critical)
+        orders = self._order_snapshot(critical=critical)
+        fills = self._fill_snapshot()
+        return BrokerSnapshot(
+            namespace=getattr(kite_client, "namespace", ExecutionNamespace.LIVE),
+            account_id=getattr(kite_client, "account_id", "UNKNOWN"),
+            positions=positions.net,
+            day_positions=positions.day,
+            current_orders=orders.orders,
+            fills=fills.fills,
+            positions_quality=positions.quality,
+            orders_quality=orders.quality,
+            fills_quality=fills.quality,
+            fetched_at=max(positions.fetched_at, orders.fetched_at, fills.fetched_at),
+            errors=positions.errors + orders.errors + fills.errors,
+            positions_fetched_at=positions.fetched_at,
+            orders_fetched_at=orders.fetched_at,
+            fills_fetched_at=fills.fetched_at,
+        )
 
     def _positions(self, *, critical: bool = True) -> list:
         snapshot = self._position_snapshot(critical=critical).require_complete()
@@ -584,6 +608,66 @@ class TradingEngine:
         )
         self._managed_position_states[position_key] = state
         self._capture_operational_position(position_key)
+
+    @_best_effort_exit_observation
+    @_serialized_exit_state
+    def _repair_phase5_entry_provenance(self, position_key, *, trade, fills):
+        thesis = self._phase5_thesis_for(position_key)
+        binding = thesis.fill_binding if thesis else None
+        if binding is None or (
+            binding.entry_terminal_at and binding.entry_first_fill_at
+        ):
+            return
+        entry_id = trade.get("entry_order_id")
+        order = self._find_order(entry_id) if entry_id else None
+        if (
+            not order
+            or order.get("status") not in self._TERMINAL_ORDER_STATUSES
+            or not self._trade_matches_position(trade, order)
+            or order.get("transaction_type") != thesis.direction
+        ):
+            return
+        selected = [
+            fill
+            for fill in fills
+            if fill.broker_order_id == entry_id
+            and fill.key.as_string() == position_key.rsplit(":", 1)[0]
+            and fill.side == thesis.direction
+        ]
+        projection = accounting_service.project_fills(selected)
+        if (
+            projection.quantity != binding.filled_quantity
+            or int(order.get("filled_quantity", 0)) != binding.filled_quantity
+        ):
+            return
+        repaired = bind_terminal_fill(
+            thesis,
+            entry_vwap=projection.vwap,
+            filled_quantity=projection.quantity,
+            source_fill_ids=tuple(fill.broker_fill_id for fill in selected),
+            first_fill_at=self._entry_execution_time(selected),
+            terminal_at=order.get("exchange_timestamp"),
+        )
+        if repaired == thesis:
+            return
+        state = self._phase5_state_for(position_key)
+        event_id = f"entry-provenance:{entry_id}:{repaired.revision}"
+        self._commit_phase5_checkpoint(
+            position_key=position_key,
+            state=reduce_lifecycle(
+                state,
+                LifecycleEvent.STATE_OBSERVED,
+                event_id=event_id,
+                occurred_at=now_utc(),
+            ),
+            event_id=event_id,
+            event_type="ENTRY_EXECUTION_METADATA_REPAIRED",
+            details={
+                "previous_revision": thesis.revision,
+                "binding": repaired.fill_binding.to_dict(),
+            },
+            bound_thesis=repaired,
+        )
 
     @_best_effort_exit_observation
     @_serialized_exit_state
@@ -2217,6 +2301,8 @@ class TradingEngine:
                 )
                 return
 
+        if trade.get("exit_management_position_key") == position_key:
+            self._repair_phase5_entry_provenance(position_key, trade=trade, fills=fills)
         self._capture_operational_position(position_key)
 
     def _owned_lifecycle_order_ids(self, position_key: str, trade: dict) -> set[str]:
@@ -2584,6 +2670,9 @@ class TradingEngine:
                 continue
             namespace, account, exchange, instrument, symbol, product, epoch = parts
             payload = intent.get("payload") or {}
+            if payload.get("scoped_reduction"):
+                self._scoped_reductions.restore(intent)
+                continue
             if (
                 intent["intent_type"] == IntentType.ENTER.value
                 and not intent.get("latest_attempt")
@@ -3346,7 +3435,9 @@ class TradingEngine:
     def _quarantine_identity_mismatch(self, symbol: str, trade: dict) -> None:
         with self._trade_lock:
             current = self.active_trades.get(symbol)
-            if current is not None:
+            if current is not None and current.get("position_epoch") == trade.get(
+                "position_epoch"
+            ):
                 current["ownership_quarantined"] = True
                 current["broker_reconciliation_pending"] = True
                 current["recovery_state"] = "IDENTITY_MISMATCH"
@@ -3750,6 +3841,7 @@ class TradingEngine:
         with self._trade_lock:
             return (
                 bool(self.active_trades)
+                or bool(self._scoped_reductions.owners)
                 or bool(self._pending_entries)
                 or self._hard_flatten_pending
                 or bool(self._operator_close_keys)
@@ -3969,15 +4061,27 @@ class TradingEngine:
                 self._push_log(f"Quote observation unavailable: {exc}", level="warning")
             self._supervisor_stop.wait(1)
 
-    def _latch_account_flatten(self, reason: str) -> None:
+    @staticmethod
+    def _current_broker_scope():
+        namespace = getattr(kite_client, "namespace", None)
+        return getattr(namespace, "value", namespace), getattr(
+            kite_client, "account_id", None
+        )
+
+    def _latch_account_flatten(self, reason: str, *, expected_scope=None) -> None:
         """Persist an account-level hard obligation until terminal cleanup."""
 
-        if self._hard_flatten_reason != reason:
-            self._push_log(
-                f"Account safety action: {self._hard_halt_description(reason)}.",
-                level="warning",
-            )
         with self._trade_lock:
+            if (
+                expected_scope is not None
+                and expected_scope != self._current_broker_scope()
+            ):
+                return
+            if reason == HardRiskReason.RISK_DAILY_LOSS.value and not getattr(
+                risk_manager, "kill_switch_active", False
+            ):
+                # An account switch may have invalidated an earlier assessment.
+                return
             if (
                 self._hard_flatten_reason
                 == HardRiskReason.OPERATOR_EMERGENCY_FLATTEN.value
@@ -4001,6 +4105,10 @@ class TradingEngine:
                 if trade.get("entry_state") == "RECOVERY_REQUIRED":
                     trade["entry_cancel_requested"] = True
         if changed:
+            self._push_log(
+                f"Account safety action: {self._hard_halt_description(reason)}.",
+                level="warning",
+            )
             try:
                 self._save_control_state()
             except Exception as exc:
@@ -4013,6 +4121,7 @@ class TradingEngine:
         """Run the bounded, entry-independent hard-risk supervision cycle."""
 
         self._consume_broker_events()
+        scope = self._current_broker_scope()
         session = self._session_clock().snapshot(now_utc())
         account_decision = evaluate_hard_risk(
             HardRiskSnapshot(
@@ -4028,7 +4137,9 @@ class TradingEngine:
             self._hard_risk_policy(),
         )
         if account_decision.action is HardRiskAction.FLATTEN_ACCOUNT:
-            self._latch_account_flatten(account_decision.primary_reason_code.value)
+            self._latch_account_flatten(
+                account_decision.primary_reason_code.value, expected_scope=scope
+            )
 
         # Monitoring owns broker/fill reconciliation and retains polling as a
         # fallback for a disconnected ticker. It also applies the frozen legacy
@@ -4060,6 +4171,7 @@ class TradingEngine:
             try:
                 # Deadline/admission control never waits for broker IO, order
                 # confirmation, instrument discovery or candle research.
+                scope = self._current_broker_scope()
                 session = self._session_clock().snapshot(now_utc())
                 decision = evaluate_hard_risk(
                     HardRiskSnapshot(
@@ -4071,7 +4183,9 @@ class TradingEngine:
                     self._hard_risk_policy(),
                 )
                 if decision.action is HardRiskAction.FLATTEN_ACCOUNT:
-                    self._latch_account_flatten(decision.primary_reason_code.value)
+                    self._latch_account_flatten(
+                        decision.primary_reason_code.value, expected_scope=scope
+                    )
                 if (
                     not self._critical_management_thread
                     or not self._critical_management_thread.is_alive()
@@ -4109,12 +4223,14 @@ class TradingEngine:
         with self._trade_lock:
             if not (
                 self.active_trades
+                or self._scoped_reductions.owners
                 or self._hard_flatten_reason
                 or self._operator_close_keys
             ):
                 return
         try:
             positions = self._positions(critical=True)
+            self._scoped_reductions.sync(positions)
             if self._hard_flatten_reason:
                 self._cancel_flatten_entries()
             session = self._session_clock().snapshot(now_utc())
@@ -4124,13 +4240,13 @@ class TradingEngine:
                 symbol = position["tradingsymbol"]
                 with self._trade_lock:
                     owner = dict(self.active_trades.get(symbol, {}))
-                if owner and not self._trade_matches_position(owner, position):
-                    continue
                 reason = None
                 if self._hard_flatten_reason and self._in_flatten_scope(position):
                     reason = self._hard_flatten_reason
                 elif position.get("position_key") in self._operator_close_keys:
                     reason = HardRiskReason.OPERATOR_POSITION_CLOSE.value
+                elif owner and not self._trade_matches_position(owner, position):
+                    continue
                 elif owner.get("exit_pending") and self._is_hard_exit_reason(
                     owner.get("exit_reason", "")
                 ):
@@ -4254,8 +4370,7 @@ class TradingEngine:
             try:
                 with self._trade_lock:
                     positions = list(self._last_positions)
-                for position in positions:
-                    symbol = position["tradingsymbol"]
+                for symbol, position in self._owned_open_positions(positions).items():
                     with self._trade_lock:
                         trade = dict(self.active_trades.get(symbol, {}))
                     if (
@@ -4284,6 +4399,9 @@ class TradingEngine:
     def resume_supervision(self) -> dict:
         """Resume recovery after trusted backend rehydration, never entries."""
 
+        bind_account = getattr(risk_manager, "bind_account", None)
+        if callable(bind_account):
+            bind_account(kite_client.namespace, kite_client.account_id)
         if self._supervision_active:
             self.stop(reason="broker session restored; waiting for Start Agent")
             self._reconciliation_pending = True
@@ -5678,6 +5796,7 @@ class TradingEngine:
                 # replacement decisions.  Persisted ownership remains active
                 # while this retry is unresolved.
                 self.reconcile_active_trades()
+            scope = self._current_broker_scope()
             positions_snapshot = self._position_snapshot().require_complete()
             positions_net = [
                 position_to_backend_dict(position)
@@ -5686,12 +5805,43 @@ class TradingEngine:
             with self._trade_lock:
                 self._last_positions = positions_net
 
+            # Fresh position losses and native protection cannot wait for the
+            # execution ledger. Position-only accounting keeps admission closed.
+            observe_risk = getattr(risk_manager, "observe_position_risk", None)
+            if callable(observe_risk) and hasattr(kite_client, "get_broker_snapshot"):
+                observe_risk(positions_snapshot)
+            else:
+                risk_manager.update_from_position_snapshot(positions_snapshot)
+            self._scoped_reductions.sync(positions_net)
+            for symbol, position in self._owned_open_positions(positions_net).items():
+                with self._trade_lock:
+                    trade = dict(self.active_trades.get(symbol, {}))
+                mark, stop = position.get("last_price"), trade.get("sl")
+                breached = (
+                    self._has_fresh_position_mark(position)
+                    and self._is_valid_management_price(stop)
+                    and (
+                        mark <= stop
+                        if trade.get("direction") == "BUY"
+                        else mark >= stop
+                    )
+                )
+                if (
+                    trade.get("entry_state") == "RECOVERY_REQUIRED"
+                    and not trade.get("stop_order_id")
+                    and not trade.get("protection_attempt_order_id")
+                    and not self._hard_flatten_reason
+                    and not trade.get("exit_pending")
+                    and not breached
+                ):
+                    self._ensure_recovery_protection(symbol, position, trade)
+
             # Use the cumulative order-grouped projection whenever the broker
             # exposes one.  Position-only fee estimates are explicitly degraded
             # and are only a compatibility fallback for test/dev adapters.
             broker_snapshot = None
             if hasattr(kite_client, "get_broker_snapshot"):
-                broker_snapshot = self._broker_snapshot()
+                broker_snapshot = self._broker_snapshot(positions=positions_snapshot)
                 update_snapshot = getattr(
                     risk_manager, "update_from_broker_snapshot", None
                 )
@@ -5706,9 +5856,6 @@ class TradingEngine:
                 )
                 if callable(reconcile_reservations):
                     reconcile_reservations(broker_snapshot)
-            else:
-                risk_manager.update_from_position_snapshot(positions_snapshot)
-
             open_count = sum(1 for p in positions_net if p["quantity"] != 0)
             risk_manager.set_open_positions(open_count)
 
@@ -5730,7 +5877,9 @@ class TradingEngine:
                 self._hard_risk_policy(),
             )
             if account_decision.action is HardRiskAction.FLATTEN_ACCOUNT:
-                self._latch_account_flatten(account_decision.primary_reason_code.value)
+                self._latch_account_flatten(
+                    account_decision.primary_reason_code.value, expected_scope=scope
+                )
             if self._hard_flatten_reason:
                 # Cancellation includes zero-fill orders. Reconciliation below
                 # must continue after flatten, including on subsequent sessions.
@@ -5903,23 +6052,12 @@ class TradingEngine:
                 symbol = p["tradingsymbol"]
 
                 if p.get("position_key") in self._operator_close_keys:
-                    with self._trade_lock:
-                        owner = dict(self.active_trades.get(symbol, {}))
-                    if owner and not self._trade_matches_position(owner, p):
-                        continue
                     self._place_exit_order(
                         p, symbol, HardRiskReason.OPERATOR_POSITION_CLOSE.value
                     )
                     continue
 
                 if self._hard_flatten_reason and self._in_flatten_scope(p):
-                    with self._trade_lock:
-                        owner = dict(self.active_trades.get(symbol, {}))
-                    # The compatible checkpoint is symbol-keyed. Finish one
-                    # product before taking ownership of another; never
-                    # quarantine the correctly owned product on a collision.
-                    if owner and not self._trade_matches_position(owner, p):
-                        continue
                     self._hard_flatten_pending = True
                     self._place_exit_order(p, symbol, self._hard_flatten_reason)
                     continue
@@ -6304,7 +6442,9 @@ class TradingEngine:
         if not entered or expected_quantity != actual_quantity:
             with self._trade_lock:
                 current = self.active_trades.get(symbol)
-                if current:
+                if current and current.get("position_epoch") == trade.get(
+                    "position_epoch"
+                ):
                     current["broker_reconciliation_pending"] = True
                     current["recovery_state"] = "POSITION_FILL_DISAGREEMENT"
             self._push_log(
@@ -8592,6 +8732,32 @@ class TradingEngine:
         )
 
     def _place_exit_order(self, position: dict, symbol: str, reason: str = ""):
+        account = getattr(kite_client, "account_id", None)
+        namespace = getattr(kite_client, "namespace", None)
+        if (
+            account
+            and namespace
+            and (
+                account != position.get("account_id")
+                or getattr(namespace, "value", namespace) != position.get("namespace")
+            )
+        ):
+            return
+        with self._trade_lock:
+            owner = self.active_trades.get(symbol)
+        key = position.get("position_key")
+        if not owner and key and self._is_hard_exit_reason(reason):
+            for intent in self._pending_lifecycle_obligations():
+                if intent["position_key"].rsplit(":", 1)[0] == key and intent.get(
+                    "payload", {}
+                ).get("scoped_reduction"):
+                    self._scoped_reductions.restore(intent)
+        if key in self._scoped_reductions.owners or (
+            owner
+            and not self._same_position_scope(owner, position)
+            and self._is_hard_exit_reason(reason)
+        ):
+            return self._scoped_reductions.dispatch(position, reason)
         lock = self._management_lock(symbol)
         if not lock.acquire(blocking=False):
             try:
@@ -8676,7 +8842,8 @@ class TradingEngine:
                 }
                 self.active_trades[symbol] = existing
             if existing and not self._trade_matches_position(existing, position):
-                self._quarantine_identity_mismatch(symbol, existing)
+                if self._same_position_scope(existing, position):
+                    self._quarantine_identity_mismatch(symbol, existing)
                 self._push_log(
                     f"Refusing exit for {symbol}: position ownership is not the tracked trade.",
                     level="warning",
@@ -9075,15 +9242,17 @@ class TradingEngine:
                 "order_role": OrderRole.REDUCTION,
                 "critical": urgent,
             }
-            if self._is_valid_management_price(ltp) and not (urgent or market_required):
-                order_kwargs["order_type"] = "LIMIT"
-                order_kwargs["price"] = self._get_exit_limit_price(
-                    symbol, order_kwargs["exchange"], ltp, tx_type
+            policy = ReductionOrderPolicy(
+                tick_size=self._get_tick_size(symbol, order_kwargs["exchange"])
+                if self._is_valid_management_price(ltp)
+                and not (urgent or market_required)
+                else 0.05
+            )
+            order_kwargs.update(
+                policy.order_fields(
+                    side=tx_type, mark=ltp, hard=urgent, market_required=market_required
                 )
-            else:
-                # The lack of a quote is not a reason to use a stale limit or
-                # claim completion.  A marketable reduction remains explicit.
-                order_kwargs["order_type"] = "MARKET"
+            )
             return execution_gateway.place_order(
                 **order_kwargs, attempt_tag=attempt_tag
             )
@@ -9302,16 +9471,14 @@ class TradingEngine:
                 deadline = config_manager.get_order_lifecycle_config().get(
                     "workingAttemptTimeoutSeconds", 15
                 )
-                elapsed = (
-                    (now_utc() - as_utc(created_at)).total_seconds()
-                    if created_at
-                    else 0
-                )
-                urgent_limit = (
-                    trade.get("exit_market_required")
-                    and str(order.get("order_type", "")).upper() == "LIMIT"
-                )
-                if urgent_limit or elapsed >= float(deadline):
+                if ReductionOrderPolicy(
+                    working_timeout_seconds=float(deadline)
+                ).cancellation_due(
+                    order_type=str(order.get("order_type", "")).upper(),
+                    submitted_at=created_at,
+                    now=now_utc(),
+                    market_required=trade.get("exit_market_required", False),
+                ):
                     # A marketable limit may be stranded by a gap. Its parent
                     # obligation persists; replace only after terminal cancel
                     # and another post-handoff residual read.

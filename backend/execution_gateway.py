@@ -62,7 +62,13 @@ class ExecutionGateway:
                 max_daily_trades = risk_config.get("maxDailyTrades", 10)
                 max_symbol_trades = risk_config.get("maxTradesPerSymbolPerDay", 2)
                 cooldown_mins = risk_config.get("tradeCooldownMins", 15)
-                todays_counts = journal.get_todays_trade_counts()
+                scope = {
+                    "namespace": getattr(
+                        kite_client.namespace, "value", kite_client.namespace
+                    ),
+                    "account_id": kite_client.account_id,
+                }
+                todays_counts = journal.get_todays_trade_counts(**scope)
                 if todays_counts["total"] >= max_daily_trades:
                     raise Exception(f"Max daily trades ({max_daily_trades}) reached.")
                 if todays_counts["by_symbol"].get(symbol, 0) >= max_symbol_trades:
@@ -71,7 +77,7 @@ class ExecutionGateway:
                         f"today for {symbol}."
                     )
 
-                last_exit = journal.get_last_exit_time(symbol)
+                last_exit = journal.get_last_exit_time(symbol, **scope)
                 if last_exit:
                     normalized_last_exit = as_utc(last_exit)
                     mins_since_exit = (

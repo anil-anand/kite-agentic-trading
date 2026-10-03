@@ -642,7 +642,7 @@ def bind_terminal_fill(
     source_fill_ids: tuple[str, ...] = (),
     first_fill_at: datetime | str | None = None,
 ) -> EntryThesis:
-    """Return the one permitted fill-bound revision of a draft thesis."""
+    """Freeze economics; append verified missing execution provenance later."""
 
     if thesis.binding_status is ThesisBindingStatus.BOUND:
         proposed = calculate_provisional_risk(
@@ -661,7 +661,34 @@ def bind_terminal_fill(
             and existing.entry_vwap == proposed.fill_price
             and existing.filled_quantity == proposed.filled_quantity
         ):
-            return thesis
+            amendments = {}
+            for name, value in (
+                ("entry_terminal_at", terminal_at),
+                ("entry_first_fill_at", first_fill_at),
+            ):
+                supplied = as_utc(value)
+                previous = as_utc(getattr(existing, name))
+                if previous and supplied and previous != supplied:
+                    raise ValueError("verified execution timestamps cannot be replaced")
+                if previous is None and supplied is not None:
+                    amendments[name] = supplied.isoformat()
+            if not amendments:
+                return thesis
+            if not existing.source_fill_ids or set(source_fill_ids) != set(
+                existing.source_fill_ids
+            ):
+                raise ValueError(
+                    "execution provenance repair requires matching fill identities"
+                )
+            binding = replace(existing, **amendments)
+            if (
+                binding.entry_first_fill_at
+                and binding.entry_terminal_at
+                and as_utc(binding.entry_first_fill_at)
+                > as_utc(binding.entry_terminal_at)
+            ):
+                raise ValueError("terminal entry precedes the first fill")
+            return replace(thesis, revision=thesis.revision + 1, fill_binding=binding)
         raise ValueError("terminal fill binding is immutable once established")
     provisional = calculate_provisional_risk(
         thesis, fill_price=entry_vwap, filled_quantity=filled_quantity

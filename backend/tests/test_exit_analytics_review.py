@@ -187,11 +187,17 @@ def test_exposure_samples_join_actual_partial_fills_and_count_missing_allocation
         "get_position_fills",
         lambda *a, **k: [
             {
+                "side": "BUY",
+                "quantity": 10,
+                "fill_price": 100,
+                "exchange_time": START.isoformat(),
+            },
+            {
                 "side": "SELL",
                 "quantity": 5,
                 "fill_price": 104,
                 "exchange_time": (START + timedelta(minutes=1)).isoformat(),
-            }
+            },
         ],
     )
     managed = journal.get_managed_position(thesis.position_key)

@@ -9,7 +9,7 @@ handoff.  No live service or default journal is imported here.
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Mapping
@@ -31,6 +31,7 @@ from ..exit_management.profiles import resolve_profile
 from ..exit_management.thesis import EntryThesis
 from ..market_context import MarketContext
 from ..order_lifecycle import IntentType, OrderLifecycleCoordinator
+from ..reduction_policy import ReductionOrderPolicy
 from ..replay import serialize_replay_artifact
 from ..risk_rules import HardRiskSnapshot
 from ..session_clock import SessionClock, SessionPolicy
@@ -47,6 +48,7 @@ class CandidatePosition:
     broker_position_key: str
     coordinator_intent_id: str | None = None
     tighten_intent_id: str | None = None
+    exit_market_required: bool = False
 
 
 class CandidateRunner:
@@ -65,6 +67,7 @@ class CandidateRunner:
         session_policy: SessionPolicy = SessionPolicy(),
         daily_loss_limit: float | None = None,
         dynamic_entries: bool = False,
+        reduction_policy: ReductionOrderPolicy = ReductionOrderPolicy(),
     ):
         if not isinstance(broker, SimulatedBroker) or broker.namespace not in {
             ExecutionNamespace.REPLAY,
@@ -84,6 +87,7 @@ class CandidateRunner:
         self.clock = SessionClock(session_policy)
         self.daily_loss_limit = daily_loss_limit
         self.dynamic_entries = dynamic_entries
+        self.reduction_policy = reduction_policy
         self.daily_loss_latched = False
         self.positions: dict[str, CandidatePosition] = {}
         self.evaluations: list[ExitEvaluation] = []
@@ -237,9 +241,24 @@ class CandidateRunner:
             )
             attempt = projection.get("latest_attempt") if projection else None
             if attempt:
+                order = self.broker.get_order(attempt.get("broker_order_id"))
+                if (
+                    order
+                    and order["status"]
+                    not in {"COMPLETE", "CANCELLED", "REJECTED", "EXPIRED"}
+                    and self.reduction_policy.cancellation_due(
+                        order_type=order["order_type"],
+                        submitted_at=order["submitted_at"],
+                        now=at,
+                        market_required=managed.exit_market_required,
+                    )
+                ):
+                    managed.exit_market_required = True
+                    self.broker.cancel_order(order["order_id"], timestamp=at)
+                    order = self.broker.get_order(order["order_id"])
                 self.coordinator.observe_order(
                     managed.coordinator_intent_id,
-                    self.broker.get_order(attempt.get("broker_order_id")),
+                    order,
                 )
         event_id = f"broker:{symbol}:{at.isoformat()}:{len(self.broker.fills)}"
         if quantity == 0:
@@ -282,6 +301,66 @@ class CandidateRunner:
                 occurred_at=at,
                 known_quantity=quantity,
             )
+
+    def _submit_reduction(self, symbol, at, reason, *, hard=False):
+        managed = self.positions[symbol]
+        position = self.broker.positions[symbol]
+        side = "SELL" if position["direction"] == "BUY" else "BUY"
+        managed.exit_market_required |= hard
+        if managed.coordinator_intent_id:
+            if hard:
+                self.coordinator.journal.escalate_order_intent(
+                    managed.coordinator_intent_id, reason
+                )
+            projection = self.coordinator.journal.get_order_intent_projection(
+                managed.coordinator_intent_id
+            )
+            latest = (projection or {}).get("latest_attempt") or {}
+            order = self.broker.get_order(latest.get("broker_order_id"))
+            if (
+                order
+                and order["status"]
+                not in {"COMPLETE", "CANCELLED", "REJECTED", "EXPIRED"}
+                and self.reduction_policy.cancellation_due(
+                    order_type=order["order_type"],
+                    submitted_at=order["submitted_at"],
+                    now=at,
+                    market_required=managed.exit_market_required,
+                )
+            ):
+                managed.exit_market_required = True
+                self.broker.cancel_order(order["order_id"], timestamp=at)
+                self.coordinator.observe_order(
+                    managed.coordinator_intent_id,
+                    self.broker.get_order(order["order_id"]),
+                )
+            if not hard:
+                reason = projection.get("reason") or reason
+        return self.coordinator.handoff_with_broker_adapter(
+            broker=self.broker,
+            position_key=managed.broker_position_key,
+            role=OrderRole.REDUCTION,
+            side=side,
+            requested_quantity=position["quantity"],
+            payload={
+                "tradingsymbol": symbol,
+                "timestamp": at.isoformat(),
+                "reason": reason,
+                "role": OrderRole.REDUCTION.value,
+                **self.reduction_policy.order_fields(
+                    side=side,
+                    mark=self.broker._prices.get(symbol),
+                    hard=hard,
+                    market_required=managed.exit_market_required,
+                ),
+                "reduction_policy": asdict(self.reduction_policy),
+                "market_required": managed.exit_market_required,
+            },
+            stop_order_id=position.get("stop_order_id"),
+            reason=reason,
+            hard=hard,
+            existing_intent_id=managed.coordinator_intent_id,
+        )
 
     def on_event(
         self,
@@ -339,6 +418,8 @@ class CandidateRunner:
         execution_artifact = {
             "broker": self.broker.execution_manifest,
             "daily_loss_limit": self.daily_loss_limit,
+            "reduction_policy": asdict(self.reduction_policy),
+            "timeout_observation": "PROVIDED_EVENTS_AFTER_CANDLE_EXECUTION",
         }
         if (
             self._execution_artifact is not None
@@ -436,22 +517,11 @@ class CandidateRunner:
                 ExitAction.REQUEST_EXIT,
                 ExitAction.MANAGE_PENDING_INTENT,
             }:
-                response = self.coordinator.handoff_with_broker_adapter(
-                    broker=self.broker,
-                    position_key=managed.broker_position_key,
-                    role=OrderRole.REDUCTION,
-                    side="SELL" if direction == "BUY" else "BUY",
-                    requested_quantity=position["quantity"],
-                    payload={
-                        "tradingsymbol": symbol,
-                        "timestamp": at.isoformat(),
-                        "reason": evaluation.decision.primary_reason_code,
-                        "role": OrderRole.REDUCTION.value,
-                    },
-                    stop_order_id=position.get("stop_order_id"),
-                    reason=evaluation.decision.primary_reason_code,
+                response = self._submit_reduction(
+                    symbol,
+                    at,
+                    evaluation.decision.primary_reason_code,
                     hard=evaluation.decision.urgency == "CRITICAL",
-                    existing_intent_id=managed.coordinator_intent_id,
                 )
                 managed.coordinator_intent_id = response.intent_id
                 self.execution_results.append(
@@ -562,7 +632,7 @@ class CandidateRunner:
         ]
         return {
             "manifest": {
-                "runner_version": "candidate-execution-v1",
+                "runner_version": "candidate-execution-v2",
                 "entry_policy": "FIXED_ADMITTED_ENTRY_FILL_OPPORTUNITIES",
                 "execution": deepcopy(self._execution_artifact["broker"])
                 if self._execution_artifact
@@ -579,7 +649,13 @@ class CandidateRunner:
                 "exit_policy_versions": sorted(
                     {p.policy.policy_version for p in self.positions.values()}
                 ),
-                "normal_fill_timing": "NEXT_AVAILABLE_BAR_OPEN",
+                "reduction_policy": deepcopy(
+                    self._execution_artifact["reduction_policy"]
+                )
+                if self._execution_artifact
+                else asdict(self.reduction_policy),
+                "timeout_observation": "PROVIDED_EVENTS_AFTER_CANDLE_EXECUTION",
+                "normal_fill_timing": "NEXT_AVAILABLE_BAR_LIMIT_EXECUTION",
                 "objective_observation": "COMPLETED_CLOSE_OR_EXPLICIT_QUOTE",
             },
             "trades": self.broker.trades,

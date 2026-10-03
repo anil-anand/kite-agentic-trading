@@ -189,6 +189,8 @@ def mock_journal_overtrading(monkeypatch):
     from backend.journal import journal
 
     monkeypatch.setattr(
-        journal, "get_todays_trade_counts", lambda: {"total": 0, "by_symbol": {}}
+        journal,
+        "get_todays_trade_counts",
+        lambda **kwargs: {"total": 0, "by_symbol": {}},
     )
-    monkeypatch.setattr(journal, "get_last_exit_time", lambda s: None)
+    monkeypatch.setattr(journal, "get_last_exit_time", lambda s, **kwargs: None)

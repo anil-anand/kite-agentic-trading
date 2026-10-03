@@ -111,9 +111,19 @@ def test_failed_breakout_reconciles_under_predeclared_execution_stress(
     assert runner.broker.positions[SYMBOL]["quantity"] == 10
     for index in range(3, 13):
         _event(runner, index, 102, volume=100)
-    assert runner.positions[SYMBOL].state.exposure is ExposureState.CLOSED
     reductions = [o for o in runner.broker.orders.values() if o["role"] == "REDUCTION"]
-    assert len(reductions) == 1
+    assert reductions[0]["order_type"] == "LIMIT"
+    assert all(o["order_type"] == "MARKET" for o in reductions[1:])
+    if latency:
+        # A full-bar execution delay exceeds the live 15-second deadline.
+        # Repeated cancellation retains exposure; the study must censor it.
+        assert runner.positions[SYMBOL].state.exposure is ExposureState.EXIT_PENDING
+        assert runner.broker.positions[SYMBOL]["quantity"] == 10
+        assert all(o["status"] == "CANCELLED" for o in reductions[:-1])
+        assert not runner.broker.trades
+        return
+    assert runner.positions[SYMBOL].state.exposure is ExposureState.CLOSED
+    assert len(reductions) >= 2
     assert sum(f["quantity"] for f in runner.broker.fills if f["side"] == "SELL") == 10
     assert runner.broker.trades[0]["exit_reason"] == "THESIS_BREAKOUT_FAILED"
     assert runner.broker.cash == pytest.approx(
