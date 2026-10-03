@@ -277,6 +277,39 @@ export interface Signal {
   indicators: Record<string, number>;
 }
 
+export interface ScanProgress {
+  phase: 'preparing' | 'screening' | 'loading_instruments' | 'scanning' | 'completed' | 'error';
+  analysisOnly: boolean;
+  startedAt: string;
+  completedAt: string | null;
+  nextScanAt: string | null;
+  universeSize: number | null;
+  totalSymbols: number;
+  completedSymbols: number;
+  evaluatedSymbols: number;
+  skippedSymbols: number;
+  failedSymbols: number;
+  signalsFound: number;
+  signalsPublished: number;
+  enabledStrategies: string[];
+  queuedSymbols: string[];
+  workers: {
+    id: number;
+    symbol: string | null;
+    stage: 'idle' | 'waiting_for_symbol' | 'fetching_candles' | 'building_context' | 'evaluating_strategies';
+    startedAt: string | null;
+    updatedAt: string | null;
+  }[];
+  results: {
+    symbol: string;
+    outcome: 'signals' | 'no_match' | 'unchanged' | 'unavailable' | 'unknown_symbol' | 'error';
+    detail: string;
+    signals: number;
+    candleTime: string | null;
+  }[];
+  message: string | null;
+}
+
 export interface AgentState {
   running: boolean;
   mode: AgentMode;
@@ -290,6 +323,8 @@ export interface AgentState {
   statusMessage: string;
   effectiveMode?: AgentMode | 'paused' | 'scan_only';
   scanOnly?: boolean;
+  scanProgress?: ScanProgress | null;
+  marketSession?: { isOpen: boolean; isTradingDay: boolean; isWeekend: boolean };
   entryBlockReasons?: string[];
   entryPaused?: boolean;
   supervisionActive?: boolean;

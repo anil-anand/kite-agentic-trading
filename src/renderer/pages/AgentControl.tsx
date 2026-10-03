@@ -1,15 +1,18 @@
 import React from 'react';
 import { useTradingStore } from '../stores/trading-store';
 import AgentEntryNotice from '../components/AgentEntryNotice';
+import ScanActivity from '../components/ScanActivity';
 import { useKiteAPI } from '../hooks/useKiteAPI';
 import { Check, X, Loader2 } from 'lucide-react';
 import { buildStrategySettings, STRATEGY_IDS } from '../utils/strategy-settings';
+import { scanIsBusy, scanSummary } from '../utils/scan-status';
 
 const AgentControl: React.FC = () => {
   const { agentState, signals, setAgentState } = useTradingStore();
   const { startAgent, stopAgent, setAgentMode } = useKiteAPI();
   const [controlPending, setControlPending] = React.useState(false);
   const [controlError, setControlError] = React.useState<string | null>(null);
+  const scanStatus = scanSummary(agentState);
 
   React.useEffect(() => {
     if (!agentState.running) {
@@ -113,7 +116,7 @@ const AgentControl: React.FC = () => {
         <div>
           <h1 className="text-2xl font-bold text-white">Agent Control</h1>
           <p className="text-sm text-surface-400 mt-1">
-            Scanning NIFTY 100 universe + your Custom Watchlist using all active strategies below.
+            Selecting candidates from NIFTY 100 + your Custom Watchlist, then scanning with the enabled strategies.
           </p>
         </div>
         <button
@@ -184,25 +187,15 @@ const AgentControl: React.FC = () => {
               <h2 className="text-lg font-semibold text-white">{agentState.scanOnly ? 'Scan-only Signals' : 'Live Signals'}</h2>
               <span className="text-xs text-surface-400">Grouped by Confluence</span>
             </div>
+            <ScanActivity state={agentState} />
           </div>
           <div className="space-y-4 p-6 pt-4">
             {groupedSignals.length === 0 ? (
-              agentState.running ? (
-                agentState.status === 'scanning' ? (
-                  <div className="flex flex-col items-center justify-center mt-12 gap-3 text-surface-400">
-                    <Loader2 size={28} className="animate-spin text-accent-light" />
-                    <p className="text-sm font-medium">Scanning the market&hellip;</p>
-                    <p className="text-xs text-surface-500">Signals will appear here as they are detected.</p>
-                  </div>
-                ) : (
-                  <div className="flex flex-col items-center justify-center mt-12 gap-3 text-surface-400">
-                    <p className="text-sm font-medium">Monitoring for new opportunities&hellip;</p>
-                    <p className="text-xs text-surface-500">No trade signals matched your criteria right now.</p>
-                  </div>
-                )
-              ) : (
-                <div className="text-center text-surface-400 mt-10 text-sm">No active signals</div>
-              )
+              <div className="flex flex-col items-center justify-center mt-12 gap-3 text-center text-surface-400" role="status">
+                {(scanIsBusy(agentState.scanProgress) || (agentState.running && !agentState.scanProgress)) && <Loader2 size={28} className="animate-spin text-accent-light" />}
+                <p className="text-sm font-medium text-surface-300">{scanStatus.title}</p>
+                <p className="text-xs leading-relaxed">{scanStatus.detail}</p>
+              </div>
             ) : (
               groupedSignals.map(group => {
                 const bestSignal = group.signals.reduce((prev, current) => ((prev.signal_score ?? (prev as any).signalScore ?? 0) > (current.signal_score ?? (current as any).signalScore ?? 0)) ? prev : current);

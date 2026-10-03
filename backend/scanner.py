@@ -14,6 +14,7 @@ from .entry_ordering import PRODUCTION_CANDLE_HISTORY_DAYS
 from .kite_client import kite_client
 from .market_context import ContextPolicy, MarketContext, MarketContextService
 from .playbooks import BreakoutPlaybook, MeanReversionPlaybook, TrendPullbackPlaybook
+from .scan_progress import SCAN_WORKERS, ScanProgress
 from .session_clock import SessionPolicy
 from .strategies.adx_momentum import ADXMomentumStrategy
 from .strategies.awesome_oscillator import AwesomeOscillatorStrategy
@@ -144,7 +145,9 @@ class Scanner:
             push_log(
                 f"Error fetching candles for {tradingsymbol}: {e}", level="warning"
             )
-            return pd.DataFrame(), False
+            frame = pd.DataFrame()
+            frame.attrs["fetch_error"] = True
+            return frame, False
 
     @staticmethod
     def _preserve_candle_receipts(
@@ -291,32 +294,70 @@ class Scanner:
         )
 
     def scan_watchlist(
-        self, symbols: List[str], on_signal=None, *, analysis_only: bool = False
+        self,
+        symbols: List[str],
+        on_signal=None,
+        *,
+        analysis_only: bool = False,
+        progress: ScanProgress | None = None,
     ) -> List[Dict[str, Any]]:
         import concurrent.futures
 
         all_signals = []
+        progress = progress or ScanProgress()
+        progress.update(analysisOnly=analysis_only)
         # Confirmation may occur after Settings are edited.  Keep the actual
         # selection inputs detached before any symbol starts calculating.
         strategy_config = deepcopy(config_manager.get_strategy_config())
         risk_config = deepcopy(config_manager.get_risk_config())
         entry_family_mapping = dict(self.family_mapping)
+        progress.set_symbols(
+            symbols,
+            [
+                name
+                for name in self.strategies
+                if isinstance(strategy_config.get(name), Mapping)
+                and strategy_config[name].get("enabled", False)
+            ],
+        )
+        if not symbols:
+            progress.finish()
+            return []
 
-        instruments = kite_client.get_instruments("NSE")
+        try:
+            instruments = kite_client.get_instruments("NSE")
+        except Exception:
+            progress.finish(error="Could not load NSE instruments. See Activity Log.")
+            raise
         instrument_map = {
             i["tradingsymbol"]: i["instrument_token"] for i in instruments
         }
 
-        def evaluate_symbol(symbol: str) -> List[Dict[str, Any]]:
+        def evaluate_symbol(symbol: str, worker_index: int):
             token = instrument_map.get(symbol)
             if not token:
-                return []
+                return [], {
+                    "outcome": "unknown_symbol",
+                    "detail": "NSE instrument not found",
+                }
 
+            progress.worker_stage(worker_index, "fetching_candles")
             df, _ = self._fetch_candles(token, symbol)
             if df.empty:
-                return []
+                return [], {
+                    "outcome": "error"
+                    if df.attrs.get("fetch_error")
+                    else "unavailable",
+                    "detail": "Candle request failed; see Activity Log"
+                    if df.attrs.get("fetch_error")
+                    else "No candle data returned",
+                }
 
+            progress.worker_stage(worker_index, "building_context")
             context = self._market_context(token, df, analysis_only=analysis_only)
+            candle_time = (
+                context.primary_bar.end.isoformat() if context.primary_bar else None
+            )
             if (
                 not (
                     context.normal_decision_eligible
@@ -325,7 +366,12 @@ class Scanner:
                 or "VOLUME_UNAVAILABLE" in context.primary_quality.issues
                 or context.primary_frame().empty
             ):
-                return []
+                issues = ", ".join(context.primary_quality.issues)
+                return [], {
+                    "outcome": "unavailable",
+                    "detail": f"Candle data not eligible: {issues or context.primary_quality.status.value}",
+                    "candle_time": candle_time,
+                }
 
             evaluate_on_incomplete = (
                 strategy_config.get("evaluateOnIncompleteCandle", False)
@@ -341,8 +387,13 @@ class Scanner:
                 latest_candle_id = context.primary_bar.end
                 last_scanned = scanned_candles.get(symbol)
                 if last_scanned is not None and latest_candle_id <= last_scanned:
-                    return []
+                    return [], {
+                        "outcome": "unchanged",
+                        "detail": "No new completed candle since the previous scan",
+                        "candle_time": candle_time,
+                    }
 
+            progress.worker_stage(worker_index, "evaluating_strategies")
             symbol_aggregated_signals = evaluate_production_entries(
                 symbol=symbol,
                 raw_frame=df,
@@ -363,18 +414,41 @@ class Scanner:
 
             if not evaluate_on_incomplete and context.primary_bar:
                 scanned_candles[symbol] = context.primary_bar.end
-            return symbol_aggregated_signals
+            return symbol_aggregated_signals, {
+                "outcome": "signals" if symbol_aggregated_signals else "no_match",
+                "detail": "Strategy signals found"
+                if symbol_aggregated_signals
+                else "No setup passed the strategy and playbook filters",
+                "signals": len(symbol_aggregated_signals),
+                "candle_time": candle_time,
+            }
 
         def process_symbol(symbol: str) -> List[Dict[str, Any]]:
-            with self._scan_locks_lock:
-                symbol_lock = self._scan_locks.setdefault(symbol, threading.Lock())
-            # Manual scans and the entry worker share one decision high-water
-            # mark. Unrelated symbols still run concurrently.
-            with symbol_lock:
-                return evaluate_symbol(symbol)
+            worker_index = progress.start_symbol(symbol)
+            try:
+                with self._scan_locks_lock:
+                    symbol_lock = self._scan_locks.setdefault(symbol, threading.Lock())
+                # Manual scans and the entry worker share one decision high-water
+                # mark. Unrelated symbols still run concurrently.
+                with symbol_lock:
+                    signals, result = evaluate_symbol(symbol, worker_index)
+            except Exception:
+                progress.finish_symbol(
+                    worker_index,
+                    symbol,
+                    "error",
+                    "Symbol scan failed; see Activity Log",
+                )
+                raise
+            progress.finish_symbol(worker_index, symbol, **result)
+            return signals
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-            futures = [executor.submit(process_symbol, symbol) for symbol in symbols]
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=SCAN_WORKERS
+        ) as executor:
+            futures = {
+                executor.submit(process_symbol, symbol): symbol for symbol in symbols
+            }
             for future in concurrent.futures.as_completed(futures):
                 try:
                     signals = future.result()
@@ -384,11 +458,10 @@ class Scanner:
                                 on_signal(sig)
                         all_signals.extend(signals)
                 except Exception as e:
-                    import sys
-
-                    print(f"Error in parallel processing: {e}", file=sys.stderr)
+                    push_log(f"Scan failed for {futures[future]}: {e}", level="warning")
 
         all_signals.sort(key=lambda x: x.get("signal_score", 0), reverse=True)
+        progress.finish()
         return all_signals
 
     def evaluate_position(

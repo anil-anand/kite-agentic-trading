@@ -74,7 +74,7 @@ def test_live_streams_ui_then_admits_completed_batch_in_declared_priority(
         engine, "execute_signal", lambda item: submitted.append(item["tradingsymbol"])
     )
 
-    def scan(symbols, on_signal):
+    def scan(symbols, on_signal, *, progress=None):
         assert symbols == ["BBB", "AAA"]
         candidates = [signal("AAA", 90), signal("BBB", 75)]
         for item in reversed(candidates) if reverse else candidates:
@@ -104,7 +104,7 @@ def test_live_probability_and_duplicate_guards_survive_batching(monkeypatch):
     submitted = []
     monkeypatch.setattr(engine, "execute_signal", lambda item: submitted.append(item))
 
-    def scan(symbols, on_signal):
+    def scan(symbols, on_signal, *, progress=None):
         for item in [
             signal("AAA", estimated_probability=0.59),
             signal("BBB", estimated_probability=float("nan")),

@@ -149,7 +149,7 @@ def test_read_only_scan_emits_signals_but_never_submits(engine, monkeypatch):
     engine.dynamic_watchlist = ["TEST"]
     published, submitted = [], []
 
-    def scan(symbols, on_signal, *, analysis_only=False):
+    def scan(symbols, on_signal, *, analysis_only=False, progress=None):
         assert symbols == ["TEST"] and analysis_only
         on_signal(
             {

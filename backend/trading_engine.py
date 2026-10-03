@@ -55,6 +55,7 @@ from .risk_rules import (
     evaluate_hard_risk,
     is_fresh_mark,
 )
+from .scan_progress import ScanProgress
 from .scanner import scanner
 from .session_clock import SessionClock, SessionPolicy
 from .time_utils import EXCHANGE_TIMEZONE, as_utc, now_utc
@@ -105,6 +106,7 @@ class TradingEngine:
     def __init__(self):
         self.running = False
         self._scan_only = False
+        self._scan_progress = None
         self._last_reconciliation_report = None
         self._entry_pause_reason = "the agent has not been started"
         self._last_pause_log = None
@@ -4092,6 +4094,8 @@ class TradingEngine:
         if not self._supervision_active:
             scanner.last_scanned_candle.clear()
         scanner.last_analysis_candle.clear()
+        if not self.thread or not self.thread.is_alive():
+            self._scan_progress = None
         # Pin read-only mode for this run. Recovery completing or the market
         # reopening must not silently promote historical analysis to trading.
         scan_only = bool(self._entry_block_reasons())
@@ -4136,10 +4140,18 @@ class TradingEngine:
 
     def status(self) -> dict:
         reasons = self._entry_block_reasons()
+        session = self._session_clock().snapshot(now_utc())
+        progress = self._scan_progress.snapshot() if self._scan_progress else None
         scan_only = self.running and self._scan_only
         entry_paused = not self.running or scan_only or bool(reasons)
         if self.running:
-            state = "scanning"
+            state = (
+                "error"
+                if progress and progress["phase"] == "error"
+                else "monitoring"
+                if progress and progress["phase"] == "completed"
+                else "scanning"
+            )
         elif self._supervision_active:
             state = "supervising"
         else:
@@ -4153,6 +4165,13 @@ class TradingEngine:
             if self.running
             else "paused",
             "scanOnly": scan_only,
+            "scanProgress": progress,
+            "lastScanTime": progress["completedAt"] if progress else None,
+            "marketSession": {
+                "isOpen": session.is_open,
+                "isTradingDay": session.is_trading_day,
+                "isWeekend": session.exchange_time.weekday() >= 5,
+            },
             "entryBlockReasons": reasons,
             "statusMessage": (
                 "Scanning latest available completed candles. New entries are disabled "
@@ -4176,15 +4195,12 @@ class TradingEngine:
         }
 
     def _push_state_update(self, status: str = None):
-        if not status:
-            status = self.status()["status"]
-
+        state = self.status()
+        if status:
+            state["status"] = status
         event = {
             "event": "agent:state-update",
-            "data": {
-                **self.status(),
-                "status": status,
-            },
+            "data": state,
         }
         with _stdout_lock:
             print(json.dumps(event, cls=DateTimeEncoder))
@@ -4225,10 +4241,16 @@ class TradingEngine:
                 # a protective stop or forced flatten deadline.
                 current_time = time.time()
                 if current_time - last_scan_time >= scan_interval:
-                    self._push_state_update(status="scanning")
                     self.scan_and_trade()
-                    self._push_state_update(status="monitoring")
                     last_scan_time = current_time
+                    if self._scan_progress:
+                        self._scan_progress.update(
+                            force=True,
+                            nextScanAt=datetime.datetime.fromtimestamp(
+                                max(time.time(), last_scan_time + scan_interval),
+                                tz=datetime.timezone.utc,
+                            ).isoformat(),
+                        )
 
                 if current_time - last_reconcile_time >= reconcile_interval:
                     self._reconcile_journal_trades()
@@ -4287,11 +4309,27 @@ class TradingEngine:
             return late_mins
 
     def scan_and_trade(self):
+        progress = ScanProgress(on_update=self._push_state_update)
+        self._scan_progress = progress
+        progress.update(force=True)
+        try:
+            self._scan_and_trade(progress)
+        except Exception:
+            progress.finish(
+                error=progress.snapshot()["message"]
+                or "Scan failed. See Activity Log for details."
+            )
+            raise
+        else:
+            progress.finish()
+
+    def _scan_and_trade(self, progress):
         can_trade, reason = risk_manager.can_trade()
         entry_allowed, entry_reason = self._entry_admission_allowed()
         if not entry_allowed:
             can_trade, reason = False, entry_reason
         analysis_only = not can_trade
+        progress.update(analysisOnly=analysis_only)
         if not can_trade:
             if not getattr(self, "_notified_cannot_trade", False):
                 self._push_log(
@@ -4320,6 +4358,9 @@ class TradingEngine:
 
             custom_watchlist = config_manager.get_watchlist()
             full_universe = list(set(get_nifty100_universe() + custom_watchlist))
+            progress.update(
+                force=True, phase="screening", universeSize=len(full_universe)
+            )
 
             self._push_log(
                 f"Running algorithmic screener on NIFTY 100 + {len(custom_watchlist)} custom stocks..."
@@ -4373,12 +4414,16 @@ class TradingEngine:
             signal["screener_ranking"] = rankings.get(signal["tradingsymbol"])
             if signal["signal_score"] >= 70:
                 self._push_signal(signal)
+                progress.signal_published()
                 with batch_lock:
                     batch_signals.append(signal)
 
         scan_options = {"analysis_only": True} if analysis_only else {}
         scanner.scan_watchlist(
-            list(universe), on_signal=handle_new_signal, **scan_options
+            list(universe),
+            on_signal=handle_new_signal,
+            progress=progress,
+            **scan_options,
         )
         for signal in ordered_entry_signals(batch_signals, universe):
             probability = signal.get("estimated_probability")
