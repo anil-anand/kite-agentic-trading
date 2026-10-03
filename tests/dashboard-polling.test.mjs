@@ -16,9 +16,10 @@ test('Dashboard overlays partial polls on the latest store until verified empty'
   let explanationUnavailable = false;
   const state = {
     positions: [], dashboard: null, agentState: {}, activityLog: [],
-    auth: { isLoggedIn: true },
+    auth: { isLoggedIn: true }, connectionStatus: 'connected', dashboardStatus: 'loading',
     setPositions: (rows) => { state.positions = rows; },
-    setDashboard: (summary) => { state.dashboard = summary; },
+    setDashboard: (summary) => { state.dashboard = summary; state.dashboardStatus = 'ready'; },
+    setDashboardStatus: (status) => { state.dashboardStatus = status; },
   };
   const store = () => ({ ...state });
   store.getState = () => state;
@@ -87,4 +88,107 @@ test('Dashboard overlays partial polls on the latest store until verified empty'
   assert.equal(requests, 8);
   cleanup();
   assert.equal(cleared, true);
+});
+
+test('Dashboard fetches on login, distinguishes loading from failure, and fences late responses', async () => {
+  let effect;
+  let dependencies;
+  let cleanup;
+  let poll;
+  let cursor = 0;
+  let requests = 0;
+  let finishSummary;
+  let finishPositions;
+  let failing = false;
+  const localState = [];
+  const state = {
+    auth: { isLoggedIn: false }, connectionStatus: 'connected',
+    dashboard: null, dashboardStatus: 'loading', positions: [], agentState: {}, activityLog: [],
+    setDashboard: (summary) => { state.dashboard = summary; state.dashboardStatus = 'ready'; },
+    setDashboardStatus: (status) => { state.dashboardStatus = status; },
+    setPositions: (positions) => { state.positions = positions; },
+  };
+  const store = () => state;
+  store.getState = () => state;
+  const react = {
+    useState: (initial) => {
+      const index = cursor++;
+      if (!(index in localState)) localState[index] = initial;
+      return [localState[index], value => { localState[index] = value; }];
+    },
+    useEffect: (callback, deps) => {
+      if (!dependencies || deps.some((value, index) => value !== dependencies[index])) effect = callback;
+      dependencies = deps;
+    },
+    createElement: (type, props, ...children) => typeof type === 'function'
+      ? type({ ...props, children }) : { type, props, children },
+  };
+  const result = await build({
+    entryPoints: ['src/renderer/pages/Dashboard.tsx'], bundle: true,
+    format: 'cjs', platform: 'node', write: false,
+    plugins: [{ name: 'offline-dashboard-startup', setup(builder) {
+      builder.onResolve({ filter: /^react(?:\/jsx-runtime)?$|^lucide-react$|stores\/trading-store|hooks\/useKiteAPI|components\/(PositionCard|AgentEntryNotice)$/ },
+        ({ path }) => ({ path, namespace: 'fixture' }));
+      builder.onLoad({ filter: /.*/, namespace: 'fixture' }, ({ path }) => ({
+        contents: path === 'react/jsx-runtime'
+          ? 'export const jsx = (type, props) => globalThis.react.createElement(type, props, props.children); export const jsxs = jsx; export const Fragment = "fragment";'
+          : path === 'react' ? 'export default globalThis.react;'
+          : path.includes('trading-store') ? 'export const useTradingStore = globalThis.store;'
+          : path.includes('useKiteAPI') ? 'export const useKiteAPI = () => ({});'
+          : 'export const Activity = () => null; export default () => null;',
+        loader: 'js',
+      }));
+    } }],
+  });
+  const context = vm.createContext({
+    module: { exports: {} }, react, store, console: { error() {} },
+    window: { electronAPI: {
+      dashboard: { summary: () => {
+        requests++;
+        return failing ? Promise.reject(new Error('offline')) : new Promise(resolve => { finishSummary = resolve; });
+      } },
+      portfolio: { positions: () => {
+        requests++;
+        return failing ? Promise.reject(new Error('offline')) : new Promise(resolve => { finishPositions = resolve; });
+      } },
+    } },
+    setInterval: callback => { poll = callback; return 1; }, clearInterval() {},
+  });
+  vm.runInContext(result.outputFiles[0].text, context);
+  const render = () => { cursor = 0; return JSON.stringify(context.module.exports.default()); };
+  const commitEffect = () => { cleanup?.(); cleanup = effect?.(); effect = undefined; };
+
+  render();
+  commitEffect();
+  assert.equal(requests, 0);
+  state.auth = { isLoggedIn: true };
+  render();
+  assert.ok(effect, 'login must trigger a new effect without waiting for the polling interval');
+  commitEffect();
+  assert.equal(requests, 2);
+  assert.match(render(), /Loading open positions/);
+  assert.doesNotMatch(render(), /Unavailable|unavailable|No open positions/);
+  finishSummary({ availableMargin: 12345, netPnl: 25, totalPnl: 25, tradesToday: 0, winRate: 0 });
+  finishPositions({ snapshotQuality: 'COMPLETE', net: [] });
+  await new Promise(setImmediate);
+  assert.match(render(), /₹12345.00/);
+  assert.match(render(), /₹25.00/);
+  assert.match(render(), /No open positions/);
+  assert.equal(state.dashboardStatus, 'ready');
+
+  failing = true;
+  await poll();
+  assert.equal(state.dashboardStatus, 'error');
+  assert.equal(state.dashboard.availableMargin, 12345, 'last-known facts are retained while stale values are hidden');
+  assert.match(render(), /Unavailable/);
+  assert.match(render(), /Open positions unavailable/);
+  assert.doesNotMatch(render(), /₹12345.00/);
+
+  failing = false;
+  const pendingPoll = poll();
+  cleanup();
+  finishSummary({ availableMargin: 99999 });
+  finishPositions({ snapshotQuality: 'COMPLETE', net: [] });
+  await pendingPoll;
+  assert.equal(state.dashboardStatus, 'error', 'unmounted polls cannot restore stale account data');
 });

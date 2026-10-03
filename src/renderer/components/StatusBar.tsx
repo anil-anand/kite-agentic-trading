@@ -1,9 +1,10 @@
 import React from 'react';
 import { useTradingStore } from '../stores/trading-store';
+import Skeleton from './Skeleton';
 
 const StatusBar: React.FC = () => {
-  const { auth, connectionStatus, agentState, dashboard } = useTradingStore();
-  const pnl = dashboard?.netPnl ?? null;
+  const { auth, connectionStatus, agentState, dashboard, dashboardStatus } = useTradingStore();
+  const pnl = dashboardStatus === 'error' ? null : dashboard?.netPnl ?? null;
 
   // Simple IST check
   const isMarketOpen = () => {
@@ -50,9 +51,11 @@ const StatusBar: React.FC = () => {
       </div>
       <div className="flex items-center gap-2">
         <span className="text-surface-400">Today's net P&L:</span>
-        <span className={`font-bold ${pnl == null ? 'text-surface-300' : pnl >= 0 ? 'text-profit-light' : 'text-loss-light'}`}>
+        {!auth.isLoggedIn ? <span className="text-surface-400">—</span> : dashboardStatus === 'loading' ? (
+          <span role="status" aria-label="Loading today's net P&L"><Skeleton className="h-4 w-20" /></span>
+        ) : <span className={`font-bold ${pnl == null ? 'text-surface-300' : pnl >= 0 ? 'text-profit-light' : 'text-loss-light'}`}>
           {pnl == null ? 'Unavailable' : `${pnl >= 0 ? '+' : '-'}₹${Math.abs(pnl).toFixed(2)}`}
-        </span>
+        </span>}
       </div>
     </div>
   );

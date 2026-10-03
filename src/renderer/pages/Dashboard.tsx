@@ -4,20 +4,23 @@ import { useKiteAPI } from '../hooks/useKiteAPI';
 import PnLDisplay from '../components/PnLDisplay';
 import PositionCard from '../components/PositionCard';
 import AgentEntryNotice from '../components/AgentEntryNotice';
+import Skeleton from '../components/Skeleton';
 import { Activity } from 'lucide-react';
 import type { ActivePositionExplanation, Position } from '@shared/types';
 import { matchPositionExplanation } from '../utils/position-explanations';
 
 const Dashboard: React.FC = () => {
-  const { dashboard, positions, agentState, activityLog, setDashboard, setPositions } = useTradingStore();
+  const { auth, connectionStatus, dashboard, dashboardStatus, positions, agentState, activityLog, setDashboard, setDashboardStatus, setPositions } = useTradingStore();
   const { startAgent, stopAgent, closePosition, emergencyFlatten } = useKiteAPI();
   const [positionQuality, setPositionQuality] = React.useState<string | null>(null);
-  const [summaryQuality, setSummaryQuality] = React.useState<string | null>(null);
   const [operatorPending, setOperatorPending] = React.useState<string | null>(null);
   const [flattenSubmitting, setFlattenSubmitting] = React.useState(false);
   const [controlPending, setControlPending] = React.useState(false);
   const [operatorError, setOperatorError] = React.useState<string | null>(null);
   const [positionExplanations, setPositionExplanations] = React.useState<Record<string, ActivePositionExplanation>>({});
+  const summaryLoading = dashboardStatus === 'loading';
+  const summary = dashboardStatus === 'error' ? null : dashboard;
+  const positionsLoading = positionQuality === null && positions.length === 0;
 
   const handleToggleAgent = async () => {
     if (controlPending) return;
@@ -40,6 +43,15 @@ const Dashboard: React.FC = () => {
   };
 
   React.useEffect(() => {
+    if (!auth.isLoggedIn) return;
+    if (connectionStatus !== 'connected') {
+      setDashboardStatus('error');
+      setPositionQuality('UNAVAILABLE');
+      setPositionExplanations({});
+      return;
+    }
+    if (!useTradingStore.getState().dashboard) setDashboardStatus('loading');
+    setPositionQuality(null);
     let active = true;
     let fetching = false;
     const fetchData = async () => {
@@ -70,9 +82,8 @@ const Dashboard: React.FC = () => {
 
       if (summaryResult.status === 'fulfilled' && summaryResult.value) {
         setDashboard(summaryResult.value);
-        setSummaryQuality(null);
       } else {
-        setSummaryQuality('UNAVAILABLE');
+        setDashboardStatus('error');
         if (summaryResult.status === 'rejected') {
           console.error('Failed to fetch dashboard summary:', summaryResult.reason);
         }
@@ -113,7 +124,7 @@ const Dashboard: React.FC = () => {
     fetchData();
     const interval = setInterval(fetchData, 10000); // refresh every 10s
     return () => { active = false; clearInterval(interval); };
-  }, [setDashboard, setPositions]);
+  }, [auth.isLoggedIn, connectionStatus, setDashboard, setDashboardStatus, setPositions]);
 
   const handleExit = async (position: Position) => {
     if (!position.positionKey || operatorPending || agentState.pendingClosePositionKeys?.includes(position.positionKey)) return;
@@ -150,7 +161,7 @@ const Dashboard: React.FC = () => {
       <h1 className="text-2xl font-bold text-white">Dashboard</h1>
       {operatorError && <div role="alert" className="rounded border border-loss-dark p-3 text-loss-light">{operatorError}</div>}
       <AgentEntryNotice />
-      {((positionQuality && positionQuality !== 'COMPLETE') || summaryQuality ||
+      {((positionQuality && positionQuality !== 'COMPLETE') || dashboardStatus === 'error' ||
         (dashboard?.reconciliationStatus && dashboard.reconciliationStatus !== 'RECONCILED')) && (
         <div className="rounded border border-amber-700/60 bg-amber-900/20 p-3 text-sm text-amber-200">
           Broker data is degraded or pending reconciliation. Risk and P&amp;L values may be unavailable.
@@ -159,35 +170,43 @@ const Dashboard: React.FC = () => {
       
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
         <PnLDisplay 
-          amount={dashboard?.totalPnl ?? null}
-          netAmount={dashboard?.netPnl}
+          loading={summaryLoading}
+          amount={summary?.totalPnl ?? null}
+          netAmount={summary?.netPnl}
           percentage={
-            ((dashboard?.availableMargin ?? 0) + (dashboard?.usedMargin ?? 0)) > 0 && dashboard?.netPnl != null
-              ? (dashboard.netPnl / ((dashboard.availableMargin ?? 0) + (dashboard.usedMargin ?? 0))) * 100
+            ((summary?.availableMargin ?? 0) + (summary?.usedMargin ?? 0)) > 0 && summary?.netPnl != null
+              ? (summary.netPnl / ((summary.availableMargin ?? 0) + (summary.usedMargin ?? 0))) * 100
               : undefined
           } 
         />
         
-        <div className="bg-surface-800 p-4 rounded-xl border border-surface-700 flex flex-col justify-center">
+        <div aria-busy={summaryLoading} className="bg-surface-800 p-4 rounded-xl border border-surface-700 flex flex-col justify-center">
           <span className="text-surface-400 text-sm mb-1">Trades Taken</span>
-          <span className="text-3xl font-mono text-white font-bold">{dashboard?.tradesToday || 0}</span>
+          {summaryLoading ? <Skeleton className="h-9 w-16" /> : <span className="text-3xl font-mono text-white font-bold">{summary?.tradesToday ?? 'Unavailable'}</span>}
         </div>
         
-        <div className="bg-surface-800 p-4 rounded-xl border border-surface-700 flex flex-col justify-center">
+        <div aria-busy={summaryLoading} className="bg-surface-800 p-4 rounded-xl border border-surface-700 flex flex-col justify-center">
           <span className="text-surface-400 text-sm mb-1">Win Rate</span>
-          <span className="text-3xl font-mono text-white font-bold">{dashboard?.winRate || 0}%</span>
+          {summaryLoading ? <Skeleton className="h-9 w-20" /> : <span className="text-3xl font-mono text-white font-bold">{summary?.winRate != null ? `${summary.winRate}%` : 'Unavailable'}</span>}
         </div>
         
-        <div className="bg-surface-800 p-4 rounded-xl border border-surface-700 flex flex-col justify-center">
+        <div aria-busy={summaryLoading} className="bg-surface-800 p-4 rounded-xl border border-surface-700 flex flex-col justify-center">
           <span className="text-surface-400 text-sm mb-1">Available Margin</span>
-          <span className="text-3xl font-mono text-white font-bold">{dashboard?.availableMargin != null ? `₹${dashboard.availableMargin.toFixed(2)}` : 'Unavailable'}</span>
+          {summaryLoading ? <Skeleton className="h-9 w-40 max-w-full" /> : <span className="text-3xl font-mono text-white font-bold">{summary?.availableMargin != null ? `₹${summary.availableMargin.toFixed(2)}` : 'Unavailable'}</span>}
         </div>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <div className="lg:col-span-2 space-y-4">
           <h2 className="text-xl font-semibold text-white">Open Positions</h2>
-          {positions.filter(p => p.quantity !== 0).length === 0 && positionQuality !== 'COMPLETE' ? (
+          {positionsLoading ? (
+            <div role="status" aria-label="Loading open positions" className="bg-surface-800 border border-surface-700 rounded-xl p-8 h-48 space-y-4">
+              <Skeleton className="h-4 w-1/3" />
+              <Skeleton className="h-7 w-2/3" />
+              <Skeleton className="h-4 w-1/2" />
+              <span className="sr-only">Loading open positions…</span>
+            </div>
+          ) : positions.filter(p => p.quantity !== 0).length === 0 && positionQuality !== 'COMPLETE' ? (
             <div className="bg-surface-800 border border-amber-700/60 rounded-xl p-8 flex flex-col items-center justify-center text-amber-200 h-48">
               <Activity size={48} className="mb-4 opacity-40" />
               <p>Open positions unavailable</p>
@@ -227,9 +246,9 @@ const Dashboard: React.FC = () => {
             </div>
             <dl className="mb-4 space-y-2 text-xs text-surface-300">
               <div className="flex justify-between"><dt>Position supervision</dt><dd>{agentState.supervisionActive ? 'ACTIVE' : 'UNVERIFIED'}</dd></div>
-              <div className="flex justify-between"><dt>Broker data</dt><dd>{positionQuality || 'UNKNOWN'}</dd></div>
+              <div className="flex justify-between"><dt>Broker data</dt><dd>{positionQuality || 'LOADING'}</dd></div>
               <div className="flex justify-between"><dt>Reconciliation</dt><dd>{agentState.reconciliationPending || agentState.lifecycleRecoveryPending ? 'PENDING' : dashboard?.reconciliationStatus || 'UNKNOWN'}</dd></div>
-              <div className="flex justify-between"><dt>Daily-loss latch</dt><dd>{summaryQuality || dashboard?.killSwitchActive == null ? 'UNKNOWN' : dashboard.killSwitchActive ? 'LATCHED' : 'CLEAR'}</dd></div>
+              <div className="flex justify-between"><dt>Daily-loss latch</dt><dd>{summaryLoading ? 'LOADING' : dashboardStatus === 'error' || dashboard?.killSwitchActive == null ? 'UNKNOWN' : dashboard.killSwitchActive ? 'LATCHED' : 'CLEAR'}</dd></div>
             </dl>
             <button 
               onClick={handleToggleAgent}

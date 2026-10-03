@@ -67,6 +67,7 @@ test('backend readiness requires trusted rehydration and one handshake per child
   const { bridge, children, statuses } = await bridgeFixture();
   bridge.start();
   const child = children[0];
+  assert.equal(bridge.getStatus().ready, false);
   await assert.rejects(bridge.call('start_agent'), /not ready/);
   child.send({ event: 'backend:ready', data: { generation: 'one' } });
   child.send({ event: 'backend:ready', data: { generation: 'one' } });
@@ -77,8 +78,10 @@ test('backend readiness requires trusted rehydration and one handshake per child
   await child.reply({ is_valid: true });
   assert.equal(child.requests.at(-1).method, 'resume_supervision');
   assert.equal(bridge.isRunning(), false);
+  assert.equal(bridge.getStatus().ready, false);
   await child.reply({ supervisionActive: true, running: false, reconciliationPending: true });
   assert.equal(bridge.isRunning(), true);
+  assert.equal(bridge.getStatus().ready, true, 'readiness can be queried after the ready event');
   assert.equal(statuses.at(-1).supervision.reconciliationPending, true);
   assert.equal(statuses.at(-1).tradingReady, false, 'control transport readiness must not advertise trading recovery');
   child.send({ event: 'backend:ready', data: { generation: 'one' } });
@@ -88,6 +91,7 @@ test('backend readiness requires trusted rehydration and one handshake per child
   child.emit('exit', 1, null);
   await rejection;
   assert.equal(bridge.isRunning(), false);
+  assert.match(bridge.getStatus().error, /Exited/);
   bridge.stop();
 });
 
@@ -178,6 +182,8 @@ test('root subscriptions preserve backend mode, invalidate lost supervision, and
   const effects: (() => (() => void) | undefined)[] = [];
   const state: any = {
     agentState: {}, auth: {},
+    startup: { status: 'connecting', error: null },
+    setStartup: (startup: unknown) => { state.startup = startup; },
     setAgentState: (patch: unknown) => Object.assign(state.agentState, patch),
     setAuth: (patch: unknown) => Object.assign(state.auth, patch),
     setConnectionStatus: (status: string) => { state.connectionStatus = status; },
@@ -187,6 +193,7 @@ test('root subscriptions preserve backend mode, invalidate lost supervision, and
     on: (channel: string, listener: (...args: any[]) => void) => { if (!listeners.has(channel)) listeners.set(channel, new Set()); listeners.get(channel)!.add(listener); return () => listeners.get(channel)?.delete(listener); },
     removeListener: (channel: string, listener: (...args: any[]) => void) => listeners.get(channel)?.delete(listener),
     invoke: async (channel: string) => {
+      if (channel === IPC.APP_GET_PYTHON_STATUS) return { ready: true };
       if (channel === IPC.AUTH_STATUS) return true;
       if (channel === IPC.AGENT_STATUS) return { mode: 'confirm', running: true, supervisionActive: true };
       if (channel === IPC.SETTINGS_GET) return { mode: 'auto' };
@@ -196,7 +203,7 @@ test('root subscriptions preserve backend mode, invalidate lost supervision, and
   const module = await bundledModule('src/renderer/hooks/useKiteAPI.ts', {
     react: { useEffect: (effect: () => (() => void) | undefined) => effects.push(effect) },
     '../stores/trading-store': { useTradingStore: () => state },
-  }, { window: { electronAPI: api } });
+  }, { window: { electronAPI: api }, setTimeout, clearTimeout });
   module.useKiteAPI({ subscribe: true });
   const cleanup = effects[0]()!;
   await flush();
@@ -220,6 +227,7 @@ test('close stays pending after acceptance and emergency remains usable during a
   const position = { positionKey: 'LIVE:A:NSE:A:MIS', tradingsymbol: 'A', quantity: 10 };
   const state: any = {
     positions: [position], dashboard: null, agentState: {}, activityLog: [],
+    auth: { isLoggedIn: true }, connectionStatus: 'connected',
     setDashboard() {}, setPositions() {}, setAgentState: (patch: unknown) => Object.assign(state.agentState, patch),
   };
   const store = Object.assign(() => state, { getState: () => state });

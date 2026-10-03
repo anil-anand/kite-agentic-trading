@@ -29,6 +29,16 @@ export interface AuthState {
   error: string | null;
 }
 
+export interface BackendStatus {
+  running: boolean;
+  ready: boolean;
+  error: string | null;
+  generation?: string;
+  tradingReady?: boolean;
+  sessionValid?: boolean;
+  supervision?: Partial<AgentState>;
+}
+
 // ─── Market Data ──────────────────────────────────────────────────
 
 export interface Tick {

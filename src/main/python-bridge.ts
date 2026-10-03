@@ -2,7 +2,7 @@ import { spawn, ChildProcess } from 'child_process';
 import * as path from 'path';
 import { app, WebContents } from 'electron';
 import { sameDocumentLocation } from '../shared/navigation-policy';
-import { RPCRequest, RPCResponse, RPCEvent } from '../shared/types';
+import { RPCRequest, RPCResponse, RPCEvent, BackendStatus } from '../shared/types';
 import * as channels from '../shared/ipc-channels';
 import { secureStorage } from './secure-storage';
 
@@ -19,6 +19,7 @@ class PythonBridge {
   private maxRestarts = 3;
   private isShuttingDown = false;
   private backendReady = false;
+  private backendStatus: BackendStatus = { running: false, ready: false, error: null };
   private handshakeStarted = false;
   private restartTimer: ReturnType<typeof setTimeout> | null = null;
   private pythonPath: string;
@@ -88,7 +89,7 @@ class PythonBridge {
       this.rejectPendingRequests(new Error(`Python backend exited with code ${code}`));
       
       // Notify renderer
-      this.broadcastToRenderer(channels.APP_PYTHON_STATUS, { running: false, error: `Exited with code ${code}` });
+      this.publishStatus({ running: false, ready: false, error: `Exited with code ${code}` });
 
       if (!this.isShuttingDown && this.restartCount < this.maxRestarts) {
         this.restartCount++;
@@ -108,7 +109,7 @@ class PythonBridge {
       console.error('Failed to start Python process:', err);
       this.backendReady = false;
       this.rejectPendingRequests(err);
-      this.broadcastToRenderer(channels.APP_PYTHON_STATUS, { running: false, ready: false, error: err.message });
+      this.publishStatus({ running: false, ready: false, error: err.message });
       // A failed spawn emits error/close but never exit. Release that child so
       // recovery does not get stuck behind a process that was never started.
       if (!child.pid) {
@@ -116,7 +117,7 @@ class PythonBridge {
       }
     });
 
-    this.broadcastToRenderer(channels.APP_PYTHON_STATUS, { running: false, ready: false, error: null });
+    this.publishStatus({ running: false, ready: false, error: null });
   }
 
   public stop(): void {
@@ -134,7 +135,18 @@ class PythonBridge {
     }
     
     this.backendReady = false;
+    this.publishStatus({ running: false, ready: false, error: 'Python bridge shutting down' });
     this.rejectPendingRequests(new Error('Python bridge shutting down'));
+  }
+
+  public getStatus(): BackendStatus {
+    return { ...this.backendStatus };
+  }
+
+  private publishStatus(status: BackendStatus): void {
+    // Keep readiness available to renderers mounted after the event was sent.
+    this.backendStatus = status;
+    this.broadcastToRenderer(channels.APP_PYTHON_STATUS, status);
   }
 
   public isRunning(): boolean {
@@ -183,7 +195,7 @@ class PythonBridge {
       const supervision = await this.callRpc('resume_supervision', {}, false);
       if (!isCurrent()) return;
       this.backendReady = true;
-      this.broadcastToRenderer(channels.APP_PYTHON_STATUS, {
+      this.publishStatus({
         running: true,
         ready: true,
         tradingReady: session?.is_valid === true && supervision?.supervisionActive === true
@@ -198,7 +210,7 @@ class PythonBridge {
     } catch (error: any) {
       if (!isCurrent()) return;
       this.backendReady = false;
-      this.broadcastToRenderer(channels.APP_PYTHON_STATUS, {
+      this.publishStatus({
         running: false,
         ready: false,
         generation,

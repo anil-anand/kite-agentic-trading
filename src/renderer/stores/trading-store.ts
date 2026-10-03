@@ -8,6 +8,7 @@ import {
 
 interface TradingState {
   auth: AuthState;
+  startup: { status: 'connecting' | 'restoring-session' | 'ready' | 'error'; error: string | null };
   positions: Position[];
   orders: Order[];
   holdings: Holding[];
@@ -19,9 +20,11 @@ interface TradingState {
   ticks: Record<string, Tick>;
   settings: AppSettings | null;
   dashboard: DashboardSummary | null;
+  dashboardStatus: 'loading' | 'ready' | 'error';
   connectionStatus: 'connected' | 'disconnected' | 'connecting';
 
   setAuth: (auth: Partial<AuthState>) => void;
+  setStartup: (startup: TradingState['startup']) => void;
   setPositions: (positions: Position[]) => void;
   setOrders: (orders: Order[]) => void;
   setHoldings: (holdings: Holding[]) => void;
@@ -36,6 +39,7 @@ interface TradingState {
   updateTick: (symbol: string, tick: Tick) => void;
   setSettings: (settings: AppSettings) => void;
   setDashboard: (dashboard: DashboardSummary) => void;
+  setDashboardStatus: (status: TradingState['dashboardStatus']) => void;
   setConnectionStatus: (status: 'connected' | 'disconnected' | 'connecting') => void;
 }
 
@@ -47,6 +51,7 @@ export const useTradingStore = create<TradingState>()(
   persist(
     (set) => ({
       auth: { isLoggedIn: false, credentials: null, loginUrl: null, error: null },
+      startup: { status: 'connecting', error: null },
       positions: [],
       orders: [],
       holdings: [],
@@ -69,9 +74,16 @@ export const useTradingStore = create<TradingState>()(
       ticks: {},
       settings: null,
       dashboard: null,
-      connectionStatus: 'disconnected',
+      dashboardStatus: 'loading',
+      connectionStatus: 'connecting',
 
-      setAuth: (auth) => set((state) => ({ auth: { ...state.auth, ...publicAuthState(auth) } })),
+      setAuth: (auth) => set((state) => ({
+        auth: { ...state.auth, ...publicAuthState(auth) },
+        ...(typeof auth.isLoggedIn === 'boolean' && auth.isLoggedIn !== state.auth.isLoggedIn
+          ? { dashboard: null, dashboardStatus: 'loading' as const, positions: [] }
+          : {}),
+      })),
+      setStartup: (startup) => set({ startup }),
       setPositions: (positions) => set({ positions }),
       setOrders: (orders) => set({ orders }),
       setHoldings: (holdings) => set({ holdings }),
@@ -101,7 +113,8 @@ export const useTradingStore = create<TradingState>()(
       setWatchlist: (watchlist) => set({ watchlist }),
       updateTick: (symbol, tick) => set((state) => ({ ticks: { ...state.ticks, [symbol]: tick } })),
       setSettings: (settings) => set({ settings }),
-      setDashboard: (dashboard) => set({ dashboard }),
+      setDashboard: (dashboard) => set({ dashboard, dashboardStatus: 'ready' }),
+      setDashboardStatus: (dashboardStatus) => set({ dashboardStatus }),
       setConnectionStatus: (status) => set({ connectionStatus: status })
     }),
     {

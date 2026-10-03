@@ -72,6 +72,7 @@ export const WATCHLIST_UPDATE = 'watchlist:update'; // Main → Renderer event
 export const APP_READY = 'app:ready';
 export const APP_ERROR = 'app:error'; // Main → Renderer event
 export const APP_PYTHON_STATUS = 'app:python-status';
+export const APP_GET_PYTHON_STATUS = 'app:get-python-status';
 
 // ─── Dashboard ────────────────────────────────────────────────────
 export const DASHBOARD_SUMMARY = 'dashboard:summary';
@@ -96,6 +97,7 @@ export const BACKTEST_RUN = 'backtest:run';
 
 // Explicit capability lists. Adding a channel requires choosing its direction.
 export const INVOKE_CHANNELS = [
+  APP_GET_PYTHON_STATUS,
   AUTH_LOGIN, AUTH_LOGOUT, AUTH_STATUS,
   ORDERS_PLACE, ORDERS_MODIFY, ORDERS_CANCEL, ORDERS_GET_ALL, ORDERS_GET_TRADES,
   PORTFOLIO_POSITIONS, PORTFOLIO_HOLDINGS, PORTFOLIO_MARGINS,
