@@ -2,7 +2,9 @@
   "compilerOptions": {
     "target": "ES2022",
     "module": "commonjs",
-    "lib": ["ES2022"],
+    "lib": [
+      "ES2022"
+    ],
     "outDir": "dist/main",
     "rootDir": "src",
     "strict": true,
@@ -14,10 +16,19 @@
     "declarationMap": true,
     "sourceMap": true,
     "paths": {
-      "@shared/*": ["./src/shared/*"]
+      "@shared/*": [
+        "./src/shared/*"
+      ]
     },
     "baseUrl": "."
   },
-  "include": ["src/main/**/*", "src/shared/**/*"],
-  "exclude": ["node_modules", "dist"]
+  "include": [
+    "src/main/**/*",
+    "src/shared/**/*"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "src/main/preload.ts"
+  ]
 }

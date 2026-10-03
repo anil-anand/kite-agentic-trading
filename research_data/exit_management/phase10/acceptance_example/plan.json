@@ -1,0 +1,166 @@
+{
+  "candidate_policy": {
+    "hard_risk_policy": {
+      "mark_max_age_seconds": 120.0,
+      "policy_version": "hard-risk-v1",
+      "require_protection": true
+    },
+    "policy_version": "deterministic-exit-v1",
+    "profile_overrides": {},
+    "tick_size": 0.05
+  },
+  "cases": [
+    "case-0.json",
+    "case-1.json",
+    "case-2.json"
+  ],
+  "control_description": "Synthetic shared-policy comparison only; not the correctness-repaired legacy control.",
+  "control_policy": {
+    "hard_risk_policy": {
+      "mark_max_age_seconds": 120.0,
+      "policy_version": "hard-risk-v1",
+      "require_protection": true
+    },
+    "policy_version": "synthetic-control-only",
+    "profile_overrides": {
+      "breakout_follow_through": {
+        "boundary_buffer_atr_multiple": 0.1,
+        "failure_confirmation_bars": 3,
+        "minimum_buffer_ticks": 2,
+        "name": "breakout_follow_through",
+        "normal_thesis_management": true,
+        "objective_mode": "fixed_objective",
+        "profit_reversal_min_giveback_r": 1.0,
+        "profit_reversal_min_mfe_r": 2.0,
+        "recovery_confirmation_bars": 2,
+        "requires_vwap_acceptance": false,
+        "review_horizon_bars": 6,
+        "structural_trail_buffer_atr_multiple": 0.1,
+        "values": {
+          "control_policy_version": "legacy-control-v1",
+          "entry_boundary": {
+            "end": "2026-09-20T04:20:00+00:00",
+            "high": 99.5,
+            "known_at": "2026-09-20T04:20:00+00:00",
+            "low": 96.0,
+            "source_bar_ids": [
+              "range-bar-1"
+            ],
+            "start": "2026-09-20T04:00:00+00:00"
+          },
+          "normal_policy_implemented": false,
+          "objective_mode": "legacy_fixed",
+          "requested_profile": "breakout_follow_through",
+          "requested_profile_version": "management-profiles-v1"
+        },
+        "version": "management-profiles-v1"
+      }
+    },
+    "tick_size": 0.05
+  },
+  "criteria": {
+    "maximum_ambiguous_execution_rate": 1,
+    "maximum_cost_stressed_loss_increase_r": 0.1,
+    "maximum_delayed_invalidation_increase": 0,
+    "maximum_tail_adverse_r": 2,
+    "maximum_unresolved_execution_rate": 0,
+    "minimum_capture_improvement_r": 0.05,
+    "minimum_completed_trades": 2,
+    "minimum_oos_folds": 2,
+    "minimum_premature_exit_reduction": 0.05,
+    "require_untouched_holdout": true,
+    "required_security_gates": [
+      "F26",
+      "F29",
+      "F30"
+    ]
+  },
+  "data_classification": "SYNTHETIC_NON_SENSITIVE",
+  "data_source": "deterministic synthetic offline fixture, no market or account data",
+  "datasets": {
+    "RELIANCE": "candles.csv"
+  },
+  "execution_scenarios": {
+    "base": {},
+    "slippage-25bps": {
+      "execution_policy": {
+        "slippage_bps": 25
+      }
+    }
+  },
+  "holdout": {
+    "fold_id": "fold-2",
+    "test_end": "2026-09-24T00:00:00+00:00",
+    "test_start": "2026-09-23T00:00:00+00:00",
+    "warmup_start": "2026-09-23T00:00:00+00:00"
+  },
+  "oos_folds": [
+    {
+      "fold_id": "fold-0",
+      "test_end": "2026-09-22T00:00:00+00:00",
+      "test_start": "2026-09-21T00:00:00+00:00",
+      "warmup_start": "2026-09-21T00:00:00+00:00"
+    },
+    {
+      "fold_id": "fold-1",
+      "test_end": "2026-09-23T00:00:00+00:00",
+      "test_start": "2026-09-22T00:00:00+00:00",
+      "warmup_start": "2026-09-22T00:00:00+00:00"
+    }
+  ],
+  "operational_limits": {
+    "maximum_observation_lag_seconds": 10,
+    "maximum_unresolved_position_rate": 0,
+    "minimum_closed_positions": 2,
+    "minimum_decisions": 20,
+    "minimum_hold_decisions": 10,
+    "minimum_sessions": 2
+  },
+  "prior_trial_count": 0,
+  "study_id": "phase10-synthetic-workflow-example",
+  "variants": {
+    "confirmation-3": {
+      "hard_risk_policy": {
+        "mark_max_age_seconds": 120.0,
+        "policy_version": "hard-risk-v1",
+        "require_protection": true
+      },
+      "policy_version": "synthetic-control-only",
+      "profile_overrides": {
+        "breakout_follow_through": {
+          "boundary_buffer_atr_multiple": 0.1,
+          "failure_confirmation_bars": 3,
+          "minimum_buffer_ticks": 2,
+          "name": "breakout_follow_through",
+          "normal_thesis_management": true,
+          "objective_mode": "fixed_objective",
+          "profit_reversal_min_giveback_r": 1.0,
+          "profit_reversal_min_mfe_r": 2.0,
+          "recovery_confirmation_bars": 2,
+          "requires_vwap_acceptance": false,
+          "review_horizon_bars": 6,
+          "structural_trail_buffer_atr_multiple": 0.1,
+          "values": {
+            "control_policy_version": "legacy-control-v1",
+            "entry_boundary": {
+              "end": "2026-09-20T04:20:00+00:00",
+              "high": 99.5,
+              "known_at": "2026-09-20T04:20:00+00:00",
+              "low": 96.0,
+              "source_bar_ids": [
+                "range-bar-1"
+              ],
+              "start": "2026-09-20T04:00:00+00:00"
+            },
+            "normal_policy_implemented": false,
+            "objective_mode": "legacy_fixed",
+            "requested_profile": "breakout_follow_through",
+            "requested_profile_version": "management-profiles-v1"
+          },
+          "version": "management-profiles-v1"
+        }
+      },
+      "tick_size": 0.05
+    }
+  }
+}

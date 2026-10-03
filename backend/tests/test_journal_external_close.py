@@ -8,14 +8,31 @@ forever and never reached analytics.
 
 import datetime
 
+import pytest
+
 import backend.trading_engine as te
 from backend.trading_engine import TradingEngine
+
+
+@pytest.fixture(autouse=True)
+def open_brokerage_session(monkeypatch, open_session_clock):
+    """External-close attribution must not depend on the test host's session."""
+    monkeypatch.setattr(
+        TradingEngine, "_session_clock", lambda self: open_session_clock
+    )
 
 
 class FakeJournal:
     def __init__(self):
         self.closed = []  # (trade_id, exit_price, reason)
         self.updated = []
+        self.linkage = {}
+
+    def get_trade(self, trade_id):
+        return self.linkage.get(trade_id, {"execution_linkage_history": None})
+
+    def update_execution_linkage(self, trade_id, **kwargs):
+        self.linkage[trade_id] = {**kwargs, "execution_linkage_history": None}
 
     def close_trade(
         self, trade_id, exit_price, reason, exit_time=None, cost_details=None
@@ -34,6 +51,25 @@ class FakeKite:
         self._orders = orders or []
         self._net = positions_net if positions_net is not None else []
         self._trades = trades or []
+        for t in self._trades:
+            if "exchange" not in t:
+                t["exchange"] = "NSE"
+            if "product" not in t:
+                t["product"] = "MIS"
+            if "transaction_type" not in t:
+                t["transaction_type"] = "SELL"
+            if "trade_id" not in t:
+                t["trade_id"] = "TR1"
+            if "order_id" not in t:
+                t["order_id"] = t.get("orderId", "ORD1")
+
+    def get_positions_snapshot(self):
+        from backend.broker_models import normalize_positions_response
+
+        rows = [dict(row, instrument_token=111) for row in self.get_positions()["net"]]
+        return normalize_positions_response(
+            {"net": rows, "day": rows}, account_id="dummy"
+        )
 
     def get_ltp(self, instruments):
         return {key: {"last_price": self._ltp} for key in instruments}
@@ -46,6 +82,15 @@ class FakeKite:
 
     def get_trades(self):
         return self._trades
+
+    def get_fills_snapshot(self):
+        from backend.broker_models import normalize_fills_response
+
+        rows = [
+            dict(row, instrument_token=111, trade_id=f"F{index}")
+            for index, row in enumerate(self.get_trades())
+        ]
+        return normalize_fills_response(rows, account_id="dummy")
 
     # monitor_positions touches these too
     def cancel_order(self, *a, **k):
@@ -65,12 +110,20 @@ class FakeRisk:
     def update_from_positions(self, positions):
         pass
 
+    def update_from_position_snapshot(self, snapshot):
+        pass
+
     def set_open_positions(self, n):
         pass
 
 
 def _trade(**over):
     base = {
+        "tradingsymbol": "RELIANCE",
+        "namespace": "LIVE",
+        "account_id": "dummy",
+        "instrument_id": "111",
+        "product": "MIS",
         "sl": 95.0,
         "target": 110.0,
         "direction": "BUY",
@@ -103,7 +156,7 @@ class TestJournalExternalClose:
 
         eng._journal_external_close("RELIANCE")
 
-        assert j.closed == [("T1", 0.0, "UNRECONCILED")]
+        assert j.closed == [("T1", None, "UNRECONCILED")]
 
     def test_calculates_vwap_from_stop_loss_trades(self, monkeypatch):
         j = FakeJournal()
@@ -185,7 +238,7 @@ class TestJournalExternalClose:
 
         eng._journal_external_close("RELIANCE")
 
-        assert j.closed == [("T1", 0.0, "UNRECONCILED")]
+        assert j.closed == [("T1", None, "UNRECONCILED")]
 
     def test_monitor_positions_journals_external_closure(self, monkeypatch):
         # End-to-end: a tracked position is no longer in the open book (its
@@ -194,6 +247,20 @@ class TestJournalExternalClose:
         j = FakeJournal()
         kite = FakeKite(
             ltp=95.0,
+            orders=[
+                {
+                    "order_id": "STOP1",
+                    "tradingsymbol": "RELIANCE",
+                    "exchange": "NSE",
+                    "product": "MIS",
+                    "transaction_type": "SELL",
+                    "order_type": "SL",
+                    "quantity": 10,
+                    "filled_quantity": 10,
+                    "pending_quantity": 0,
+                    "status": "COMPLETE",
+                }
+            ],
             trades=[
                 {
                     "tradingsymbol": "RELIANCE",
@@ -234,6 +301,20 @@ class TestJournalExternalClose:
             def __init__(self):
                 super().__init__(
                     ltp=95.0,
+                    orders=[
+                        {
+                            "order_id": "STOP1",
+                            "tradingsymbol": "RELIANCE",
+                            "exchange": "NSE",
+                            "product": "MIS",
+                            "transaction_type": "SELL",
+                            "order_type": "SL",
+                            "quantity": 10,
+                            "filled_quantity": 10,
+                            "pending_quantity": 0,
+                            "status": "COMPLETE",
+                        }
+                    ],
                     trades=[
                         {
                             "tradingsymbol": "RELIANCE",
@@ -248,6 +329,9 @@ class TestJournalExternalClose:
                             "tradingsymbol": "RELIANCE",
                             "quantity": 10,
                             "lastPrice": 95.0,
+                            "timestamp": te.now_utc(),
+                            "exchange": "NSE",
+                            "product": "MIS",
                         }
                     ],
                 )

@@ -1,13 +1,18 @@
 import React from 'react';
 import { useTradingStore } from '../stores/trading-store';
-import SignalCard from '../components/SignalCard';
+import AgentEntryNotice from '../components/AgentEntryNotice';
+import ScanActivity from '../components/ScanActivity';
 import { useKiteAPI } from '../hooks/useKiteAPI';
 import { Check, X, Loader2 } from 'lucide-react';
 import { buildStrategySettings, STRATEGY_IDS } from '../utils/strategy-settings';
+import { scanIsBusy, scanSummary } from '../utils/scan-status';
 
 const AgentControl: React.FC = () => {
   const { agentState, signals, setAgentState } = useTradingStore();
-  const { startAgent, stopAgent } = useKiteAPI();
+  const { startAgent, stopAgent, setAgentMode } = useKiteAPI();
+  const [controlPending, setControlPending] = React.useState(false);
+  const [controlError, setControlError] = React.useState<string | null>(null);
+  const scanStatus = scanSummary(agentState);
 
   React.useEffect(() => {
     if (!agentState.running) {
@@ -16,23 +21,40 @@ const AgentControl: React.FC = () => {
   }, []);
 
   const handleToggle = async () => {
+    if (controlPending) return;
+    setControlPending(true);
+    setControlError(null);
     try {
       if (agentState.running) {
-        await stopAgent();
-        setAgentState({ running: false });
+        const state = await stopAgent();
+        setAgentState(state);
         useTradingStore.getState().setSignals([]); // Clear live signals on stop
       } else {
-        await startAgent(agentState.mode || 'auto');
-        setAgentState({ running: true });
+        const state = await startAgent(agentState.mode || 'auto');
+        setAgentState(state);
       }
     } catch (e) {
+      setControlError(e instanceof Error ? e.message : 'Agent command failed');
       console.error('Failed to toggle agent', e);
+    } finally {
+      setControlPending(false);
     }
   };
 
-  const handleModeChange = (mode: 'auto' | 'confirm') => {
-    setAgentState({ mode });
-    window.electronAPI?.invoke('settings:save', { mode });
+  const handleModeChange = async (mode: 'auto' | 'confirm') => {
+    if (controlPending || agentState.mode === mode) return;
+    setControlPending(true);
+    setControlError(null);
+    try {
+      const state = await setAgentMode(mode);
+      setAgentState(state);
+      await window.electronAPI?.invoke('settings:save', { mode });
+    } catch (error) {
+      setControlError(error instanceof Error ? error.message : 'Trading mode change failed');
+      console.error('Failed to change effective trading mode', error);
+    } finally {
+      setControlPending(false);
+    }
   };
 
   const handleStrategyToggle = (strat: any) => {
@@ -94,16 +116,23 @@ const AgentControl: React.FC = () => {
         <div>
           <h1 className="text-2xl font-bold text-white">Agent Control</h1>
           <p className="text-sm text-surface-400 mt-1">
-            Scanning NIFTY 100 universe + your Custom Watchlist using all active strategies below.
+            Selecting candidates from NIFTY 100 + your Custom Watchlist, then scanning with the enabled strategies.
           </p>
         </div>
         <button
           onClick={handleToggle}
+          disabled={controlPending}
           className={`px-8 py-3 rounded-lg font-bold shadow-lg transition-all ${agentState.running ? 'bg-loss-dark hover:bg-loss text-white' : 'bg-profit-dark hover:bg-profit text-white animate-pulse-slow'}`}
         >
-          {agentState.running ? 'STOP AGENT' : 'START AGENT'}
+          {controlPending ? 'UPDATING…' : agentState.scanOnly ? 'STOP SCANNING' : agentState.running ? 'PAUSE ENTRIES' : 'START AGENT'}
         </button>
       </div>
+
+      {controlError && <div role="alert" className="rounded border border-loss-dark p-3 text-loss-light">{controlError}</div>}
+      <AgentEntryNotice />
+      <p className="text-sm text-amber-200">
+        {agentState.statusMessage || (agentState.supervisionActive ? 'Position supervision active.' : 'Position supervision is not yet verified.')}
+      </p>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 relative">
         {/* Sticky Left Column (Controls) */}
@@ -155,28 +184,18 @@ const AgentControl: React.FC = () => {
           {/* Pad the header itself instead of the parent so it blocks scrolling cards behind it */}
           <div className="sticky top-[89px] bg-surface-800 z-20 p-6 pb-4 border-b border-surface-700 rounded-t-xl">
             <div className="flex justify-between items-center">
-              <h2 className="text-lg font-semibold text-white">Live Signals</h2>
+              <h2 className="text-lg font-semibold text-white">{agentState.scanOnly ? 'Scan-only Signals' : 'Live Signals'}</h2>
               <span className="text-xs text-surface-400">Grouped by Confluence</span>
             </div>
+            <ScanActivity state={agentState} />
           </div>
           <div className="space-y-4 p-6 pt-4">
             {groupedSignals.length === 0 ? (
-              agentState.running ? (
-                agentState.status === 'scanning' ? (
-                  <div className="flex flex-col items-center justify-center mt-12 gap-3 text-surface-400">
-                    <Loader2 size={28} className="animate-spin text-accent-light" />
-                    <p className="text-sm font-medium">Scanning the market&hellip;</p>
-                    <p className="text-xs text-surface-500">Signals will appear here as they are detected.</p>
-                  </div>
-                ) : (
-                  <div className="flex flex-col items-center justify-center mt-12 gap-3 text-surface-400">
-                    <p className="text-sm font-medium">Monitoring for new opportunities&hellip;</p>
-                    <p className="text-xs text-surface-500">No trade signals matched your criteria right now.</p>
-                  </div>
-                )
-              ) : (
-                <div className="text-center text-surface-400 mt-10 text-sm">No active signals</div>
-              )
+              <div className="flex flex-col items-center justify-center mt-12 gap-3 text-center text-surface-400" role="status">
+                {(scanIsBusy(agentState.scanProgress) || (agentState.running && !agentState.scanProgress)) && <Loader2 size={28} className="animate-spin text-accent-light" />}
+                <p className="text-sm font-medium text-surface-300">{scanStatus.title}</p>
+                <p className="text-xs leading-relaxed">{scanStatus.detail}</p>
+              </div>
             ) : (
               groupedSignals.map(group => {
                 const bestSignal = group.signals.reduce((prev, current) => ((prev.signal_score ?? (prev as any).signalScore ?? 0) > (current.signal_score ?? (current as any).signalScore ?? 0)) ? prev : current);
@@ -231,18 +250,23 @@ const AgentControl: React.FC = () => {
                       const isCalibrated = probRaw !== null && probRaw !== undefined;
                       const prob = isCalibrated ? probRaw : 0;
                       const isProbHigh = isCalibrated ? prob >= 0.60 : true; // Uncalibrated is allowed to explore
-                      const willAutoEnter = agentState.mode === 'auto' && isProbHigh;
-                      const autoEnterReason = agentState.mode !== 'auto'
+                      const entriesEnabled = !bestSignal.analysisOnly && agentState.running && !agentState.entryPaused && !agentState.reconciliationPending && !agentState.lifecycleRecoveryPending && !agentState.controlStateInvalid && !agentState.protectionFailureHalt && !agentState.hardFlattenReason;
+                      const willAutoEnter = entriesEnabled && agentState.mode === 'auto' && isProbHigh;
+                      const autoEnterReason = bestSignal.analysisOnly
+                        ? 'Analysis only'
+                        : !entriesEnabled
+                        ? 'Entries paused or awaiting recovery'
+                        : agentState.mode !== 'auto'
                         ? 'Mode is not Auto'
                         : !isCalibrated
                           ? 'Exploring (Uncalibrated)'
                           : !isProbHigh
-                            ? `Prob < 60% (${(prob * 100).toFixed(1)}%)`
+                          ? `Historical score-bucket estimate < 60% (${(prob * 100).toFixed(1)}%)`
                             : 'Meets criteria';
 
                       return (
                         <div className="flex items-center justify-between mt-1 p-2 bg-surface-900 rounded border border-surface-700">
-                          <span className="text-xs text-surface-400">Will Auto-Enter:</span>
+                          <span className="text-xs text-surface-400">Preliminary entry eligibility:</span>
                           <div className="flex items-center gap-1.5">
                             <span className={`text-xs font-bold ${willAutoEnter ? 'text-profit-light' : 'text-surface-400'}`}>
                               {willAutoEnter ? 'YES' : 'NO'}
@@ -253,13 +277,19 @@ const AgentControl: React.FC = () => {
                       );
                     })()}
 
+                    {bestSignal.analysisOnly && (
+                      <p className="text-xs text-amber-200">
+                        Analysis only{bestSignal.analysisAsOf ? ` · Candles through ${new Date(bestSignal.analysisAsOf).toLocaleString()}` : ''}
+                      </p>
+                    )}
                     <div className="flex gap-2 mt-2 pt-3 border-t border-surface-700">
                       <button
+                        disabled={bestSignal.analysisOnly || agentState.entryPaused || !agentState.running}
                         onClick={() => {
                           window.electronAPI?.invoke('agent:execute-signal', bestSignal);
                           group.signals.forEach(s => useTradingStore.getState().removeSignal(s.id));
                         }}
-                        className="flex-1 bg-profit-dark hover:bg-profit flex items-center justify-center gap-2 py-2 rounded transition-colors text-white text-sm font-medium"
+                        className="flex-1 bg-profit-dark hover:bg-profit flex items-center justify-center gap-2 py-2 rounded transition-colors text-white text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed"
                       >
                         <Check size={16} /> Take Trade
                       </button>

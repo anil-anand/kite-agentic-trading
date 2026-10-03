@@ -7,6 +7,7 @@ const LoginModal: React.FC = () => {
   const setAuth = useTradingStore(state => state.setAuth);
   const [apiKey, setApiKey] = useState('');
   const [apiSecret, setApiSecret] = useState('');
+  const [redirectUrl, setRedirectUrl] = useState('http://127.0.0.1/');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
@@ -15,7 +16,7 @@ const LoginModal: React.FC = () => {
     setLoading(true);
     setError('');
     try {
-      const res = await login({ apiKey, apiSecret });
+      const res = await login({ apiKey, apiSecret, redirectUrl });
       if (!res) {
         setError('Fatal Error: `res` is undefined. IPC bridge (window.electronAPI) might be broken.');
       } else if (res.error) {
@@ -47,6 +48,11 @@ const LoginModal: React.FC = () => {
             <input required type="password" value={apiSecret} onChange={(e) => setApiSecret(e.target.value)} className="w-full bg-surface-800 border border-surface-700 rounded-lg px-4 py-2.5 text-white focus:outline-none focus:border-accent-light transition-colors" placeholder="••••••••••••••••" />
           </div>
           
+          <div>
+            <label className="block text-surface-300 text-sm font-medium mb-1">Kite app redirect URL</label>
+            <input required type="url" value={redirectUrl} onChange={(e) => setRedirectUrl(e.target.value)} className="w-full bg-surface-800 border border-surface-700 rounded-lg px-4 py-2.5 text-white" />
+            <p className="text-xs text-surface-400 mt-1">Must exactly match the redirect URL configured for your Kite Connect app.</p>
+          </div>
           {error && <div className="text-loss-light text-sm bg-loss-fade p-3 rounded">{error}</div>}
           
           <button type="submit" disabled={loading} className="w-full bg-accent-dark hover:bg-accent py-3 rounded-lg text-white font-bold transition-colors mt-2">

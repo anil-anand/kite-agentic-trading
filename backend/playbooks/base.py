@@ -31,6 +31,16 @@ class BasePlaybook(ABC):
         """
         pass
 
+    def management_profile(self) -> str:
+        """Stable profile name captured with an accepted entry.
+
+        Phase 5 records this value but does not yet use it to change any live
+        exit behavior.  Subclasses override it rather than inferring a profile
+        later from the mutable strategy configuration.
+        """
+
+        return "unknown_legacy_bounded"
+
     @abstractmethod
     def evaluate_invalidation(
         self, position: Dict[str, Any], evaluation: Dict[str, Any]

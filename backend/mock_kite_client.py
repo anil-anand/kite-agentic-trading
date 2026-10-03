@@ -9,15 +9,27 @@ Not for any real trading. Orders are not sent anywhere, but the mock keeps a
 full in-memory simulated book: orders fill (market at the live price, limit at
 the limit, stop-losses rest and trigger when the drifting price crosses them),
 positions mark to a moving price with realised/unrealised P&L, and the
-Orders/Positions views populate — all in the same camelCase shape the real
-KiteClient returns via convert_keys().
+Orders/Positions views populate through the same explicit DTO serializers as
+the real client.
 """
 
 import datetime
 import random
 import zlib
 
+from .broker_models import (
+    BrokerSnapshot,
+    ExecutionNamespace,
+    OrderRole,
+    fill_snapshot_to_renderer_dto,
+    normalize_fills_response,
+    normalize_orders_response,
+    normalize_positions_response,
+    order_snapshot_to_renderer_dto,
+    position_snapshot_to_renderer_dto,
+)
 from .nifty_universe import NIFTY_100
+from .time_utils import now_utc
 
 
 def _token_for(symbol: str) -> int:
@@ -45,11 +57,16 @@ class MockKiteClient:
     def __init__(self):
         self.access_token = "dev-token"
         self._order_seq = 0
+        self._fill_seq = 0
         # Simulated trading book: the agent's orders actually fill against a
         # live-moving synthetic price, so dev mode shows real positions and P&L.
         self._orders = {}  # order_id -> order dict
+        self._fills = []
+        self._order_roles = {}
         self._positions = {}  # symbol -> position dict
         self._live_prices = {}  # symbol -> current (drifting) price
+        self.namespace = ExecutionNamespace.DEV
+        self.account_id = "DEV0001"
 
     # -- auth (no-ops in dev) ----------------------------------------------
     def init(self, api_key):
@@ -147,7 +164,7 @@ class MockKiteClient:
             return []
         rng = random.Random(token)
         price = _base_price(token)
-        now = datetime.datetime.now()
+        now = now_utc()
         candles = []
         for i in range(n):
             open_ = price
@@ -194,21 +211,24 @@ class MockKiteClient:
         order_type,
         price=None,
         trigger_price=None,
+        order_role=OrderRole.UNKNOWN,
         **kwargs,
     ):
         self._order_seq += 1
         order_id = f"DEV{self._order_seq}"
         qty = int(quantity)
-        now = datetime.datetime.now().isoformat()
+        now = now_utc().isoformat()
         # camelCase keys match the real KiteClient.convert_keys() output the
         # renderer reads (e.g. the Orders page uses o.transactionType).
         order = {
             "orderId": order_id,
             "tradingsymbol": tradingsymbol,
+            "instrumentToken": _token_for(tradingsymbol),
             "exchange": exchange,
             "transactionType": transaction_type,
             "quantity": qty,
             "filledQuantity": 0,
+            "pendingQuantity": qty,
             "product": product,
             "orderType": order_type,
             "price": price,
@@ -221,6 +241,12 @@ class MockKiteClient:
             "exchangeTimestamp": now,
         }
         self._orders[order_id] = order
+        role = (
+            order_role
+            if isinstance(order_role, OrderRole)
+            else OrderRole(str(order_role).upper())
+        )
+        self._order_roles[order_id] = role.value
 
         if qty <= 0:
             order["status"] = "REJECTED"
@@ -246,6 +272,7 @@ class MockKiteClient:
         order = self._orders.get(str(order_id))
         if order and order["status"] in _OPEN_STATUSES:
             order["status"] = "CANCELLED"
+            order["pendingQuantity"] = 0
         return {"order_id": order_id}
 
     def modify_order(self, variety, order_id, trigger_price=None, price=None, **kwargs):
@@ -258,9 +285,27 @@ class MockKiteClient:
         return {"order_id": order_id}
 
     def _fill(self, order, price):
+        fill_time = now_utc().isoformat()
         order["status"] = "COMPLETE"
         order["filledQuantity"] = order["quantity"]
+        order["pendingQuantity"] = 0
         order["averagePrice"] = price
+        order["exchangeTimestamp"] = fill_time
+        self._fill_seq += 1
+        self._fills.append(
+            {
+                "tradeId": f"DEVF{self._fill_seq}",
+                "orderId": order["orderId"],
+                "tradingsymbol": order["tradingsymbol"],
+                "instrumentToken": _token_for(order["tradingsymbol"]),
+                "exchange": order["exchange"],
+                "product": order["product"],
+                "transactionType": order["transactionType"],
+                "quantity": order["quantity"],
+                "averagePrice": price,
+                "fillTimestamp": fill_time,
+            }
+        )
         self._apply_fill(
             order["tradingsymbol"],
             order["exchange"],
@@ -281,6 +326,10 @@ class MockKiteClient:
                 "quantity": 0,
                 "averagePrice": 0.0,
                 "realised": 0.0,
+                "buyQuantity": 0,
+                "sellQuantity": 0,
+                "buyValue": 0.0,
+                "sellValue": 0.0,
             }
             self._positions[symbol] = pos
 
@@ -302,6 +351,12 @@ class MockKiteClient:
             elif new_qty == 0:
                 pos["averagePrice"] = 0.0
         pos["quantity"] = new_qty
+        if txn == "BUY":
+            pos["buyQuantity"] += qty
+            pos["buyValue"] += price * qty
+        else:
+            pos["sellQuantity"] += qty
+            pos["sellValue"] += price * qty
 
     def _check_resting_orders(self):
         for order in self._orders.values():
@@ -315,7 +370,7 @@ class MockKiteClient:
             if (txn == "SELL" and ltp <= trig) or (txn == "BUY" and ltp >= trig):
                 self._fill(order, trig)
 
-    def get_positions(self):
+    def _raw_positions(self):
         self._check_resting_orders()
         net = []
         for symbol, pos in self._positions.items():
@@ -325,17 +380,85 @@ class MockKiteClient:
             net.append(
                 {
                     "tradingsymbol": symbol,
+                    "instrumentToken": _token_for(symbol),
                     "exchange": pos["exchange"],
                     "product": pos["product"],
                     "quantity": qty,
                     "averagePrice": round(pos["averagePrice"], 2),
                     "lastPrice": ltp,
+                    # This price was generated by the simulator on this read.
+                    "timestamp": now_utc().isoformat(),
                     "realised": round(pos["realised"], 2),
                     "unrealised": round(unrealised, 2),
                     "pnl": round(pos["realised"] + unrealised, 2),
+                    "buyQuantity": pos["buyQuantity"],
+                    "sellQuantity": pos["sellQuantity"],
+                    "dayBuyQuantity": pos["buyQuantity"],
+                    "daySellQuantity": pos["sellQuantity"],
+                    "buyValue": round(pos["buyValue"], 2),
+                    "sellValue": round(pos["sellValue"], 2),
                 }
             )
         return {"net": net, "day": list(net)}
 
-    def get_orders(self):
+    def get_positions(self):
+        return position_snapshot_to_renderer_dto(self.get_positions_snapshot())
+
+    def _raw_orders(self):
         return [dict(o) for o in self._orders.values()]
+
+    def get_orders(self):
+        # Preserve the historical direct-mock list API.  The RPC boundary uses
+        # get_order_history_snapshot() and carries quality beside the rows.
+        return order_snapshot_to_renderer_dto(self.get_current_orders_snapshot())[
+            "orders"
+        ]
+
+    def _raw_fills(self):
+        return [dict(fill) for fill in self._fills]
+
+    def get_trades(self):
+        return fill_snapshot_to_renderer_dto(self.get_fills_snapshot())
+
+    def get_positions_snapshot(self):
+        return normalize_positions_response(
+            self._raw_positions(),
+            namespace=self.namespace,
+            account_id=self.account_id,
+        )
+
+    def get_current_orders_snapshot(self):
+        return normalize_orders_response(
+            self._raw_orders(),
+            namespace=self.namespace,
+            account_id=self.account_id,
+            roles_by_order_id=self._order_roles,
+        )
+
+    def get_order_history_snapshot(self, current_snapshot=None):
+        return current_snapshot or self.get_current_orders_snapshot()
+
+    def get_fills_snapshot(self):
+        return normalize_fills_response(
+            self._raw_fills(), namespace=self.namespace, account_id=self.account_id
+        )
+
+    def get_broker_snapshot(self):
+        positions = self.get_positions_snapshot()
+        orders = self.get_current_orders_snapshot()
+        fills = self.get_fills_snapshot()
+        return BrokerSnapshot(
+            namespace=self.namespace,
+            account_id=self.account_id,
+            positions=positions.net,
+            day_positions=positions.day,
+            current_orders=orders.orders,
+            fills=fills.fills,
+            positions_quality=positions.quality,
+            orders_quality=orders.quality,
+            fills_quality=fills.quality,
+            fetched_at=max(positions.fetched_at, orders.fetched_at, fills.fetched_at),
+            positions_fetched_at=positions.fetched_at,
+            orders_fetched_at=orders.fetched_at,
+            fills_fetched_at=fills.fetched_at,
+        )

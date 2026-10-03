@@ -1,4 +1,5 @@
-from typing import Any, Dict
+import math
+from typing import Any, Dict, Optional
 
 
 class TradingCostCalculator:
@@ -16,6 +17,8 @@ class TradingCostCalculator:
         sebi_pct: float = 0.000001,
         stamp_buy_pct: float = 0.00003,
         gst_pct: float = 0.18,
+        rate_version: str = "equity-intraday-rates-v1",
+        rounding_version: str = "python-round-paise-v1",
     ):
         self.brokerage_pct = brokerage_pct
         self.max_brokerage = max_brokerage
@@ -24,11 +27,23 @@ class TradingCostCalculator:
         self.sebi_pct = sebi_pct
         self.stamp_buy_pct = stamp_buy_pct
         self.gst_pct = gst_pct
+        self.rate_version = rate_version
+        self.rounding_version = rounding_version
 
-    def calculate_leg_charges(
-        self, price: float, quantity: int, side: str
+    def calculate_turnover_charges(
+        self, turnover: float, side: str
     ) -> Dict[str, float]:
-        turnover = price * quantity
+        """Calculate charges for one order's aggregate executed turnover.
+
+        Brokerage is capped once for the order.  Callers with partial fills must
+        aggregate those fills before using this method.
+        """
+
+        if not math.isfinite(turnover) or turnover < 0:
+            raise ValueError("turnover must be finite and non-negative")
+        side = side.upper()
+        if side not in {"BUY", "SELL"}:
+            raise ValueError("side must be BUY or SELL")
 
         # Brokerage
         brokerage = min(turnover * self.brokerage_pct, self.max_brokerage)
@@ -69,18 +84,48 @@ class TradingCostCalculator:
             ),
         }
 
+    def calculate_leg_charges(
+        self, price: float, quantity: int, side: str
+    ) -> Dict[str, float]:
+        """Compatibility helper for a single-fill/single-order leg."""
+
+        if (
+            isinstance(price, bool)
+            or not math.isfinite(price)
+            or price <= 0
+            or isinstance(quantity, bool)
+            or not isinstance(quantity, int)
+            or quantity < 0
+        ):
+            raise ValueError("price and quantity must be finite and non-negative")
+        return self.calculate_turnover_charges(price * quantity, side)
+
     def calculate_trade_charges(
         self,
         direction: str,
         entry_price: float,
         exit_price: float,
         quantity: int,
-        signal_entry_price: float = None,
-        signal_exit_price: float = None,
+        signal_entry_price: Optional[float] = None,
+        signal_exit_price: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         Calculates total charges, gross P&L, slippage, and net P&L for a complete trade round-trip.
         """
+        direction = str(direction).upper()
+        if direction not in {"BUY", "SELL"}:
+            raise ValueError("direction must be BUY or SELL")
+        if (
+            not math.isfinite(entry_price)
+            or not math.isfinite(exit_price)
+            or entry_price <= 0
+            or exit_price <= 0
+            or isinstance(quantity, bool)
+            or not isinstance(quantity, int)
+            or quantity <= 0
+        ):
+            raise ValueError("trade prices and quantity must be finite and positive")
+
         entry_side = "BUY" if direction == "BUY" else "SELL"
         exit_side = "SELL" if direction == "BUY" else "BUY"
 

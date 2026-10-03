@@ -2,7 +2,9 @@ import threading
 import time
 
 import pytest
+from kiteconnect.exceptions import DataException, InputException
 
+from backend.broker_models import OrderSubmissionRejected, OrderSubmissionUnknown
 from backend.request_policy import BrokerGateway, ErrorClassification, Priority
 
 
@@ -150,3 +152,47 @@ def test_order_reconciliation():
     # Should not have retried since reconciler returned an ID
     assert attempts == 1
     assert result == "mock_order_id_123"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [DataException("Couldn't parse JSON response"), RuntimeError("invalid response")],
+)
+def test_mutation_response_error_remains_unknown_without_retry(error):
+    gateway = BrokerGateway(rate_limit=100, max_retries=3)
+    submissions = []
+
+    def submit():
+        submissions.append("accepted")
+        raise error
+
+    with pytest.raises(OrderSubmissionUnknown):
+        gateway.execute(
+            submit,
+            priority=Priority.ORDER,
+            is_order=True,
+            order_reconciler=lambda: None,
+        )
+    assert submissions == ["accepted"]
+
+
+def test_structured_input_rejection_is_definite():
+    gateway = BrokerGateway(rate_limit=100)
+
+    def submit():
+        raise InputException("quantity invalid")
+
+    with pytest.raises(OrderSubmissionRejected):
+        gateway.execute(submit, priority=Priority.ORDER, is_order=True)
+
+
+def test_circuit_rejection_before_submission_is_definite():
+    gateway = BrokerGateway(rate_limit=100)
+    gateway.circuit_open = True
+    gateway.circuit_open_time = time.time()
+    submissions = []
+    with pytest.raises(OrderSubmissionRejected):
+        gateway.execute(
+            lambda: submissions.append("sent"), priority=Priority.ORDER, is_order=True
+        )
+    assert submissions == []

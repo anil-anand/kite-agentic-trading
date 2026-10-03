@@ -1,9 +1,11 @@
 import { safeStorage } from 'electron';
+import { randomUUID } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
+import { runtimeDataDir } from './runtime-paths';
+import { credentialReplacements } from '../shared/credential-boundary';
 
-const CONFIG_DIR = path.join(os.homedir(), '.kite-agentic-trading');
+const CONFIG_DIR = runtimeDataDir();
 const SECRETS_FILE = path.join(CONFIG_DIR, 'secrets.json');
 
 export interface SecureCredentials {
@@ -11,12 +13,13 @@ export interface SecureCredentials {
   apiSecret?: string;
   accessToken?: string;
   llmApiKey?: string;
+  llmProvider?: string;
 }
 
 class SecureStorage {
   constructor() {
     if (!fs.existsSync(CONFIG_DIR)) {
-      fs.mkdirSync(CONFIG_DIR, { recursive: true });
+      fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
     }
   }
 
@@ -43,26 +46,14 @@ class SecureStorage {
         if (encrypted.apiSecret) creds.apiSecret = safeStorage.decryptString(Buffer.from(encrypted.apiSecret, 'base64'));
         if (encrypted.accessToken) creds.accessToken = safeStorage.decryptString(Buffer.from(encrypted.accessToken, 'base64'));
         if (encrypted.llmApiKey) creds.llmApiKey = safeStorage.decryptString(Buffer.from(encrypted.llmApiKey, 'base64'));
+        if (encrypted.llmProvider) creds.llmProvider = safeStorage.decryptString(Buffer.from(encrypted.llmProvider, 'base64'));
       } else {
-        // Legacy fallback: read credentials written by an older build that used
-        // base64 encoding.  We only support *reading* here so that users can
-        // recover after upgrading; writing in this state is now refused (see
-        // saveCredentials).  Log a prominent warning so it is easy to diagnose.
-        console.warn(
-          '[SecureStorage] safeStorage is not available on this system. '
-          + 'Reading credentials from a legacy base64-encoded file. '
-          + 'Please re-enter your credentials so they can be stored securely.'
-        );
-        if (encrypted.apiKey) creds.apiKey = Buffer.from(encrypted.apiKey, 'base64').toString('utf-8');
-        if (encrypted.apiSecret) creds.apiSecret = Buffer.from(encrypted.apiSecret, 'base64').toString('utf-8');
-        if (encrypted.accessToken) creds.accessToken = Buffer.from(encrypted.accessToken, 'base64').toString('utf-8');
-        if (encrypted.llmApiKey) creds.llmApiKey = Buffer.from(encrypted.llmApiKey, 'base64').toString('utf-8');
+        throw new Error('Secure credential storage is unavailable');
       }
 
       return creds;
     } catch (e) {
-      console.error('Failed to load secure credentials', e);
-      return {};
+      throw new Error('Unable to decrypt native credentials; stored credentials were preserved.');
     }
   }
 
@@ -84,16 +75,32 @@ class SecureStorage {
     if (creds.apiSecret) toSave.apiSecret = safeStorage.encryptString(creds.apiSecret).toString('base64');
     if (creds.accessToken) toSave.accessToken = safeStorage.encryptString(creds.accessToken).toString('base64');
     if (creds.llmApiKey) toSave.llmApiKey = safeStorage.encryptString(creds.llmApiKey).toString('base64');
+    if (creds.llmProvider) toSave.llmProvider = safeStorage.encryptString(creds.llmProvider).toString('base64');
 
     // Write with restrictive permissions (0o600).
     // Do NOT catch here: callers must know if the save failed so they never
     // delete a legacy copy before confirming the new write succeeded.
-    fs.writeFileSync(SECRETS_FILE, JSON.stringify(toSave, null, 2), { mode: 0o600 });
+    const temporary = path.join(CONFIG_DIR, `.secrets-${randomUUID()}.tmp`);
+    try {
+      fs.writeFileSync(temporary, JSON.stringify(toSave, null, 2), { mode: 0o600, flag: 'wx' });
+      fs.renameSync(temporary, SECRETS_FILE);
+    } finally {
+      if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
+    }
   }
 
   public updateCredentials(updates: Partial<SecureCredentials>): void {
+    const replacements: SecureCredentials = credentialReplacements(updates);
+    if (replacements.llmApiKey && typeof updates.llmProvider === 'string') replacements.llmProvider = updates.llmProvider;
+    if (!Object.keys(replacements).length) return;
     const current = this.loadCredentials();
-    this.saveCredentials({ ...current, ...updates });
+    this.saveCredentials({ ...current, ...replacements });
+  }
+
+  public clearAccessToken(): void {
+    const current = this.loadCredentials();
+    delete current.accessToken;
+    this.saveCredentials(current);
   }
 
   public clearCredentials(): void {

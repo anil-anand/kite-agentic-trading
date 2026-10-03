@@ -1,19 +1,25 @@
 import datetime
+import hashlib
 import json
 import os
 import tempfile
+import threading
 from copy import deepcopy
 from pathlib import Path
 
 from cryptography.fernet import Fernet
 
+from .dev_mode import runtime_data_dir
+from .time_utils import as_utc
+
 
 class ConfigManager:
     def __init__(self):
-        self.config_dir = Path.home() / ".kite-agentic-trading"
+        self.config_dir = runtime_data_dir()
         self.config_file = self.config_dir / "config.json"
         self.key_file = self.config_dir / ".key"
         self.config = {}
+        self._state_file_lock = threading.RLock()
 
         self.default_config = {
             "risk": {
@@ -35,6 +41,10 @@ class ConfigManager:
                 "positionRevalBreakevenMins": 45,
                 "stopOrderType": "SL",
                 "haltAutoTradesOnStopFailure": True,
+                "hardRiskPolicyVersion": "hard-risk-v1",
+                "supervisorIntervalSeconds": 5,
+                "marketOpenTime": "09:15",
+                "marketCloseTime": "15:30",
                 "maxGrossExposure": 200000,
                 "maxNetExposure": 100000,
                 "maxSingleSymbolExposure": 50000,
@@ -120,6 +130,47 @@ class ConfigManager:
                 "maxTokens": 1024,
             },
             "mode": "auto",
+            # Execution recovery is independent of discretionary exit policy.
+            # Pinning this value makes lifecycle traces interpretable across
+            # future broker-capability changes.
+            "orderLifecycle": {
+                "policyVersion": "order-lifecycle-v1",
+                "workingAttemptTimeoutSeconds": 15,
+            },
+            # Causal market-data semantics are versioned separately from entry
+            # formulas.  The zero availability delay preserves the current
+            # completed-bar boundary while still making a future operational
+            # delay explicit and replayable.
+            "marketContext": {
+                "policyVersion": "market-context-v1",
+                "primaryIntervalMinutes": 5,
+                "higherIntervalMinutes": 15,
+                "availabilityDelaySeconds": 0,
+                "maxPrimaryAgeSeconds": 600,
+                "maxHigherAgeSeconds": 1200,
+                "setupRangeBars": 20,
+                "swingConfirmationBars": 2,
+                "regimeTransitionConfirmBars": 2,
+            },
+            # This is a provenance contract only in phase 5.  The existing
+            # normal-exit controls remain active until the later shadow/parity
+            # phases explicitly promote a deterministic policy.
+            "exitManagement": {
+                "policyVersion": "exit-thesis-state-v1",
+                "thesisSchemaVersion": "entry-thesis-v1",
+                "defaultProfileVersion": "management-profiles-v1",
+                "legacyControlPolicyVersion": "legacy-control-v1",
+                # Phase 7 records deterministic policy decisions alongside the
+                # approved legacy controller.  This is deliberately a
+                # per-position pin, captured with the entry thesis/checkpoint;
+                # changing Settings must not reinterpret an open position.
+                # ``candidate`` is representable for replay/integration
+                # contracts, but live dispatch stays disabled until the later
+                # promotion gates are complete.
+                "livePolicyMode": "shadow",
+                "candidatePolicyVersion": "deterministic-exit-v1",
+                "candidateActivationEnabled": False,
+            },
         }
 
         self.in_memory_credentials = {}
@@ -185,8 +236,12 @@ class ConfigManager:
                 pass
 
     def save(self):
-        with open(self.config_file, "w") as f:
-            json.dump(self.config, f, indent=4)
+        # Settings and lifecycle metadata can be updated by independent
+        # recovery/control paths.  A complete JSON file is not the lifecycle
+        # source of truth (SQLite is), but it must never be torn or partially
+        # overwrite a compatible checkpoint on process interruption.
+        with self._state_file_lock:
+            self._atomic_write_json(self.config_file, self.config)
 
     def get_legacy_credentials(self):
         """Extract credentials from legacy encrypted config.json."""
@@ -202,14 +257,22 @@ class ConfigManager:
         }
 
     def set_credentials(self, creds: dict):
-        self.in_memory_credentials.update(creds)
+        incoming = deepcopy(creds)
+        if incoming.get("llmApiKey") and not incoming.get("llmProvider"):
+            # Bind legacy trusted-native credentials to their existing profile.
+            incoming["llmProvider"] = self.get_llm_settings().get("provider")
+        self.in_memory_credentials.update(incoming)
 
     def get_credentials(self):
         return {
             "apiKey": self.in_memory_credentials.get("apiKey", ""),
             "apiSecret": self.in_memory_credentials.get("apiSecret", ""),
             "accessToken": self.in_memory_credentials.get("accessToken", ""),
-            "llmApiKey": self.in_memory_credentials.get("llmApiKey", ""),
+            "llmApiKey": self.in_memory_credentials.get("llmApiKey", "")
+            if self.in_memory_credentials.get("llmProvider")
+            == self.get_llm_settings().get("provider")
+            else "",
+            "llmProvider": self.in_memory_credentials.get("llmProvider"),
         }
 
     def get_llm_settings(self):
@@ -220,7 +283,7 @@ class ConfigManager:
         settings.setdefault("llm", deepcopy(self.default_config["llm"]))
         settings["llm"]["apiKey"] = ""
         settings["llm"]["apiKeyConfigured"] = bool(
-            self.in_memory_credentials.get("llmApiKey")
+            self.get_credentials().get("llmApiKey")
         )
         settings["credentials"] = {key: "" for key in settings.get("credentials", {})}
         return settings
@@ -228,6 +291,15 @@ class ConfigManager:
     def save_settings(self, settings: dict):
         incoming = deepcopy(settings)
         incoming_llm = incoming.pop("llm", None)
+        if incoming_llm is not None:
+            from .llm_client import validate_provider_url
+
+            proposed_llm = {**self.get_llm_settings(), **incoming_llm}
+            validate_provider_url(
+                proposed_llm.get("provider"),
+                proposed_llm.get("baseUrl"),
+                proposed_llm.get("openCodePlan", "zen"),
+            )
         incoming_credentials = incoming.pop("credentials", None)
         for key, value in incoming.items():
             if isinstance(value, dict) and isinstance(self.config.get(key), dict):
@@ -258,7 +330,7 @@ class ConfigManager:
                     "baseUrl"
                 ]
             if api_key and api_key != "********":
-                self.in_memory_credentials["llmApiKey"] = api_key
+                self.save_llm_api_key(api_key)
         self.save()
 
     def save_credentials(self, api_key: str, api_secret: str, access_token: str = ""):
@@ -272,6 +344,9 @@ class ConfigManager:
 
     def save_llm_api_key(self, llm_api_key: str):
         self.in_memory_credentials["llmApiKey"] = llm_api_key
+        self.in_memory_credentials["llmProvider"] = self.get_llm_settings().get(
+            "provider"
+        )
 
     def get_risk_config(self):
         return self.config.get("risk", self.default_config["risk"])
@@ -285,62 +360,163 @@ class ConfigManager:
     def get_screener_config(self):
         return self.config.get("screener", self.default_config.get("screener", {}))
 
+    def get_order_lifecycle_config(self):
+        return self.config.get("orderLifecycle", self.default_config["orderLifecycle"])
+
+    def get_market_context_config(self):
+        return deepcopy(
+            self.config.get("marketContext", self.default_config["marketContext"])
+        )
+
+    def get_exit_management_config(self):
+        """Return a detached policy/provenance contract for new positions."""
+
+        settings = self.config.get(
+            "exitManagement", self.default_config["exitManagement"]
+        )
+        if not isinstance(settings, dict):
+            # A malformed settings object must not crash thesis capture or
+            # silently opt a new position into the current shadow default.
+            settings = {
+                **self.default_config["exitManagement"],
+                "livePolicyMode": "legacy_control",
+            }
+        return deepcopy(settings)
+
+    def get_exit_live_policy_mode(self) -> str:
+        """Return the requested phase-7 policy pin without enabling dispatch.
+
+        The value is intentionally constrained here rather than being inferred
+        by callers.  A malformed older settings file keeps the frozen legacy
+        controller; candidate execution is separately and unconditionally
+        disabled by the live orchestrator in this phase.
+        """
+
+        value = self.get_exit_management_config().get(
+            "livePolicyMode", "legacy_control"
+        )
+        return (
+            value
+            if isinstance(value, str)
+            and value in {"legacy_control", "shadow", "candidate"}
+            else "legacy_control"
+        )
+
+    def get_effective_exit_management_config(self):
+        """Pin all non-secret settings that can explain a position's premise.
+
+        This does not validate or activate a new discretionary exit policy.
+        It is deliberately a snapshot so a Settings save cannot rewrite an
+        already accepted trade's entry premise during phase 5.
+        """
+
+        return {
+            "exitManagement": self.get_exit_management_config(),
+            "risk": deepcopy(self.get_risk_config()),
+            "strategies": deepcopy(self.get_strategy_config()),
+            "families": deepcopy(self.get_families_config()),
+            "marketContext": self.get_market_context_config(),
+            "orderLifecycle": deepcopy(self.get_order_lifecycle_config()),
+        }
+
     def get_watchlist(self):
         return self.config.get("watchlist", self.default_config["watchlist"])
 
     def get_app_order_ids(self) -> set:
-        path = self.config_dir / "app_orders.json"
-        if path.exists():
-            try:
-                with open(path, "r") as f:
-                    return set(json.load(f))
-            except Exception:
-                return set()
-        return set()
+        with self._state_file_lock:
+            path = self.config_dir / "app_orders.json"
+            if path.exists():
+                try:
+                    with open(path, "r") as f:
+                        return {str(order_id) for order_id in json.load(f)}
+                except Exception:
+                    return set()
+            return set()
 
-    def add_app_order_id(self, order_id: str):
+    def get_app_order_roles(self) -> dict[str, str]:
+        with self._state_file_lock:
+            legacy_ids = self.get_app_order_ids()
+            path = self.config_dir / "app_order_roles.json"
+            roles = {}
+            if path.exists():
+                try:
+                    with open(path, "r") as f:
+                        loaded = json.load(f)
+                    if isinstance(loaded, dict):
+                        roles = {
+                            str(order_id): str(role).upper()
+                            for order_id, role in loaded.items()
+                        }
+                except Exception:
+                    roles = {}
+            for order_id in legacy_ids:
+                roles.setdefault(order_id, "UNKNOWN")
+            return roles
+
+    def add_app_order_id(self, order_id: str, role: str = "UNKNOWN"):
         if not order_id:
             return
-        orders = self.get_app_order_ids()
-        orders.add(str(order_id))
-        path = self.config_dir / "app_orders.json"
-        with open(path, "w") as f:
-            json.dump(list(orders), f)
+        normalized_role = str(role).upper()
+        if normalized_role not in {"ENTRY", "PROTECTION", "REDUCTION", "UNKNOWN"}:
+            normalized_role = "UNKNOWN"
+        with self._state_file_lock:
+            orders = self.get_app_order_ids()
+            orders.add(str(order_id))
+            path = self.config_dir / "app_orders.json"
+            self._atomic_write_json(path, sorted(orders))
+
+            roles = self.get_app_order_roles()
+            roles[str(order_id)] = normalized_role
+            self._atomic_write_json(self.config_dir / "app_order_roles.json", roles)
 
     def get_historical_orders(self) -> dict:
-        path = self.config_dir / "historical_orders.json"
-        if path.exists():
-            try:
-                with open(path, "r") as f:
-                    return json.load(f)
-            except Exception:
-                return {}
-        return {}
+        with self._state_file_lock:
+            path = self.config_dir / "historical_orders.json"
+            if path.exists():
+                try:
+                    with open(path, "r") as f:
+                        loaded = json.load(f)
+                    return loaded if isinstance(loaded, dict) else {}
+                except Exception:
+                    return {}
+            return {}
 
     def save_historical_orders(self, orders: dict):
-        path = self.config_dir / "historical_orders.json"
-        with open(path, "w") as f:
-            json.dump(orders, f, indent=4, default=str)
+        with self._state_file_lock:
+            path = self.config_dir / "historical_orders.json"
+            self._atomic_write_json(path, orders)
 
     def save_active_trades(self, trades: dict):
         """Persist the trading engine's active_trades to disk.
 
-        entry_time is a datetime; it's stored as an ISO string and restored by
-        load_active_trades so the engine can resume managing positions after a
-        crash or restart.
+        Execution, observation and reevaluation timestamps are stored as ISO
+        strings and restored by load_active_trades after a crash or restart.
         """
         path = self.config_dir / "active_trades.json"
         serializable = {}
         for symbol, trade in trades.items():
             record = dict(trade)
-            entry_time = record.get("entry_time")
-            if isinstance(entry_time, (datetime.datetime, datetime.date)):
-                record["entry_time"] = entry_time.isoformat()
-            last_reeval = record.get("last_reeval_time")
-            if isinstance(last_reeval, (datetime.datetime, datetime.date)):
-                record["last_reeval_time"] = last_reeval.isoformat()
+            for field in ("entry_time", "entry_observed_at", "last_reeval_time"):
+                timestamp = record.get(field)
+                if isinstance(timestamp, (datetime.datetime, datetime.date)):
+                    record[field] = timestamp.isoformat()
             serializable[symbol] = record
         self._atomic_write_json(path, serializable)
+
+    def archive_inactive_trade(self, symbol: str, trade: dict, verification: dict):
+        """Retain the old tracking record and flatness evidence before removal."""
+        payload = {"tradingsymbol": symbol, "trade": trade}
+        record_id = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()
+        path = self.config_dir / "retired_active_trades.json"
+        with self._state_file_lock:
+            archived = json.loads(path.read_text()) if path.exists() else {}
+            if not isinstance(archived, dict):
+                raise ValueError("Retired trade archive is invalid")
+            if record_id not in archived:
+                archived[record_id] = {**payload, "verification": verification}
+                self._atomic_write_json(path, archived)
 
     @staticmethod
     def _atomic_write_json(path: Path, data):
@@ -368,7 +544,7 @@ class ConfigManager:
             raise
 
     def load_active_trades(self) -> dict:
-        """Load persisted active_trades, restoring entry_time to a datetime.
+        """Restore known timestamps while preserving unknown execution times.
 
         Returns {} if there's nothing persisted or the file is unreadable —
         the engine reconciles against live positions regardless.
@@ -382,27 +558,31 @@ class ConfigManager:
         except Exception:
             return {}
         for trade in trades.values():
-            entry_time = trade.get("entry_time")
-            if isinstance(entry_time, str):
+            for field in ("entry_time", "entry_observed_at", "last_reeval_time"):
+                if field not in trade:
+                    continue
+                timestamp = trade[field]
                 try:
-                    trade["entry_time"] = datetime.datetime.fromisoformat(entry_time)
-                except ValueError:
-                    trade["entry_time"] = datetime.datetime.now()
-
-            last_reeval_time = trade.get("last_reeval_time")
-            if isinstance(last_reeval_time, str):
-                try:
-                    trade["last_reeval_time"] = datetime.datetime.fromisoformat(
-                        last_reeval_time
-                    )
-                except ValueError:
-                    trade["last_reeval_time"] = trade["entry_time"]
+                    trade[field] = as_utc(timestamp) if timestamp is not None else None
+                except (TypeError, ValueError):
+                    trade[field] = None
         return trades
 
     def save_daily_risk_state(self, state: dict):
-        """Persist the daily risk state to disk."""
+        """Persist independent account/session records without adopting legacy state."""
         path = self.config_dir / "daily_risk_state.json"
-        self._atomic_write_json(path, state)
+        namespace, account = state.get("namespace"), state.get("account_id")
+        with self._state_file_lock:
+            if namespace and account and account != "UNKNOWN":
+                document = self.load_daily_risk_state()
+                key = self._operator_state_key(namespace, account)
+                document.setdefault("scopes", {}).setdefault(key, {})[state["date"]] = (
+                    deepcopy(state)
+                )
+                document.setdefault("active_sessions", {})[key] = state["date"]
+                self._atomic_write_json(path, document)
+            else:
+                self._atomic_write_json(path, state)
 
     def load_daily_risk_state(self) -> dict:
         """Load persisted daily risk state."""
@@ -414,6 +594,43 @@ class ConfigManager:
                 return json.load(f)
         except Exception:
             return {}
+
+    @staticmethod
+    def _operator_state_key(namespace: str, account_id: str) -> str:
+        if not namespace or not account_id or account_id == "UNKNOWN":
+            raise ValueError("operator state requires a verified account identity")
+        return json.dumps([str(namespace), str(account_id)], separators=(",", ":"))
+
+    def _load_operator_states(self) -> dict:
+        path = self.config_dir / "operator_state.json"
+        if not path.exists():
+            return {}
+        with path.open() as stream:
+            states = json.load(stream)
+        if not isinstance(states, dict) or any(
+            not isinstance(state, dict) for state in states.values()
+        ):
+            raise ValueError("persisted operator state is malformed")
+        return states
+
+    def load_operator_state(self, namespace: str, account_id: str) -> dict:
+        """Restore control obligations only for their original account.
+
+        Unreadable state is a recovery error, never proof that no flatten or
+        pause was requested. These records contain no authentication material.
+        """
+        key = self._operator_state_key(namespace, account_id)
+        with self._state_file_lock:
+            return deepcopy(self._load_operator_states().get(key, {}))
+
+    def save_operator_state(self, namespace: str, account_id: str, state: dict) -> None:
+        key = self._operator_state_key(namespace, account_id)
+        if not isinstance(state, dict):
+            raise ValueError("operator state must be an object")
+        with self._state_file_lock:
+            states = self._load_operator_states()
+            states[key] = deepcopy(state)
+            self._atomic_write_json(self.config_dir / "operator_state.json", states)
 
 
 config_manager = ConfigManager()

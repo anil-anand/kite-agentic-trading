@@ -4,6 +4,8 @@ import sys
 import threading
 import uuid
 
+from .time_utils import now_utc
+
 stdout_lock = threading.Lock()
 
 
@@ -14,7 +16,7 @@ def push_log(message: str, level: str = "info"):
             "id": str(uuid.uuid4()),
             "level": level,
             "message": message,
-            "timestamp": datetime.datetime.now().isoformat(),
+            "timestamp": now_utc().isoformat(),
         },
     }
     with stdout_lock:

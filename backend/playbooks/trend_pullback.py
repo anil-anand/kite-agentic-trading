@@ -1,10 +1,14 @@
 import uuid
+from copy import deepcopy
 from typing import Any, Dict, List, Optional
 
 from .base import BasePlaybook
 
 
 class TrendPullbackPlaybook(BasePlaybook):
+    def management_profile(self) -> str:
+        return "trend_continuation"
+
     def get_name(self) -> str:
         return "Trend Pullback"
 
@@ -48,7 +52,11 @@ class TrendPullbackPlaybook(BasePlaybook):
 
         # Check for pullback confirmation from mean reversion indicators
         mr_signals = [s for s in evidence if s.get("family") == "mean_reversion"]
-        pullback_confirmed = any(s.get("direction") == direction for s in mr_signals)
+        pullback_signal = next(
+            (signal for signal in mr_signals if signal.get("direction") == direction),
+            None,
+        )
+        pullback_confirmed = pullback_signal is not None
 
         # We can enter either on pure strong trend or trend + pullback
         final_score = base_sig.get("signal_score", 0)
@@ -73,6 +81,23 @@ class TrendPullbackPlaybook(BasePlaybook):
             "riskReward": base_sig.get("riskReward", 0),
             "reasoning": reasoning,
             "playbook": self.get_name(),
+            "playbook_version": "playbooks-v1",
+            "management_profile": self.management_profile(),
+            "setup_variant": (
+                "trend_with_mean_reversion_signal"
+                if pullback_confirmed
+                else "trend_continuation_trigger"
+            ),
+            # Preserve precisely the inputs this playbook actually used.  The
+            # scanner may include broader raw evidence for diagnostics, but it
+            # must not be mistaken for selected confirmation later.
+            "selected_evidence": [
+                deepcopy(base_sig),
+                *([deepcopy(pullback_signal)] if pullback_signal else []),
+            ],
+            # Opposing trend scores participated in direction selection too.
+            # Retain them separately from supporting confirmation evidence.
+            "selection_inputs": deepcopy(trend_signals + mr_signals),
         }
 
     def evaluate_invalidation(

@@ -12,19 +12,23 @@ import Settings from './pages/Settings';
 import Journal from './pages/Journal';
 import Backtesting from './pages/Backtesting';
 import LoginModal from './components/LoginModal';
+import StartupScreen from './components/StartupScreen';
 import { useTradingStore } from './stores/trading-store';
 import { useKiteAPI } from './hooks/useKiteAPI';
 
 const App: React.FC = () => {
-  useKiteAPI();
+  useKiteAPI({ subscribe: true });
   const auth = useTradingStore(state => state.auth);
+  const startup = useTradingStore(state => state.startup);
+
+  if (startup.status !== 'ready') return <StartupScreen />;
 
   return (
     <div className="flex h-screen overflow-hidden bg-surface-950">
       <Sidebar />
       <div className="flex flex-col flex-1 min-w-0">
         <main className="flex-1 overflow-auto bg-surface-900 relative">
-          <Routes>
+          {auth.isLoggedIn && <Routes>
             <Route path="/" element={<Navigate to="/dashboard" replace />} />
             <Route path="/dashboard" element={<Dashboard />} />
             <Route path="/journal" element={<Journal />} />
@@ -35,7 +39,7 @@ const App: React.FC = () => {
             <Route path="/activity" element={<ActivityLog />} />
             <Route path="/settings" element={<Settings />} />
             <Route path="/backtesting" element={<Backtesting />} />
-          </Routes>
+          </Routes>}
           {!auth.isLoggedIn && <LoginModal />}
         </main>
         <StatusBar />

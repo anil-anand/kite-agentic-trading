@@ -69,7 +69,7 @@ const SignalCard: React.FC<Props> = ({ signal, onTakeTrade, onDismiss, compact =
       </div>
 
       <div className="flex gap-2 mt-2 pt-3 border-t border-surface-700">
-        <button onClick={() => onTakeTrade(signal)} className="flex-1 bg-profit-dark hover:bg-profit flex items-center justify-center gap-2 py-2 rounded transition-colors text-white text-sm font-medium">
+        <button disabled={signal.analysisOnly} onClick={() => onTakeTrade(signal)} className="flex-1 bg-profit-dark hover:bg-profit flex items-center justify-center gap-2 py-2 rounded transition-colors text-white text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed">
           <Check size={16} /> Take Trade
         </button>
         <button onClick={() => onDismiss(signal.id)} className="flex-1 bg-surface-700 hover:bg-surface-600 flex items-center justify-center gap-2 py-2 rounded transition-colors text-white text-sm font-medium">

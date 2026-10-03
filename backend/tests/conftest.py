@@ -7,6 +7,7 @@ resulting signals without ever touching the Kite API.
 
 import os
 import tempfile
+import threading
 
 import numpy as np
 import pandas as pd
@@ -82,6 +83,38 @@ def make_candles():
 
 
 @pytest.fixture
+def open_session_clock():
+    """Explicit open-session input for brokerage unit tests, at any host time.
+
+    Keep receipt dates/timestamps real so quote freshness and daily accounting
+    retain their own tests. Only the external session classification is pinned;
+    session/deadline tests use their real clock or override this dependency.
+    This fixture is deliberately opt-in, not a global hard-risk bypass.
+    """
+    from dataclasses import replace
+    from datetime import datetime, timezone
+
+    from backend.session_clock import SessionClock, SessionPolicy
+
+    clock = SessionClock(SessionPolicy())
+    open_session = clock.snapshot(datetime(2026, 9, 7, 6, 30, tzinfo=timezone.utc))
+
+    class OpenSessionClock:
+        policy = clock.policy
+
+        def snapshot(self, observed_at):
+            actual = clock.snapshot(observed_at)
+            return replace(
+                open_session,
+                observed_at=actual.observed_at,
+                exchange_time=actual.exchange_time,
+                session_date=actual.session_date,
+            )
+
+    return OpenSessionClock()
+
+
+@pytest.fixture
 def uptrend():
     """60 bars of a smooth, strong uptrend."""
     return build_candles(np.linspace(100, 140, 60))
@@ -135,6 +168,20 @@ def assert_valid_signal(sig, entry_tolerance=1e-6):
 
 
 @pytest.fixture(autouse=True)
+def isolated_default_journal(monkeypatch, tmp_path):
+    """Durable recovery from one test must not become another test's broker book."""
+    from backend.journal import journal
+
+    monkeypatch.setattr(journal, "db_path", tmp_path / "default-journal.db")
+    monkeypatch.setattr(journal, "_local", threading.local())
+    journal._init_db()
+    yield
+    connection = getattr(journal._local, "conn", None)
+    if connection is not None:
+        connection.close()
+
+
+@pytest.fixture(autouse=True)
 def mock_journal_overtrading(monkeypatch):
     """Bypass overtrading protections for all tests so they don't fail when
     multiple tests execute signals for the same symbol (e.g. RELIANCE) and hit
@@ -142,6 +189,8 @@ def mock_journal_overtrading(monkeypatch):
     from backend.journal import journal
 
     monkeypatch.setattr(
-        journal, "get_todays_trade_counts", lambda: {"total": 0, "by_symbol": {}}
+        journal,
+        "get_todays_trade_counts",
+        lambda **kwargs: {"total": 0, "by_symbol": {}},
     )
-    monkeypatch.setattr(journal, "get_last_exit_time", lambda s: None)
+    monkeypatch.setattr(journal, "get_last_exit_time", lambda s, **kwargs: None)

@@ -28,17 +28,17 @@ def test_generate_normalizes_url_headers_payload_and_response(monkeypatch):
         captured["timeout"] = timeout
         return FakeResponse({"choices": [{"message": {"content": "analysis"}}]})
 
-    monkeypatch.setattr("backend.llm_client.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("backend.llm_client._urlopen", fake_urlopen)
 
     result = OpenAICompatibleClient().generate(
-        "https://example.test/v1/",
+        "https://api.openai.com/v1/",
         "secret-key",
         "model-name",
         "prompt text",
     )
 
     assert result == "analysis"
-    assert captured["request"].full_url == "https://example.test/v1/chat/completions"
+    assert captured["request"].full_url == "https://api.openai.com/v1/chat/completions"
     assert captured["request"].headers["Authorization"] == "Bearer secret-key"
     assert captured["request"].headers["Content-type"] == "application/json"
     assert json.loads(captured["request"].data) == {
@@ -51,20 +51,24 @@ def test_generate_reports_http_errors(monkeypatch):
     def fake_urlopen(request, timeout):
         raise HTTPError(request.full_url, 401, "Unauthorized", {}, None)
 
-    monkeypatch.setattr("backend.llm_client.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("backend.llm_client._urlopen", fake_urlopen)
 
     with pytest.raises(RuntimeError, match="HTTP 401"):
-        OpenAICompatibleClient().generate("https://example.test", "key", "model", "p")
+        OpenAICompatibleClient().generate(
+            "https://api.openai.com/v1", "key", "model", "p"
+        )
 
 
 def test_generate_rejects_malformed_response(monkeypatch):
     monkeypatch.setattr(
-        "backend.llm_client.request.urlopen",
+        "backend.llm_client._urlopen",
         lambda request, timeout: FakeResponse({"choices": []}),
     )
 
     with pytest.raises(RuntimeError, match="malformed"):
-        OpenAICompatibleClient().generate("https://example.test", "key", "model", "p")
+        OpenAICompatibleClient().generate(
+            "https://api.openai.com/v1", "key", "model", "p"
+        )
 
 
 def test_provider_presets_are_explicit_and_exclude_custom_and_bedrock():
@@ -145,7 +149,7 @@ def test_opencode_discovery_filters_minimal_catalog_by_plan_allowlist(
     monkeypatch, plan, catalog, expected
 ):
     monkeypatch.setattr(
-        "backend.llm_client.request.urlopen",
+        "backend.llm_client._urlopen",
         lambda request, timeout: FakeResponse({"data": catalog}),
     )
 
@@ -172,7 +176,7 @@ def test_generate_rejects_opencode_models_outside_selected_plan_allowlist(
     def fail_if_requested(*args, **kwargs):
         raise AssertionError("invalid OpenCode model reached HTTP request")
 
-    monkeypatch.setattr("backend.llm_client.request.urlopen", fail_if_requested)
+    monkeypatch.setattr("backend.llm_client._urlopen", fail_if_requested)
 
     with pytest.raises(RuntimeError, match="not available for OpenCode plan"):
         OpenAICompatibleClient().generate(
@@ -192,7 +196,7 @@ def test_anthropic_request_uses_provider_auth_and_native_messages_api(monkeypatc
         captured["request"] = req
         return FakeResponse({"content": [{"type": "text", "text": "analysis"}]})
 
-    monkeypatch.setattr("backend.llm_client.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("backend.llm_client._urlopen", fake_urlopen)
 
     result = OpenAICompatibleClient().generate(
         "https://api.anthropic.com/v1",
@@ -220,7 +224,7 @@ def test_anthropic_request_uses_provider_auth_and_native_messages_api(monkeypatc
             "gemini-2.5-flash",
             {"candidates": [{"content": {"parts": [{"text": "gemini"}]}}]},
             "gemini",
-            "/models/gemini-2.5-flash:generateContent?key=gemini-key",
+            "/models/gemini-2.5-flash:generateContent",
         ),
         (
             "OpenRouter",
@@ -251,7 +255,7 @@ def test_generate_supports_provider_specific_paths(
         captured["request"] = req
         return FakeResponse(response)
 
-    monkeypatch.setattr("backend.llm_client.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("backend.llm_client._urlopen", fake_urlopen)
 
     result = OpenAICompatibleClient().generate(
         base_url, api_key, model, "prompt", provider=provider
@@ -272,7 +276,7 @@ def test_ollama_request_has_no_authorization_header(monkeypatch):
         captured["request"] = req
         return FakeResponse({"message": {"content": "analysis"}})
 
-    monkeypatch.setattr("backend.llm_client.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("backend.llm_client._urlopen", fake_urlopen)
 
     assert (
         OpenAICompatibleClient().generate(
@@ -291,7 +295,7 @@ def test_ollama_cloud_request_uses_api_key_and_cloud_endpoint(monkeypatch):
         captured["request"] = req
         return FakeResponse({"message": {"content": "cloud analysis"}})
 
-    monkeypatch.setattr("backend.llm_client.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("backend.llm_client._urlopen", fake_urlopen)
 
     result = OpenAICompatibleClient().generate(
         "http://localhost:11434", "cloud-key", "llama3.2", "prompt", provider="Ollama"
@@ -309,7 +313,7 @@ def test_ollama_cloud_model_discovery_validates_api_key(monkeypatch):
         captured["request"] = req
         return FakeResponse({"models": [{"name": "cloud-model"}]})
 
-    monkeypatch.setattr("backend.llm_client.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("backend.llm_client._urlopen", fake_urlopen)
 
     assert OpenAICompatibleClient().discover_models(
         "Ollama", "http://localhost:11434", "cloud-key"
@@ -322,7 +326,7 @@ def test_ollama_cloud_rejects_invalid_api_key(monkeypatch):
     def fake_urlopen(req, timeout):
         raise HTTPError(req.full_url, 401, "Unauthorized", {}, None)
 
-    monkeypatch.setattr("backend.llm_client.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("backend.llm_client._urlopen", fake_urlopen)
 
     with pytest.raises(RuntimeError, match="HTTP 401"):
         OpenAICompatibleClient().discover_models(
@@ -337,7 +341,7 @@ def test_discover_models_uses_provider_endpoint_and_normalizes_models(monkeypatc
         captured["request"] = req
         return FakeResponse({"data": [{"id": "gpt-4o"}, {"id": "gpt-4o-mini"}]})
 
-    monkeypatch.setattr("backend.llm_client.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("backend.llm_client._urlopen", fake_urlopen)
 
     assert OpenAICompatibleClient().discover_models(
         "OpenAI", "https://api.openai.com/v1", "secret-key"
@@ -363,7 +367,7 @@ def test_discover_models_uses_provider_endpoint_and_normalizes_models(monkeypatc
             "gemini-key",
             {"models": [{"name": "models/gemini-2.5-flash"}]},
             ["gemini-2.5-flash"],
-            "/models?key=gemini-key",
+            "/models",
         ),
         (
             "OpenRouter",
@@ -392,7 +396,7 @@ def test_discover_models_supports_all_provider_protocols(
         captured["request"] = req
         return FakeResponse(body)
 
-    monkeypatch.setattr("backend.llm_client.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("backend.llm_client._urlopen", fake_urlopen)
 
     assert (
         OpenAICompatibleClient().discover_models(provider, base_url, api_key)
@@ -414,7 +418,7 @@ def test_opencode_model_discovery_does_not_send_api_key(monkeypatch):
         captured["request"] = req
         return FakeResponse({"data": [{"id": "big-pickle"}]})
 
-    monkeypatch.setattr("backend.llm_client.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("backend.llm_client._urlopen", fake_urlopen)
 
     assert OpenAICompatibleClient().discover_models(
         "OpenCode", OPENCODE_PLANS["zen"]["baseUrl"], "expired-key"

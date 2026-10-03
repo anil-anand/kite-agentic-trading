@@ -150,44 +150,17 @@ def test_trade_replay(mock_instruments, mock_historical, temp_db):
 
 
 @patch("backend.analytics.TradeAnalytics.get_trade_replay")
-def test_what_if_analysis(mock_replay, temp_db):
-    now = datetime.now()
-    mock_replay.return_value = {
-        "trade": {
-            "tradingsymbol": "TCS",
-            "entry_price": 100,
-            "direction": "BUY",
-            "quantity": 10,
-            "target": 110,
-            "stop_loss": 95,
-            "entry_time": (now - timedelta(minutes=10)).isoformat(),
-            "pnl": 100,
-        },
-        "candles": [
-            {
-                "time": int((now - timedelta(minutes=5)).timestamp()),
-                "open": 100,
-                "high": 115,
-                "low": 98,
-                "close": 110,
-            },
-            {
-                "time": int(now.timestamp()),
-                "open": 110,
-                "high": 112,
-                "low": 105,
-                "close": 108,
-            },
-        ],
-    }
-
+def test_what_if_analysis_does_not_reintroduce_unconstrained_paths(
+    mock_replay, temp_db
+):
+    # Downloading a later daily maximum cannot establish reachable profit after
+    # the original retained stop, forced session exit, or account loss latch.
     analytics = TradeAnalytics(db_path=temp_db)
     res = analytics.get_what_if_analysis("1")
-
-    assert "error" not in res
-    assert res["target_hit"] is True
-    assert res["eod_pnl"] == (108 - 100) * 10
-    assert res["wider_stop_hit"] is False
+    assert res["status"] == "UNAVAILABLE"
+    assert res["censor_reason"] == "FORWARD_RETAINED_PATH_UNAVAILABLE"
+    assert "wider_stop_pnl" not in res
+    mock_replay.assert_not_called()
 
 
 @patch("backend.config.config_manager.get_credentials")

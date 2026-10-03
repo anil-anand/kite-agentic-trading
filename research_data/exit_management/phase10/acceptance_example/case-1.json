@@ -1,0 +1,207 @@
+{
+  "case_id": "synthetic-case-1",
+  "checkpoint_at": "2026-09-22T04:20:00+00:00",
+  "initial_capital": 100000,
+  "positions": [
+    {
+      "state": {
+        "development": "EARLY",
+        "exposure": "OPEN",
+        "had_fills": true,
+        "known_quantity": 10,
+        "last_event_id": null,
+        "last_transition_at": null,
+        "latched_exit_intent_id": null,
+        "position_key": "LIVE:acct-1:NSE:1:RELIANCE:MIS:example-epoch-1-1",
+        "protection": "ACTIVE",
+        "recovery_from": null,
+        "thesis_health": "VALID",
+        "version": 0
+      },
+      "thesis": {
+        "binding_status": "BOUND",
+        "causal_anchors": {
+          "direction_dynamics": null,
+          "known_structure": [],
+          "participation": null,
+          "regime": "BREAKOUT",
+          "regime_features": {
+            "atr": 2.0,
+            "vwap": 98.5
+          },
+          "session_vwap": 98.5,
+          "setup_range": {
+            "end": "2026-09-20T04:20:00+00:00",
+            "high": 99.5,
+            "known_at": "2026-09-20T04:20:00+00:00",
+            "low": 96.0,
+            "source_bar_ids": [
+              "range-bar-1"
+            ],
+            "start": "2026-09-20T04:00:00+00:00"
+          },
+          "trigger_bar": {
+            "available_at": "2026-09-20T04:25:00+00:00",
+            "close": 100.0,
+            "end": "2026-09-20T04:25:00+00:00",
+            "start": "2026-09-20T04:20:00+00:00"
+          },
+          "volatility": {
+            "atr": 2.0,
+            "quality": "VALID"
+          }
+        },
+        "created_at": "2026-09-20T04:25:01+00:00",
+        "direction": "BUY",
+        "entry_input": {},
+        "entry_selection_config": null,
+        "exchange": "NSE",
+        "fill_binding": {
+          "entry_terminal_at": "2026-09-22T04:20:00+00:00",
+          "entry_vwap": 100.0,
+          "filled_quantity": 10,
+          "initial_r_per_share": 5.0,
+          "initial_risk_budget": 50.0,
+          "source_fill_ids": [
+            "entry-fill"
+          ]
+        },
+        "initial_stop": 95.0,
+        "input_reference": {
+          "context_hash": "f16bb5016882d9b6cb7cc516851f0fe43d15308da44c744eda97f3328b1becde",
+          "context_policy_version": "market-context-v1",
+          "decision_at": "2026-09-20T04:25:00+00:00",
+          "higher_bar_id": "2026-09-20T04:15:00+00:00",
+          "primary_bar_id": "2026-09-20T04:25:00+00:00",
+          "snapshot": {
+            "decision_event_time": "2026-09-20T04:25:00+00:00",
+            "higherBar": {
+              "end": "2026-09-20T04:15:00+00:00"
+            },
+            "knownSwings": [],
+            "policy": {
+              "policyVersion": "market-context-v1"
+            },
+            "primaryBar": {
+              "available_at": "2026-09-20T04:25:00+00:00",
+              "close": 100.0,
+              "end": "2026-09-20T04:25:00+00:00",
+              "start": "2026-09-20T04:20:00+00:00"
+            },
+            "primary_quality": "VALID",
+            "setupRange": {
+              "end": "2026-09-20T04:20:00+00:00",
+              "high": 99.5,
+              "known_at": "2026-09-20T04:20:00+00:00",
+              "low": 96.0,
+              "source_bar_ids": [
+                "range-bar-1"
+              ],
+              "start": "2026-09-20T04:00:00+00:00"
+            },
+            "sourceAsOf": "2026-09-20T04:25:00+00:00",
+            "vwap": 98.5
+          },
+          "source_as_of": "2026-09-20T04:25:00+00:00"
+        },
+        "instrument_id": "1",
+        "legacy_reason_text": null,
+        "management_profile": {
+          "name": "breakout_follow_through",
+          "structure_status": "VALID",
+          "values": {
+            "control_policy_version": "legacy-control-v1",
+            "entry_boundary": {
+              "end": "2026-09-20T04:20:00+00:00",
+              "high": 99.5,
+              "known_at": "2026-09-20T04:20:00+00:00",
+              "low": 96.0,
+              "source_bar_ids": [
+                "range-bar-1"
+              ],
+              "start": "2026-09-20T04:00:00+00:00"
+            },
+            "normal_policy_implemented": false,
+            "objective_mode": "legacy_fixed",
+            "requested_profile": "breakout_follow_through"
+          },
+          "version": "management-profiles-v1"
+        },
+        "objective": 110.0,
+        "planned_entry_price": 100.0,
+        "playbook": "Breakout",
+        "playbook_version": "playbooks-v1",
+        "policy_snapshot": {
+          "config_hash": "0df14b0fe4ead099fba61b96b160578880e765bf753e1a28938a3cc5bcf90937",
+          "policy_version": "exit-thesis-state-v1",
+          "values": {
+            "exitManagement": {
+              "policyVersion": "exit-thesis-state-v1"
+            },
+            "marketContext": {
+              "policyVersion": "market-context-v1"
+            },
+            "risk": {
+              "maxDailyLoss": 2000
+            },
+            "strategies": {
+              "ema_crossover": {
+                "enabled": true
+              }
+            }
+          }
+        },
+        "position_epoch": "example-epoch-1-1",
+        "position_key": "LIVE:acct-1:NSE:1:RELIANCE:MIS:example-epoch-1-1",
+        "product": "MIS",
+        "provenance": "SYSTEM",
+        "provisional_risk": {
+          "fill_price": 100.0,
+          "filled_quantity": 10,
+          "risk_budget": 50.0,
+          "risk_per_share": 5.0
+        },
+        "reasoning": "Breakout: BUY breakout detected with trend confirmation",
+        "revision": 2,
+        "schema_version": "entry-thesis-v1",
+        "selected_evidence": [
+          {
+            "dependency_group": "breakout",
+            "direction": "BUY",
+            "family": "breakout",
+            "payload": {
+              "direction": "BUY",
+              "family": "breakout",
+              "levels": {
+                "range_high": 99.5
+              },
+              "signal_score": 80,
+              "strategy_id": "donchian_breakout"
+            },
+            "score": 80.0,
+            "strategy_id": "donchian_breakout"
+          },
+          {
+            "dependency_group": "price_dynamics",
+            "direction": "BUY",
+            "family": "trend",
+            "payload": {
+              "direction": "BUY",
+              "family": "trend",
+              "signal_score": 70,
+              "strategy_id": "ema_crossover"
+            },
+            "score": 70.0,
+            "strategy_id": "ema_crossover"
+          }
+        ],
+        "selection_inputs": [],
+        "setup_variant": "breakout_with_trend_confirmation",
+        "strategy": "Breakout",
+        "symbol": "RELIANCE",
+        "thesis_id": "b4b5955f-5bf6-4eb7-8938-e1540ec663ca",
+        "trade_id": "trade-1"
+      }
+    }
+  ]
+}

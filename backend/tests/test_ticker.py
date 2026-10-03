@@ -2,6 +2,9 @@
 
 import json
 import time
+from datetime import datetime, timezone
+
+import pytest
 
 import backend.ticker as tk
 from backend.ticker import TickerManager
@@ -79,6 +82,27 @@ class TestEmitShape:
         assert d["tradingsymbol"] == "INFY"
         assert d["changePercent"] == 2.0  # (255-250)/250 * 100
 
+    def test_on_ticks_preserves_source_time_and_records_feed_freshness(
+        self, capsys, monkeypatch
+    ):
+        monkeypatch.setattr(tk, "kite_client", FakeMD())
+        mgr = TickerManager()
+        mgr.on_ticks(
+            None,
+            [
+                {
+                    "instrument_token": 222,
+                    "last_price": 255.0,
+                    "ohlc": {"close": 250.0},
+                    "exchange_timestamp": "2026-09-01T10:00:00+05:30",
+                }
+            ],
+        )
+
+        timestamp = _capture_events(capsys)[0]["data"]["timestamp"]
+        assert timestamp == "2026-09-01T04:30:00+00:00"
+        assert mgr.status()["lastTickAt"] == timestamp
+
     def test_order_update_uses_renderer_channel(self, capsys):
         mgr = TickerManager()
         mgr.on_order_update(None, {"order_id": "X1", "status": "COMPLETE"})
@@ -111,6 +135,97 @@ class TestSubscription:
         st = mgr.status()
         assert st["tokens"] == 1
         assert "running" in st and "dev" in st
+
+
+@pytest.mark.parametrize("source_time", [None, "not-a-timestamp"])
+def test_unknown_source_time_is_not_reported_as_fresh_market_data(
+    source_time, capsys, monkeypatch
+):
+    monkeypatch.setattr(tk, "kite_client", FakeMD())
+    mgr = TickerManager()
+
+    mgr._emit_tick(111, 100, observed_at=source_time)
+
+    event = _capture_events(capsys)[0]["data"]
+    assert event["timestampQuality"] == "RECEIPT_ONLY"
+    assert event["observedAt"] is None
+    assert mgr.status()["lastTickAt"] is None
+    assert mgr.status()["lastTickReceivedAt"] == event["receivedAt"]
+
+
+@pytest.mark.parametrize("host_timezone", ["UTC", "Asia/Kolkata", "America/New_York"])
+def test_sdk_naive_epoch_timestamp_preserves_instant_on_every_host_timezone(
+    host_timezone, capsys, monkeypatch
+):
+    monkeypatch.setattr(tk, "kite_client", FakeMD())
+    # Match the installed SDK's datetime.fromtimestamp wire decoder exactly.
+    with monkeypatch.context() as host:
+        host.setenv("TZ", host_timezone)
+        time.tzset()
+        instant = datetime(2026, 9, 1, 4, 30, tzinfo=timezone.utc)
+        source_time = datetime.fromtimestamp(instant.timestamp())
+        mgr = TickerManager()
+        mgr.on_ticks(
+            None,
+            [
+                {
+                    "instrument_token": 111,
+                    "last_price": 100,
+                    "exchange_timestamp": source_time,
+                    "volume_traded": 123456,
+                }
+            ],
+        )
+    time.tzset()
+
+    event = _capture_events(capsys)[0]["data"]
+    assert event["timestamp"] == instant.isoformat()
+    assert event["volume"] == 123456  # Day-cumulative broker volume, not a tick delta.
+
+
+def test_out_of_order_ticks_do_not_regress_marks_or_global_freshness(
+    capsys, monkeypatch
+):
+    monkeypatch.setattr(tk, "kite_client", FakeMD())
+    mgr = TickerManager()
+    newest = "2026-09-01T04:30:00+00:00"
+    older = "2026-09-01T04:29:59+00:00"
+    mgr._emit_tick(111, 100, observed_at=newest)
+    mgr._emit_tick(111, 80, observed_at=older)
+    mgr._emit_tick(222, 200, observed_at=older)
+
+    events = _capture_events(capsys)
+    assert [event["data"]["lastPrice"] for event in events] == [100, 200]
+    assert mgr.status()["lastTickAt"] == newest
+
+
+def test_future_source_time_cannot_poison_subsequent_tick_freshness(
+    capsys, monkeypatch
+):
+    monkeypatch.setattr(tk, "kite_client", FakeMD())
+    instant = datetime(2026, 9, 1, 4, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr(tk, "now_utc", lambda: instant)
+    mgr = TickerManager()
+    mgr._emit_tick(111, 120, observed_at="2026-09-02T04:30:00+00:00")
+    mgr._emit_tick(111, 100, observed_at=instant)
+
+    assert [event["data"]["lastPrice"] for event in _capture_events(capsys)] == [100]
+    assert mgr.status()["lastTickAt"] == instant.isoformat()
+
+
+def test_malformed_price_or_token_does_not_stop_remaining_batch(capsys, monkeypatch):
+    monkeypatch.setattr(tk, "kite_client", FakeMD())
+    mgr = TickerManager()
+    mgr.on_ticks(
+        None,
+        [
+            {"instrument_token": 111, "last_price": "bad"},
+            {"instrument_token": None, "last_price": 100},
+            {"instrument_token": 222, "last_price": 200},
+        ],
+    )
+
+    assert [event["data"]["lastPrice"] for event in _capture_events(capsys)] == [200]
 
 
 class TestDevEmitter:

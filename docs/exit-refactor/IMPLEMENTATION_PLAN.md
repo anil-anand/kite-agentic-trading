@@ -94,6 +94,31 @@ the same essential admission checks; contract tests cover Python-to-renderer DTO
 by actual risk limits. Entry indicator formulas and normal exit policy remain the
 comparison control while foundation defects are corrected.
 
+**Implementation evidence:** the canonical broker, accounting, journal, RPC,
+admission and lifecycle suites in `backend/tests/` exercise the production
+adapters through synthetic SDK records and temporary storage. They cover missing
+prices and timestamps, stale marks, partial/unknown executions, reducer exposure,
+durable ownership/linkage, transaction rollback, cooldowns and restart recovery.
+`test_execution_accounting_integrity.py` additionally checks that incomplete entry
+ledgers cannot become verified outcomes, actual fill prices replace signal-price
+fallbacks, late execution times repair the journal, and unknown execution time
+does not disable existing thesis timers. Renderer polling scenarios in `tests/`
+exercise complete, partial and unavailable snapshots through the real components.
+`test_session_accounting_admission.py` checks execution/turnover agreement,
+per-order fee grouping and daily-loss enforcement from the admission snapshot;
+`test_entry_boundary_contracts.py` covers malformed proposal prices. The DEV
+adapter tests use the same canonical identity and mark contracts.
+Normal entry indicators and exit thresholds remain the comparison control.
+
+**Final phase-1 validation:** 620 Python tests and both renderer polling tests
+passed. Ruff lint/format, frontend lint/typecheck, an isolated full frontend build,
+and `git diff --check` passed. Frontend lint retains four existing unused-symbol
+warnings. No real broker calls or orders were used.
+
+This phase does not authorize live promotion: the CRITICAL phase-2 stop-fill/cancel
+handoff and separate [F26 DEV/account storage isolation](REPOSITORY_AUDIT.md#f26--dev-trading-is-not-isolated-from-live-persistent-state)
+gates remain open.
+
 ## Phase 2 — Recoverable order intents, residual fills and protective-stop handoff
 
 **Responsibility:** an exit/protection action must not duplicate, reverse or abandon
@@ -239,6 +264,17 @@ existing entry calculation behavior is characterized for any intended semantic c
 **Expected behavior:** normal management waits for usable completed context.
 Hard supervision continues regardless. No new indicators are needed.
 
+**Implementation/review evidence:** [PHASE4_REVIEW.md](PHASE4_REVIEW.md) records the
+pre-commit findings, corrections and scope. `market-context-v1` supplies causal
+5m/15m bars, source availability/quality, revision identity, known-at structure and
+raw/persistent regime context. The existing scanner and legacy normal controls
+consume validated inputs; missing volume remains unknown separately from price.
+The intended common VWAP change is tagged `session_typical_price_v1`; mirrored
+entry characterization records its effect on the existing five-point breakout
+alignment bonus without changing signal geometry. Final offline validation:
+**875 Python tests**, Ruff lint/format and `git diff --check` passed. No commit,
+broker order, or candidate-policy promotion was performed by the review.
+
 ## Phase 5 — Immutable thesis, lifecycle state and replayable journal
 
 **Responsibility:** make the position remember its premise and history; implement
@@ -280,6 +316,14 @@ restores counters/extrema/intents; legacy data remain readable without fake fact
 
 **Expected behavior:** bookkeeping becomes explicit while approved legacy exit
 semantics can still run as control. Unknown legacy trades use bounded management.
+
+**Implementation/review evidence:** [PHASE5_REVIEW.md](PHASE5_REVIEW.md) records
+the pre-commit findings, applied corrections and phase boundaries. Immutable
+theses, causal selection provenance, original-fill risk, orthogonal state,
+atomic checkpoints and scoped restart recovery are covered by offline tests,
+including partial fills, duplicate events, failed persistence and stop handoff.
+Final validation: **979 Python tests**, Ruff lint/format and `git diff --check`
+passed. No commit, live broker order or candidate-policy activation was performed.
 
 ## Phase 6 — Pure deterministic thesis and profit-management engine
 
@@ -323,6 +367,15 @@ decisions including HOLD reasoning.
 failure exits and justified profit protection. Trading benefit remains unproven
 until later validation; this phase does not activate the policy live.
 
+**Implementation/review evidence:** [PHASE6_REVIEW.md](PHASE6_REVIEW.md) records
+the hostile pre-commit review, severity, scenarios, corrections and phase
+boundaries. The pure policy uses shared hard-risk rules, causal evidence,
+distinct-bar confirmation/recovery, immutable profile/objective semantics and
+monotone confirmed protection. Tests cover real context/thesis contracts and
+checkpoint restart as well as mirrored adversarial paths. Final offline
+validation: **1,226 Python tests**, Ruff lint/format and `git diff --check` passed.
+No commit, live broker order or candidate-policy activation was performed.
+
 ## Phase 7 — Live orchestration integration in shadow mode
 
 **Responsibility:** connect the pure engine to existing live data/state/supervision,
@@ -359,6 +412,16 @@ states remain distinct; old and candidate paths cannot both submit exits.
 
 **Expected behavior:** observable candidate HOLD/weakening/exit recommendations in
 shadow, with existing approved control behavior executing through corrected safety.
+
+**Implementation/review evidence:** [PHASE7_REVIEW.md](PHASE7_REVIEW.md) records
+the pre-commit adversarial findings and fixes. Managed positions receive independent
+shadow scheduling, durable pinned policies, causal retained inputs, serialized
+candidate state and truthful legacy comparison. Quote observations cannot advance
+or reset normal confirmation; broker mutations remain suppressed. Scripted common
+coordinator tests cover cancel/fill races, partial residuals and unknown submissions.
+Final offline validation: **1,294 Python tests**, Ruff lint/format and
+`git diff --check` passed. No commit, real broker order or candidate live activation
+was performed. Phases 8–10 and the separate promotion gates remain required.
 
 ## Phase 8 — Shared paper, backtest and decision replay adapters
 
@@ -406,6 +469,16 @@ separate decision rules. Dataset/execution/cost versions recorded per run.
 **Expected behavior:** realistic, reproducible exit-only and full-stack comparisons,
 with conservative ambiguity and honest uncertainty rather than ideal fills.
 
+**Implementation/review evidence:** [PHASE8_REVIEW.md](PHASE8_REVIEW.md) records
+the hostile pre-commit findings, corrections, declared execution assumptions and
+phase boundaries. The fixed-admission candidate runner executes the shared
+policy/coordinator/reducer with partial fills, independent session deadlines,
+synchronized marked risk, retained exact-replay artifacts and explicit censoring.
+Production entry evaluation uses injected risk/config/time inputs; the raw lab
+remains separately labelled. Full portfolio selection/admission and promotion
+claims require the later research gates. Validation results are in the review.
+No commit, real broker order or candidate live activation was performed.
+
 ## Phase 9 — Exit-quality analytics and operator explanation
 
 **Responsibility:** answer why HOLD/weakening/exit and distinguish missed continuation
@@ -450,6 +523,16 @@ loss. User sees actual confirmed risk/execution state rather than only P&L.
 
 **Expected behavior:** actionable explanations and honest research diagnostics.
 LLM commentary remains optional, trace-linked and outside order authority.
+
+**Implementation/review evidence:** [PHASE9_REVIEW.md](PHASE9_REVIEW.md) records
+the adversarial findings, corrections, scenario coverage and validation. Reports
+use frozen fill-bound risk, verified financial eligibility, explicit metric
+coverage and execution-linked attribution. Retained replay and active panels
+separate shadow recommendations from actual protection/residual obligations.
+Hold-N diagnoses reachable price paths with censoring; paired alternative
+execution uses the isolated shared simulator with retained hard risk and costs.
+Missing historical observations remain unavailable. No commit, real broker
+operation or candidate live activation was performed by this review.
 
 ## Phase 10 — Robustness validation, controlled activation and legacy retirement
 
@@ -496,10 +579,20 @@ cannot loosen stops or revoke exits. No improvement claim based only on in-sampl
 **Expected behavior:** coherent, explained, validated management with strict
 hard-risk authority. More holding time or fewer trades alone is not success.
 
+**Implementation/review status:** [PHASE10_REVIEW.md](PHASE10_REVIEW.md) records
+the findings and corrections. The [acceptance workflow](PHASE10_ACCEPTANCE.md)
+implements frozen paired and independent portfolio runs, repaired legacy control,
+causal production entry/risk/calibration, single-access holdout, session-block
+inference, authentic shadow/paper capture, and binding of review claims to executed
+artifacts. F26/F29/F30 source fixes and focused regressions are included. Historical
+and operational outcomes must still satisfy the predeclared empirical gates;
+working adapters and passing synthetic tests do not establish that result.
+Candidate activation and legacy retirement remain conditional on accepted evidence.
+
 ## Separate work and explicit non-rewrites
 
-Before live promotion, deliver focused fixes for F29 secrets/blank saves, F26
-DEV/LIVE storage isolation and F30 privileged IPC/provider boundaries. Complete
+The focused F29 secrets/blank-save, F26 DEV/LIVE storage isolation, and F30
+IPC/provider corrections are included in this review. Before live promotion, complete
 any enabled manual entry protection/validation gaps from F09. These are not
 opportunities to add LLM trade authority or replace native credential storage.
 
