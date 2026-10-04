@@ -416,6 +416,13 @@ class MarketContextService:
         complete_frame = raw_frame.loc[
             raw_frame["available_at"] <= pd.Timestamp(decision_at)
         ].copy()
+        if normalized.missing_bars:
+            # A hole invalidates features spanning it, not every later bar.
+            # Keep its provenance in SourceQuality and restart feature warmup
+            # from the uninterrupted suffix without synthesizing observations.
+            complete_frame = complete_frame.loc[
+                complete_frame["date"] > pd.Timestamp(max(normalized.missing_bars))
+            ].copy()
         primary_bars = _frame_to_bars(complete_frame)
         primary_quality = _primary_quality(
             normalized,
@@ -458,6 +465,12 @@ class MarketContextService:
         session_vwap, atr, dynamics, participation = _continuous_observations(
             complete_frame
         )
+        if any(
+            missing.astimezone(EXCHANGE_TIMEZONE).date().isoformat() == session_id
+            for missing in normalized.missing_bars
+        ):
+            # VWAP needs the entire session even after rolling features recover.
+            session_vwap = None
         raw_regime, raw_features = _raw_regime(complete_frame)
         observations_usable = primary_quality.usable or (
             analysis_only and primary_quality.status is ContextQuality.STALE
@@ -1025,7 +1038,8 @@ def _primary_quality(
         for issue in issues
     ):
         status = ContextQuality.INVALID
-    elif normalized.missing_bars:
+    elif normalized.missing_bars and len(complete_frame) < 14:
+        # Require a fresh ATR window before restarting ordinary confirmation.
         status = ContextQuality.GAP
     elif (
         latest.astimezone(EXCHANGE_TIMEZONE).date()

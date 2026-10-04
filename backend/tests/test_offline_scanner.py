@@ -92,7 +92,7 @@ def test_weekend_analysis_keeps_real_timestamps_and_live_freshness_rules(
 def test_analysis_never_relaxes_chart_integrity_checks(offline_scanner, defect):
     scanner, frame, scanned = offline_scanner
     if defect == "gap":
-        frame.drop(index=20, inplace=True)
+        frame.drop(index=frame.index[-2], inplace=True)
     elif defect == "invalid":
         frame.loc[20, "close"] = -1
     elif defect == "volume":

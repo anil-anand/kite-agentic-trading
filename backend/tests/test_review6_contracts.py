@@ -497,4 +497,9 @@ def test_unlinked_fills_still_require_a_known_entry_window(
     result = e.engine._reconcile_execution(
         "RELIANCE", e.engine.active_trades["RELIANCE"]
     )
-    assert result == (None, "UNRECONCILED", None, None)
+    if unlinked_time == "missing":
+        # The handoff already retained the verified timestamp. A later response
+        # omitting it cannot erase that execution fact.
+        assert result[0] == 109.2
+    else:
+        assert result == (None, "UNRECONCILED", None, None)

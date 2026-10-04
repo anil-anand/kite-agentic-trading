@@ -430,6 +430,32 @@ class OrderLifecycleCoordinator:
 
         status = str(order.get("status", "")).upper()
         filled = int(order.get("filled_quantity", 0) or 0)
+        retained = self.journal.get_terminal_order_fact(
+            str(broker_order_id),
+            namespace=identity_parts[0],
+            account_id=identity_parts[1],
+        )
+        filled = max(filled, int((retained or {}).get("filled_quantity", 0) or 0))
+        if filled < 0 or (
+            order.get("quantity") is not None and filled > int(order["quantity"])
+        ):
+            self.journal.record_order_intent_event(
+                intent_id,
+                "order_quantity_conflict",
+                {"order": dict(order)},
+                attempt["attempt_id"],
+            )
+            return SubmissionResult(
+                intent_id,
+                attempt["attempt_id"],
+                attempt["attempt_tag"],
+                "RECONCILE_REQUIRED",
+                attempt.get("broker_order_id"),
+                "order quantity contradicts retained execution",
+            )
+        order = {**order, "filled_quantity": filled}
+        if status in _TERMINAL_ORDER_STATUSES:
+            order["pending_quantity"] = 0
         if status == "COMPLETE":
             state = AttemptState.FILLED.value if filled else AttemptState.REJECTED.value
         elif status in {"CANCELLED", "EXPIRED", "REJECTED AMO"}:
@@ -446,7 +472,14 @@ class OrderLifecycleCoordinator:
             AttemptState.REJECTED.value,
         }
         if attempt["state"] in terminal_states and state != attempt["state"]:
-            # Delayed working/order callbacks cannot revive a terminal order.
+            # A delayed status cannot revive an order, but any additional
+            # verified execution remains a durable lower bound on its fills.
+            self.journal.record_order_intent_event(
+                intent_id,
+                "order_observation_after_terminal",
+                {"order": dict(order)},
+                attempt["attempt_id"],
+            )
             return SubmissionResult(
                 intent_id,
                 attempt["attempt_id"],

@@ -2297,8 +2297,14 @@ class TradeJournal:
             if row is None:
                 raise ValueError(f"unknown lifecycle intent {intent_id}")
             intent = self._lifecycle_row(row)
-            if not intent["active"] or intent["intent_type"] not in {"EXIT", "FLATTEN"}:
-                raise ValueError("external handoff requires an active reduction intent")
+            if not intent["active"] or intent["intent_type"] not in {
+                "EXIT",
+                "FLATTEN",
+                "PROTECT",
+            }:
+                raise ValueError(
+                    "external handoff requires an active reduction or protection intent"
+                )
             payload = intent["payload"]
             recovery = payload.setdefault("recovery_trade", {})
             if not isinstance(recovery, dict):
@@ -2814,6 +2820,11 @@ class TradeJournal:
                 (namespace, account_id, str(broker_fill_id)),
             ).fetchone()
             if existing is not None:
+                allocated_key = json.loads(existing["raw_fill"] or "{}").get(
+                    "allocated_position_key"
+                )
+                if allocated_key and allocated_key != position_key:
+                    raise ValueError("external fill already allocated to another epoch")
                 facts = {
                     "broker_order_id": str(broker_order_id),
                     "side": side,
@@ -2976,6 +2987,8 @@ class TradeJournal:
             "ORDER BY e.timestamp DESC, e.rowid DESC",
             (str(broker_order_id),),
         ).fetchall()
+        terminal = None
+        maximum_filled = 0
         for row in rows:
             if self._lifecycle_account_identity(row["position_key"]) != (
                 str(namespace),
@@ -2983,37 +2996,82 @@ class TradeJournal:
             ):
                 continue
             order = json.loads(row["details"]).get("order")
-            if (
-                isinstance(order, dict)
-                and str(order.get("order_id", order.get("orderId")))
-                == str(broker_order_id)
-                and str(order.get("status", "")).upper()
-                in {"COMPLETE", "CANCELLED", "REJECTED", "EXPIRED", "REJECTED AMO"}
-            ):
-                return order
-        return None
+            if not isinstance(order, dict) or str(
+                order.get("order_id", order.get("orderId"))
+            ) != str(broker_order_id):
+                continue
+            maximum_filled = max(
+                maximum_filled, int(order.get("filled_quantity", 0) or 0)
+            )
+            if str(order.get("status", "")).upper() in {
+                "COMPLETE",
+                "CANCELLED",
+                "REJECTED",
+                "EXPIRED",
+                "REJECTED AMO",
+            }:
+                updated = as_utc(order.get("exchange_update_timestamp"))
+                retained_update = as_utc(
+                    (terminal or {}).get("exchange_update_timestamp")
+                )
+                if terminal is None or (
+                    updated is not None
+                    and (retained_update is None or updated > retained_update)
+                ):
+                    terminal = dict(order)
+        if terminal is not None:
+            # Event arrival order is not execution order. Retain the greatest
+            # cumulative execution ever observed, including before termination.
+            ledger_quantity = conn.execute(
+                "SELECT COALESCE(SUM(quantity), 0) FROM order_fill_ledger "
+                "WHERE namespace = ? AND account_id = ? AND broker_order_id = ?",
+                (namespace, account_id, str(broker_order_id)),
+            ).fetchone()[0]
+            terminal["filled_quantity"] = max(maximum_filled, int(ledger_quantity))
+            if terminal.get("quantity") is not None and terminal[
+                "filled_quantity"
+            ] > int(terminal["quantity"]):
+                raise ValueError(
+                    "retained executions exceed the reported order quantity"
+                )
+            if "pending_quantity" in terminal:
+                terminal["pending_quantity"] = 0
+        return terminal
 
     def get_position_fills(
-        self, position_key: str, *, broker_order_ids: set[str]
+        self,
+        position_key: str,
+        *,
+        broker_order_ids: set[str],
+        include_allocated_external: bool = False,
     ) -> List[Dict[str, Any]]:
         """Read retained execution facts, never a claim about current broker state.
 
-        Both epoch and explicit owned-order linkage are required. This also
-        excludes unallocated v1 symbol-history observations from a new epoch.
+        The epoch and either owned-order linkage or a verified external-fill
+        allocation are required. Unallocated symbol history remains excluded.
         """
 
         namespace, account_id = self._lifecycle_account_identity(position_key)
-        if not broker_order_ids:
+        if not broker_order_ids and not include_allocated_external:
             return []
         order_ids = sorted(str(order_id) for order_id in broker_order_ids)
-        placeholders = ", ".join("?" for _ in order_ids)
+        placeholders = ", ".join("?" for _ in order_ids) or "NULL"
         conn = self._get_conn()
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             "SELECT * FROM order_fill_ledger WHERE namespace = ? AND account_id = ? "
             "AND position_key = ? "
-            f"AND broker_order_id IN ({placeholders}) ORDER BY recorded_at, broker_fill_id",
-            (namespace, account_id, position_key, *order_ids),
+            f"AND (broker_order_id IN ({placeholders}) OR "
+            "(? AND json_extract(raw_fill, '$.allocated_position_key') = ?)) "
+            "ORDER BY recorded_at, broker_fill_id",
+            (
+                namespace,
+                account_id,
+                position_key,
+                *order_ids,
+                include_allocated_external,
+                position_key,
+            ),
         ).fetchall()
         return [dict(row) for row in rows]
 

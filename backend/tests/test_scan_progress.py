@@ -93,7 +93,7 @@ def test_empty_scans_preserve_the_reason(
             scanner, "_fetch_candles", lambda *args: (pd.DataFrame(), False)
         )
     elif defect == "gap":
-        frame.drop(index=20, inplace=True)
+        frame.drop(index=frame.index[-2], inplace=True)
     elif defect == "fetch_error":
 
         def fail(*args):

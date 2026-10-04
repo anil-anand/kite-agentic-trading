@@ -132,6 +132,7 @@ class SimulatedBroker:
         self._mark_times: Dict[str, datetime] = {}
         self._last_candle_times: Dict[str, datetime] = {}
         self._candle_fill_budget: dict[str, int] = {}
+        self.target_execution_model = "RESTING_LIMIT"
         self._position_keys: Dict[str, BrokerPositionKey] = {}
         self._order_sequence = 0
         self._fill_sequence = 0
@@ -167,7 +168,9 @@ class SimulatedBroker:
             "zero_volume_policy": "NO_FILLS",
             "protection_activation": "IMMEDIATE_CONFIRMED",
             "cancellation_ack_latency_bars": 0,
-            "target_order_type": "RESTING_LIMIT",
+            "target_order_type": self.target_execution_model,
+            "target_touch_timing": "OPEN_OR_CLOSE_PRINT_ELSE_BAR_BOUNDS",
+            "partial_entry_target_policy": "POST_ENTRY_CLOSE_PROOF_OR_REPORTED_AMBIGUITY",
             "quantity_lot_size": 1,
             "price_tick_size": 10**-self.execution_policy.price_precision,
             "immediate_helpers": "FIXED_EXECUTION_EVENT_IGNORES_LATENCY_AND_FILL_FRACTION",
@@ -785,7 +788,7 @@ class SimulatedBroker:
                 self.positions[symbol]["excursion_quality"] = "PARTIAL_BAR_BOUNDS"
                 self.positions[symbol]["intrabar_entry_at"] = timestamp
 
-    def process_candle(self, symbol: str, candle: pd.Series):
+    def process_candle(self, symbol: str, candle: pd.Series, *, target_handler=None):
         """Advance one OHLC event using declared conservative ambiguity rules."""
 
         for name in ("open", "high", "low", "close", "date"):
@@ -833,7 +836,15 @@ class SimulatedBroker:
             return
 
         try:
-            self._execute_candle(symbol, candle, timestamp, opening, high, low)
+            self._execute_candle(
+                symbol,
+                candle,
+                timestamp,
+                opening,
+                high,
+                low,
+                target_handler=target_handler,
+            )
         finally:
             self._candle_fill_budget.pop(symbol, None)
             # Fills have their own executable prints; MTM uses the observed
@@ -848,6 +859,8 @@ class SimulatedBroker:
         opening: float,
         high: float,
         low: float,
+        *,
+        target_handler=None,
     ) -> None:
         if self.positions.get(symbol, {}).get("execution_censored"):
             return
@@ -858,12 +871,24 @@ class SimulatedBroker:
         if position is None:
             return
 
+        bar_end = self._time(
+            candle.get("available_at", timestamp + pd.Timedelta(minutes=5))
+        )
+        partial_entry_bar = (
+            position.get("intrabar_entry_at") == timestamp
+            or position["entry_time"] > timestamp
+        )
+        if position["entry_time"] >= bar_end:
+            return
         stop = position.get("sl")
         stop_order = self.orders.get(position.get("stop_order_id"))
         stop_active = bool(
             stop_order
             and stop_order["status"] not in {"COMPLETE", "CANCELLED", "REJECTED"}
-            and stop_order["updated_at"] <= timestamp
+            and (
+                stop_order["updated_at"] <= timestamp
+                or (partial_entry_bar and stop_order["updated_at"] < bar_end)
+            )
         )
         target = position.get("target")
         if position["direction"] == "BUY":
@@ -872,30 +897,63 @@ class SimulatedBroker:
         else:
             stop_hit = stop is not None and high >= stop
             target_hit = target is not None and low <= target
-        if position.get("intrabar_entry_at") == timestamp:
+        if partial_entry_bar:
             # A bar's favorable extreme can precede a limit entry. Its close
             # is known to follow the entry, so only that print proves a target
             # crossing within the actual exposure window.
-            target_hit = target is not None and (
+            proven_target_hit = target is not None and (
                 float(candle["close"]) >= target
                 if position["direction"] == "BUY"
                 else float(candle["close"]) <= target
             )
+            if target_hit and not proven_target_hit:
+                position["ambiguity"] = True
+                position["excursion_quality"] = "PARTIAL_BAR_BOUNDS"
+                event = {
+                    "type": "ENTRY_TARGET_AMBIGUITY",
+                    "symbol": symbol,
+                    "timestamp": timestamp.isoformat(),
+                    "resolution": "POST_ENTRY_TOUCH_UNPROVEN",
+                    "target_price": target,
+                    "bar_end": bar_end.isoformat(),
+                }
+                self.ambiguous_events.append(event)
+                self.events.append(event)
+                if self.execution_policy.ambiguity_policy == "REPORT_ONLY":
+                    position["execution_censored"] = True
+                    position["excursion_quality"] = "CENSORED_AMBIGUOUS_EXECUTION"
+                    self.censored_positions.append(
+                        {
+                            "symbol": symbol,
+                            "reason": "ENTRY_TARGET_AMBIGUITY",
+                            "at": timestamp,
+                        }
+                    )
+                    return
+            target_hit = proven_target_hit
         stop_hit = stop_active and (stop_hit or stop_order["triggered"])
         # If the opening print already satisfies an active target, a later
         # stop touch is not ambiguous. The order at the open precedes it.
         target_at_open = (
             target_hit
-            and position.get("intrabar_entry_at") != timestamp
+            and not partial_entry_bar
             and (
                 opening >= target
                 if position["direction"] == "BUY"
                 else opening <= target
             )
         )
-        stop_at_open = stop_active and (
-            stop_order["triggered"]
-            or (opening <= stop if position["direction"] == "BUY" else opening >= stop)
+        stop_at_open = (
+            stop_active
+            and stop_order["updated_at"] <= timestamp
+            and (
+                stop_order["triggered"]
+                or (
+                    opening <= stop
+                    if position["direction"] == "BUY"
+                    else opening >= stop
+                )
+            )
         )
         if target_at_open and not stop_at_open:
             stop_hit = False
@@ -978,7 +1036,7 @@ class SimulatedBroker:
                 stop_id,
                 raw_price=raw,
                 quantity=self._fill_quantity(position["quantity"]),
-                timestamp=timestamp,
+                timestamp=max(timestamp, position["entry_time"]),
                 reason="stop_loss",
             )
             if symbol in self.positions:
@@ -991,9 +1049,35 @@ class SimulatedBroker:
                 if position["direction"] == "BUY"
                 else min(opening, target)
             )
-            if position.get("intrabar_entry_at") == timestamp:
+            if partial_entry_bar:
                 raw = target
+            execution_at = bar_end if partial_entry_bar else timestamp
+            self.events.append(
+                {
+                    "type": "TARGET_BARRIER_TOUCH",
+                    "symbol": symbol,
+                    "target_price": target,
+                    "earliest_at": (
+                        execution_at
+                        if target_at_open or partial_entry_bar
+                        else timestamp
+                    ).isoformat(),
+                    "latest_at": (
+                        execution_at if target_at_open or partial_entry_bar else bar_end
+                    ).isoformat(),
+                    "timing_quality": "OBSERVED_PRINT"
+                    if target_at_open or partial_entry_bar
+                    else "INTRABAR_BOUNDS",
+                }
+            )
             order = self.orders.get(position.get("target_order_id"))
+            if target_handler is not None:
+                order_id = target_handler(symbol, execution_at, target)
+                if not order_id:
+                    return
+                order = self.orders[order_id]
+                if order["latency_remaining"]:
+                    return
             if not order or order["status"] in {"COMPLETE", "CANCELLED", "REJECTED"}:
                 order = self._new_order(
                     symbol=symbol,
@@ -1013,8 +1097,8 @@ class SimulatedBroker:
                 order["order_id"],
                 raw_price=raw,
                 quantity=self._fill_quantity(position["quantity"]),
-                timestamp=timestamp,
-                reason="target",
+                timestamp=execution_at,
+                reason=order.get("reason") or "target",
             )
             if symbol in self.positions:
                 self._update_excursions(position, high=high, low=low)

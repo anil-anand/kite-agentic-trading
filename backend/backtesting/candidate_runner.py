@@ -27,7 +27,7 @@ from ..exit_management.models import (
     ProtectionState,
     reduce_lifecycle,
 )
-from ..exit_management.profiles import resolve_profile
+from ..exit_management.profiles import ObjectiveMode, resolve_profile
 from ..exit_management.thesis import EntryThesis
 from ..market_context import MarketContext
 from ..order_lifecycle import IntentType, OrderLifecycleCoordinator
@@ -83,6 +83,9 @@ class CandidateRunner:
         if daily_loss_limit is not None:
             broker._finite_price(daily_loss_limit, "daily loss limit")
         self.broker = broker
+        self.broker.target_execution_model = (
+            "PRECOMMITTED_LIMIT_WITH_COORDINATOR_HANDOFF"
+        )
         self.coordinator = coordinator
         self.clock = SessionClock(session_policy)
         self.daily_loss_limit = daily_loss_limit
@@ -192,10 +195,51 @@ class CandidateRunner:
                 )
             ),
         }
-        # A runner owns objectives through the shared policy.  The broker's
-        # legacy OHLC target helper cannot add a second intrabar exit path.
-        position["target"] = None
+        # Freeze the same price barrier used by quote evaluation. OHLC touches
+        # enter the common coordinator before the simulator can execute them.
+        position["target"] = self._fixed_objective(thesis, policy)
         self.coordinator_record_fills(symbol)
+
+    def _fixed_objective(self, thesis, policy):
+        profile = resolve_profile(
+            thesis.management_profile, overrides=policy.profile_overrides
+        )
+        return (
+            thesis.objective
+            if profile.objective_mode is ObjectiveMode.FIXED_OBJECTIVE
+            else None
+        )
+
+    def _on_fixed_objective_touch(self, symbol, at, target):
+        managed = self.positions[symbol]
+        if managed.coordinator_intent_id:
+            return None
+        reason = "PROFIT_FIXED_OBJECTIVE_REACHED"
+        response = self._submit_reduction(symbol, at, reason, fixed_limit=target)
+        managed.coordinator_intent_id = response.intent_id
+        managed.state = reduce_lifecycle(
+            managed.state,
+            LifecycleEvent.EXIT_REQUESTED,
+            event_id=f"objective:{response.intent_id}",
+            occurred_at=at,
+            exit_intent_id=response.intent_id,
+        )
+        managed.management = replace(
+            managed.management,
+            latched_exit_reason_code=reason,
+            latched_exit_urgency="NORMAL",
+        )
+        self.execution_results.append(
+            {
+                "source": "PRECOMMITTED_FIXED_OBJECTIVE",
+                "intent_id": response.intent_id,
+                "order_id": response.broker_order_id,
+                "state": response.state,
+            }
+        )
+        if response.broker_order_id:
+            self.broker.positions[symbol]["target"] = None
+        return response.broker_order_id
 
     def coordinator_record_fills(self, symbol: str) -> None:
         managed = self.positions[symbol]
@@ -302,7 +346,7 @@ class CandidateRunner:
                 known_quantity=quantity,
             )
 
-    def _submit_reduction(self, symbol, at, reason, *, hard=False):
+    def _submit_reduction(self, symbol, at, reason, *, hard=False, fixed_limit=None):
         managed = self.positions[symbol]
         position = self.broker.positions[symbol]
         side = "SELL" if position["direction"] == "BUY" else "BUY"
@@ -347,13 +391,19 @@ class CandidateRunner:
                 "timestamp": at.isoformat(),
                 "reason": reason,
                 "role": OrderRole.REDUCTION.value,
-                **self.reduction_policy.order_fields(
-                    side=side,
-                    mark=self.broker._prices.get(symbol),
-                    hard=hard,
-                    market_required=managed.exit_market_required,
+                **(
+                    {"order_type": "LIMIT", "price": fixed_limit}
+                    if fixed_limit is not None
+                    else self.reduction_policy.order_fields(
+                        side=side,
+                        mark=self.broker._prices.get(symbol),
+                        hard=hard,
+                        market_required=managed.exit_market_required,
+                    )
                 ),
-                "reduction_policy": asdict(self.reduction_policy),
+                "reduction_policy": None
+                if fixed_limit is not None
+                else asdict(self.reduction_policy),
                 "market_required": managed.exit_market_required,
             },
             stop_order_id=position.get("stop_order_id"),
@@ -444,7 +494,9 @@ class CandidateRunner:
             candle = dict(candles[symbol])
             # Receipt of an old bar does not make its historical close fresh.
             candle["available_at"] = as_utc(candle["date"]) + pd.Timedelta(minutes=5)
-            self.broker.process_candle(symbol, pd.Series(candle))
+            self.broker.process_candle(
+                symbol, pd.Series(candle), target_handler=self._on_fixed_objective_touch
+            )
         for symbol in sorted(self.positions):
             self._reconcile(symbol, at)
         equity = self.broker.current_equity({})
@@ -632,7 +684,7 @@ class CandidateRunner:
         ]
         return {
             "manifest": {
-                "runner_version": "candidate-execution-v2",
+                "runner_version": "candidate-execution-v3",
                 "entry_policy": "FIXED_ADMITTED_ENTRY_FILL_OPPORTUNITIES",
                 "execution": deepcopy(self._execution_artifact["broker"])
                 if self._execution_artifact
@@ -656,7 +708,7 @@ class CandidateRunner:
                 else asdict(self.reduction_policy),
                 "timeout_observation": "PROVIDED_EVENTS_AFTER_CANDLE_EXECUTION",
                 "normal_fill_timing": "NEXT_AVAILABLE_BAR_LIMIT_EXECUTION",
-                "objective_observation": "COMPLETED_CLOSE_OR_EXPLICIT_QUOTE",
+                "objective_observation": "PRECOMMITTED_OHLC_BARRIER_OR_EXPLICIT_QUOTE",
             },
             "trades": self.broker.trades,
             "censored_positions": censored,
@@ -664,4 +716,16 @@ class CandidateRunner:
             "evaluations": self.evaluations,
             "recorded_decisions": deepcopy(self.recorded_decisions),
             "execution_results": self.execution_results,
+            "objective_events": deepcopy(
+                [
+                    event
+                    for event in self.broker.events
+                    if event["type"]
+                    in {
+                        "TARGET_BARRIER_TOUCH",
+                        "ENTRY_TARGET_AMBIGUITY",
+                        "STOP_TARGET_AMBIGUITY",
+                    }
+                ]
+            ),
         }

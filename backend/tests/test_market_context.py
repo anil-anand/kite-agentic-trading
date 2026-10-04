@@ -364,6 +364,56 @@ def test_missing_session_open_is_a_gap_and_cannot_claim_session_vwap():
     assert context.session_vwap is None
 
 
+def test_old_gap_recovers_real_context_and_restarts_exit_confirmation():
+    from backend.exit_management.engine import ExitPolicy, evaluate_exit
+    from backend.tests.exit_management.test_engine import _risk, _state, _thesis
+
+    old = _candles(
+        dates=pd.date_range(SESSION_START - timedelta(days=3), periods=3, freq="5min")
+    ).drop(index=1)
+    today = _candles(25)
+    today.loc[:, ["open", "high", "low", "close"]] = [100, 100.5, 99.5, 100]
+    today.loc[23:, ["open", "high", "low", "close"]] = [98, 98.5, 97.5, 98]
+    service = MarketContextService()
+    state, management = _state(), None
+    results = []
+    for count in (1, 23, 24, 25):
+        context = service.build(
+            "1", pd.concat([old, today.iloc[:count]], ignore_index=True), _at(count * 5)
+        )
+        if count == 1:
+            assert context.primary_quality.status is ContextQuality.GAP
+        else:
+            assert context.normal_decision_eligible
+            assert context.primary_quality.missing_bars
+            assert context.atr is not None
+            assert context.session_vwap is not None
+            assert context.direction_dynamics["ema_50"] is None
+        result = evaluate_exit(
+            _thesis(),
+            state,
+            context,
+            _risk(context, mark=context.primary_bar.close),
+            ExitPolicy(),
+            management_state=management,
+        )
+        state, management = result.next_position_state, result.next_management_state
+        results.append(result)
+    assert results[-2].decision.action.value == "HOLD"
+    assert results[-1].decision.primary_reason_code == "THESIS_BREAKOUT_FAILED"
+
+
+def test_same_session_gap_keeps_vwap_unknown_after_rolling_features_recover():
+    frame = _candles(27).drop(index=1)
+    context = build_market_context("101", frame, _at(135))
+    assert context.normal_decision_eligible
+    assert context.atr is not None
+    assert context.direction_dynamics["ema_20"] is not None
+    assert context.direction_dynamics["ema_50"] is None
+    assert context.session_vwap is None
+    assert context.primary_bars[0].start == _at(10)
+
+
 def test_setup_range_does_not_cross_overnight_session_seam():
     previous = _candles(21)
     today = _candles(

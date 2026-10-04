@@ -141,6 +141,7 @@ class BrokerOrder:
     order_time: Optional[datetime]
     received_at: datetime
     is_archived: bool = False
+    exchange_update_time: Optional[datetime] = None
 
     @property
     def is_app_order(self) -> bool:
@@ -668,6 +669,9 @@ def normalize_order(
         exchange_time=parse_broker_timestamp(
             _value(payload, "exchange_timestamp", "exchangeTimestamp")
         ),
+        exchange_update_time=parse_broker_timestamp(
+            _value(payload, "exchange_update_timestamp", "exchangeUpdateTimestamp")
+        ),
         order_time=parse_broker_timestamp(
             _value(payload, "order_timestamp", "orderTimestamp")
         ),
@@ -896,6 +900,9 @@ def order_to_backend_dict(order: BrokerOrder) -> dict[str, Any]:
         "order_timestamp": order.order_time.isoformat() if order.order_time else None,
         "exchange_timestamp": order.exchange_time.isoformat()
         if order.exchange_time
+        else None,
+        "exchange_update_timestamp": order.exchange_update_time.isoformat()
+        if order.exchange_update_time
         else None,
     }
 

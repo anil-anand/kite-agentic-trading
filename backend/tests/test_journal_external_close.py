@@ -34,6 +34,9 @@ class FakeJournal:
     def update_execution_linkage(self, trade_id, **kwargs):
         self.linkage[trade_id] = {**kwargs, "execution_linkage_history": None}
 
+    def reconcile_entry_time(self, trade_id, **kwargs):
+        pass
+
     def close_trade(
         self, trade_id, exit_price, reason, exit_time=None, cost_details=None
     ):
@@ -192,17 +195,28 @@ class TestJournalExternalClose:
         trades = [
             {
                 "tradingsymbol": "RELIANCE",
+                "order_id": "ENTRY1",
+                "transaction_type": "BUY",
+                "quantity": 10,
+                "average_price": 100.0,
+                "fillTimestamp": "2026-09-06 10:00:00",
+            },
+            {
+                "tradingsymbol": "RELIANCE",
                 "transaction_type": "SELL",
                 "quantity": 10,
                 "average_price": 96.0,
                 "fillTimestamp": "2026-09-06 12:00:00",
-            }
+            },
         ]
         kite = FakeKite(trades=trades)
         eng = self._engine(monkeypatch, kite, j)
         # Entry time is before exit
         eng.active_trades["RELIANCE"] = _trade(
-            quantity=10, entry_time="2026-09-06T10:00:00", stop_order_id=None
+            quantity=10,
+            entry_time="2026-09-06T10:00:00",
+            stop_order_id=None,
+            entry_order_id="ENTRY1",
         )
 
         eng._journal_external_close("RELIANCE")

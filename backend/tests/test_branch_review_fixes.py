@@ -256,7 +256,7 @@ def test_bound_entry_timestamp_repairs_after_restart(lifecycle):
     restarted = TradingEngine()
     restarted.reconcile_active_trades()
     terminal_at = now_utc()
-    e.sdk.book[0]["exchange_timestamp"] = terminal_at
+    e.sdk.book[0]["exchange_update_timestamp"] = terminal_at
     restarted.monitor_positions()
     repaired = restarted._phase5_thesis_for(key)
     assert repaired.fill_binding.entry_terminal_at == terminal_at.isoformat()

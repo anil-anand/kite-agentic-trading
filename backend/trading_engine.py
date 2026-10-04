@@ -646,7 +646,7 @@ class TradingEngine:
             filled_quantity=projection.quantity,
             source_fill_ids=tuple(fill.broker_fill_id for fill in selected),
             first_fill_at=self._entry_execution_time(selected),
-            terminal_at=order.get("exchange_timestamp"),
+            terminal_at=order.get("exchange_update_timestamp"),
         )
         if repaired == thesis:
             return
@@ -2261,10 +2261,18 @@ class TradingEngine:
             fills = self._fill_snapshot().require_complete().fills
         except Exception:
             return
+        retained = self._accounting_fills(symbol, trade, live=False)
+        external = self._allocated_external_reductions(
+            symbol, trade, (*retained, *fills)
+        )
+        external_ids = {fill.broker_fill_id for fill in external}
         for fill in fills:
             key = fill.key
             if not (
-                fill.broker_order_id in owned_order_ids
+                (
+                    fill.broker_order_id in owned_order_ids
+                    or fill.broker_fill_id in external_ids
+                )
                 and key.tradingsymbol == symbol
                 and key.namespace.value == str(trade.get("namespace"))
                 and key.account_id == str(trade.get("account_id"))
@@ -2289,7 +2297,14 @@ class TradingEngine:
                     quantity=fill.quantity,
                     fill_price=fill.fill_price,
                     exchange_time=fill.exchange_time,
-                    raw_fill=fill_to_backend_dict(fill),
+                    raw_fill={
+                        **fill_to_backend_dict(fill),
+                        **(
+                            {"allocated_position_key": position_key}
+                            if fill.broker_fill_id in external_ids
+                            else {}
+                        ),
+                    },
                 )
             except Exception as exc:
                 # Failure to journal an observation does not mean a broker fill
@@ -2327,6 +2342,70 @@ class TradingEngine:
         if callable(getter):
             order_ids.update(getter(position_key))
         return order_ids
+
+    def _allocated_external_reductions(self, symbol: str, trade: dict, fills) -> tuple:
+        """Allocate only the uninterrupted intraday episode anchored by entry fills.
+
+        A later same-side fill, a session boundary, an unexplained opening
+        balance, or a reduction crossing flat ends the provable allocation.
+        Symbol, side and a lower time bound alone never establish ownership.
+        """
+        entry_id = trade.get("entry_order_id")
+        direction = trade.get("direction")
+        if not entry_id or trade.get("product") != "MIS":
+            return ()
+        scoped = {
+            fill.broker_fill_id: fill
+            for fill in fills
+            if fill.key.tradingsymbol == symbol
+            and fill.key.namespace.value == trade.get("namespace")
+            and fill.key.account_id == trade.get("account_id")
+            and fill.key.exchange == trade.get("exchange")
+            and fill.key.product == trade.get("product")
+            and fill.key.instrument_id == str(trade.get("instrument_id"))
+        }
+        entries = [
+            fill
+            for fill in scoped.values()
+            if fill.broker_order_id == entry_id and fill.side == direction
+        ]
+        first = self._entry_execution_time(entries)
+        quantity = int(
+            trade.get("executed_entry_quantity") or trade.get("quantity") or 0
+        )
+        if first is None or sum(fill.quantity for fill in entries) != quantity:
+            return ()
+        session = first.astimezone(EXCHANGE_TIMEZONE).date()
+        if any(fill.exchange_time is None for fill in scoped.values()):
+            return ()
+        episode = [
+            fill
+            for fill in scoped.values()
+            if fill.exchange_time.astimezone(EXCHANGE_TIMEZONE).date() == session
+        ]
+        prior_balance = sum(
+            fill.quantity if fill.side == direction else -fill.quantity
+            for fill in episode
+            if fill.exchange_time < first
+        )
+        if prior_balance:
+            return ()
+        owned = self._owned_lifecycle_order_ids(
+            self._trade_position_key(symbol, trade), trade
+        )
+        remaining, allocated = quantity, []
+        for fill in sorted(
+            episode,
+            key=lambda f: (f.exchange_time, f.side != direction, f.broker_fill_id),
+        ):
+            if fill.exchange_time < first or fill.broker_order_id == entry_id:
+                continue
+            if remaining == 0 or fill.side == direction or fill.quantity > remaining:
+                break
+            remaining -= fill.quantity
+            if fill.broker_order_id not in owned:
+                allocated.append(fill)
+        return tuple(allocated)
 
     def _accounting_fills(
         self, symbol: str, trade: dict, *, live: bool = True
@@ -2376,6 +2455,7 @@ class TradingEngine:
             rows = getter(
                 position_key,
                 broker_order_ids=self._owned_lifecycle_order_ids(position_key, trade),
+                include_allocated_external=True,
             )
             key = BrokerPositionKey(
                 namespace=ExecutionNamespace(trade["namespace"]),
@@ -2430,7 +2510,23 @@ class TradingEngine:
                     exchange_time=fill.exchange_time or previous.exchange_time,
                 )
             merged[fill_key] = fill
-        return tuple(merged.values())
+        result = tuple(merged.values())
+        if live and position_key is not None:
+            for fill in self._allocated_external_reductions(symbol, trade, result):
+                self._order_lifecycle.record_fill(
+                    position_key=position_key,
+                    broker_fill_id=fill.broker_fill_id,
+                    broker_order_id=fill.broker_order_id,
+                    side=fill.side,
+                    quantity=fill.quantity,
+                    fill_price=fill.fill_price,
+                    exchange_time=fill.exchange_time,
+                    raw_fill={
+                        **fill_to_backend_dict(fill),
+                        "allocated_position_key": position_key,
+                    },
+                )
+        return result
 
     def _persist_execution_linkage(self, trade: dict) -> bool:
         """Persist current and predecessor IDs, retaining a retry obligation."""
@@ -5649,7 +5745,7 @@ class TradingEngine:
                     quantity=filled_quantity,
                     residual_quantity=actual_quantity,
                     entry_time=entry_time,
-                    terminal_at=terminal_entry.get("exchange_timestamp"),
+                    terminal_at=terminal_entry.get("exchange_update_timestamp"),
                     confirmed_stop=self._find_order(stop_order_id),
                     entry_order_id=str(order_id),
                     stop_order_id=str(stop_order_id),
@@ -6346,7 +6442,12 @@ class TradingEngine:
         except Exception:
             return None
         try:
-            fills = self._accounting_fills(symbol, trade, live=not critical)
+            # The shared history reader has a 100 ms bound and one in-flight
+            # request. Urgency must not discard already available executions.
+            fills = self._accounting_fills(symbol, trade)
+        except ValueError:
+            # Contradictory execution facts are not an unavailable history feed.
+            return None
         except Exception:
             fills = ()
         direction = trade.get("direction")
@@ -6354,7 +6455,7 @@ class TradingEngine:
         amounts: dict[str, int] = {}
         sides: dict[str, str] = {}
         entry_times = []
-        external_reductions = []
+        external_reductions = self._allocated_external_reductions(symbol, trade, fills)
         for fill in fills:
             if not (
                 fill.key.namespace.value == str(trade.get("namespace"))
@@ -6367,8 +6468,6 @@ class TradingEngine:
                 continue
             order_id = fill.broker_order_id
             if order_id not in owned_ids:
-                if fill.side != direction:
-                    external_reductions.append(fill)
                 continue
             if order_id in sides and sides[order_id] != fill.side:
                 return None
@@ -6416,7 +6515,7 @@ class TradingEngine:
             self._quarantine_identity_mismatch(symbol, trade)
             return None
         reduced = sum(qty for oid, qty in amounts.items() if sides[oid] != direction)
-        if not reduced and not external_delta:
+        if not reduced and not external_delta and not external_reductions:
             return residual
         entered = sum(qty for oid, qty in amounts.items() if sides[oid] == direction)
         if not entered:
@@ -6578,6 +6677,11 @@ class TradingEngine:
         if (position["quantity"] > 0) != (trade["direction"] == "BUY"):
             self._quarantine_identity_mismatch(symbol, trade)
             return False
+        if trade.get("adopted") and not trade.get("adoption_handoff_complete"):
+            position = self._handoff_adopted_orders(symbol, trade)
+            if not position:
+                return False
+            residual_quantity = abs(position["quantity"])
         protection = self._lifecycle_projection(trade.get("protection_intent_id"))
         attempt = (protection or {}).get("latest_attempt") or {}
         if (
@@ -6765,6 +6869,78 @@ class TradingEngine:
             self._persist_execution_linkage(linkage_trade)
 
         return True
+
+    def _handoff_adopted_orders(self, symbol: str, trade: dict) -> Optional[dict]:
+        """Acquire protection only after external executable capacity is settled.
+
+        Called under the position management lock. The baseline and every
+        cancellation observation survive a restart before replacement submission.
+        """
+        key = self._trade_position_key(symbol, trade)
+        owned = self._owned_lifecycle_order_ids(key, trade)
+        try:
+            orders = [
+                order
+                for order in self._orders()
+                if self._trade_matches_position(trade, order)
+                and str(order["order_id"]) not in owned
+                and order["status"] not in self._TERMINAL_ORDER_STATUSES
+            ]
+            for order in orders:
+                if self._valid_protection_order(order, trade):
+                    trade["sl"] = order["trigger_price"]
+            intent = self._order_lifecycle.prepare_intent(
+                position_key=key,
+                intent_type=IntentType.PROTECT,
+                role=OrderRole.PROTECTION,
+                side="SELL" if trade["direction"] == "BUY" else "BUY",
+                quantity=trade["quantity"],
+                trade_id=trade.get("trade_id"),
+                reason="Adopted protection handoff",
+                payload={"recovery_trade": deepcopy(trade)},
+                latched=False,
+            )
+            trade["protection_intent_id"] = intent["intent_id"]
+            for order in orders:
+                order_id = str(order["order_id"])
+                trade.setdefault("external_handoff_baselines", {}).setdefault(
+                    order_id, int(order.get("filled_quantity", 0) or 0)
+                )
+                trade.setdefault("external_handoff_orders", {})[order_id] = order
+                self._order_lifecycle.journal.record_external_handoff(
+                    intent["intent_id"], trade
+                )
+                with self._trade_lock:
+                    self.active_trades[symbol].update(trade)
+                self._write_trade_checkpoint()
+                terminal = self._cancel_order_terminal(order_id)
+                if not terminal:
+                    return None
+                trade["external_handoff_orders"][order_id] = terminal
+                self._order_lifecycle.journal.record_external_handoff(
+                    intent["intent_id"], trade
+                )
+            residual = self._find_reconciled_residual(symbol, trade)
+            if residual is None:
+                return None
+            if any(
+                self._trade_matches_position(trade, order)
+                and str(order["order_id"]) not in owned
+                and order["status"] not in self._TERMINAL_ORDER_STATUSES
+                for order in self._orders()
+            ):
+                return None
+            trade["adoption_handoff_complete"] = True
+            with self._trade_lock:
+                self.active_trades[symbol].update(trade)
+            self._write_trade_checkpoint()
+            return residual
+        except Exception as exc:
+            self._push_log(
+                f"Adoption handoff for {symbol} requires recovery: {exc}",
+                level="warning",
+            )
+            return None
 
     def _recover_pending_entry(self, symbol: str, position: dict, trade: dict) -> None:
         lock = self._management_lock(symbol)
@@ -7067,7 +7243,7 @@ class TradingEngine:
                         quantity=original_quantity,
                         residual_quantity=residual_quantity,
                         entry_time=entry_time,
-                        terminal_at=entry_order.get("exchange_timestamp"),
+                        terminal_at=entry_order.get("exchange_update_timestamp"),
                         entry_order_id=str(entry_order_id),
                         stop_order_id=current.get("stop_order_id"),
                         protected=protected,
@@ -7362,6 +7538,7 @@ class TradingEngine:
             "original_strategy": "manual",
             "stop_order_id": None,
             "quantity": abs(p["quantity"]),
+            "executed_entry_quantity": abs(p["quantity"]),
             "residual_quantity": abs(p["quantity"]),
             "product": p.get("product", "MIS"),
             "exchange": exchange,
@@ -9632,12 +9809,6 @@ class TradingEngine:
         exit_order_ids = {exit_order_id} | {
             item["order_id"] for item in history if item["field"] == "exit_order_id"
         }
-        entry_time_val = trade_record.get("entry_time")
-        try:
-            entry_time = as_utc(entry_time_val)
-        except (TypeError, ValueError):
-            entry_time = None
-
         entry_direction = trade_record.get("direction", "BUY")
         exit_transaction_type = "SELL" if entry_direction == "BUY" else "BUY"
 
@@ -9736,7 +9907,6 @@ class TradingEngine:
         if entry_fills:
             actual_entry_time = self._entry_execution_time(entry_fills)
             if actual_entry_time is not None:
-                entry_time = actual_entry_time
                 trade_id = trade_record.get("trade_id") or trade_record.get("id")
                 if trade_id:
                     try:
@@ -9756,6 +9926,21 @@ class TradingEngine:
                         if active and active.get("trade_id") == trade_id:
                             active["entry_time"] = actual_entry_time
 
+        external_fill_ids = {
+            fill.broker_fill_id
+            for fill in self._allocated_external_reductions(
+                symbol,
+                {
+                    **trade_record,
+                    "namespace": req_namespace,
+                    "account_id": req_account,
+                    "exchange": req_exchange,
+                    "instrument_id": req_instrument,
+                    "product": req_product,
+                },
+                fills,
+            )
+        }
         matched_fills = []
         for fill in fills:
             if fill.key.tradingsymbol != symbol:
@@ -9795,12 +9980,7 @@ class TradingEngine:
                         0,
                     )
                 )
-            elif (
-                fill.side == exit_transaction_type
-                and entry_time is not None
-                and fill.exchange_time is not None
-                and fill.exchange_time >= entry_time
-            ):
+            elif fill.broker_fill_id in external_fill_ids:
                 # Only unlinked allocation uses the temporal window. Exact
                 # canonical linkage survives delayed/legacy bookkeeping time.
                 matched_fills.append((fill, "manual_broker_exit", 1))

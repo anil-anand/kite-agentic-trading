@@ -127,6 +127,9 @@ class LegacyControlRunner(CandidateRunner):
         self._legacy_last_review = {}
         self._legacy_last_bar = {}
 
+    def _fixed_objective(self, thesis, policy):
+        return thesis.objective
+
     def on_event(self, at, *, candles=None, contexts=None):
         # No candidate structural context enters the comparator. Hard risk and
         # existing immutable fixed objectives still use the same coordinator.
