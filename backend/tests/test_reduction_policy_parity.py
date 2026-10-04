@@ -42,7 +42,7 @@ def test_live_and_research_payloads_partial_timeout_and_late_cancel(
     assert simulated["quantity"] == live_order["quantity"] == 10
     if not hard:
         assert simulated["price"] == 97
-        runner.broker.process_candle(
+        runner.process_candle(
             SYMBOL,
             pd.Series(
                 {

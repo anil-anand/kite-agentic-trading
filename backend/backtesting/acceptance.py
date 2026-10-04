@@ -1433,6 +1433,13 @@ def _executed_research_failures(
                 failures.append(f"{prefix}_PORTFOLIO_HAS_UNPAIRED_ENTRIES")
             if account["parity"]["mismatches"]:
                 failures.append(f"{prefix}_PORTFOLIO_DECISION_PARITY_FAILED")
+            if (
+                isinstance(coverage, dict)
+                and coverage.get("target_execution_complete") is False
+            ):
+                failures.append(
+                    f"{prefix}_PORTFOLIO_TARGET_EXECUTION_COVERAGE_INCOMPLETE"
+                )
     reports = evidence.get("reports")
     stress = (
         reports.get("execution_and_data_stress_passed")

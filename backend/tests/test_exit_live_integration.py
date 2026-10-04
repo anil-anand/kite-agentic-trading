@@ -160,9 +160,8 @@ def test_shadow_evaluates_once_per_completed_bar_and_records_quote_extrema(monke
     )
     assert len(journal.get_exit_decisions(thesis.position_key)) == 2
 
-    # A timestamped tick is independently persisted as an extrema observation;
-    # it does not require another completed-candle evaluation and never sends
-    # an order.
+    # A timestamped tick is independently assessed without another completed
+    # candle vote or any broker dispatch.
     quote_at = START + timedelta(minutes=11)
     current["now"] = quote_at
     engine.enqueue_quote_event(
@@ -178,7 +177,7 @@ def test_shadow_evaluates_once_per_completed_bar_and_records_quote_extrema(monke
     checkpoint = journal.get_managed_position(thesis.position_key)["state"]
     assert checkpoint["counters"]["exit_policy"]["observed_mfe_r"] > 0
     assert checkpoint["counters"]["exit_policy"]["eligible_completed_bars"] == 2
-    assert len(journal.get_exit_decisions(thesis.position_key)) == 2
+    assert len(journal.get_exit_decisions(thesis.position_key)) == 3
 
 
 def test_candidate_intent_shape_is_accepted_by_the_common_coordinator(monkeypatch):

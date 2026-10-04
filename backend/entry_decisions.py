@@ -141,7 +141,7 @@ def evaluate_production_entries(
         raise ValueError("entry decision time must match the as-of market context")
     if not isinstance(raw_frame, pd.DataFrame):
         raise TypeError("raw_frame must be a DataFrame")
-    if not (
+    if not market_context.entry_history_ready or not (
         market_context.normal_decision_eligible
         or market_context.analysis_decision_eligible
     ):

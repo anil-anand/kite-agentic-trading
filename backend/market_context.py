@@ -241,6 +241,11 @@ class MarketContext:
             in {ContextQuality.VALID, ContextQuality.STALE}
         )
 
+    @property
+    def entry_history_ready(self) -> bool:
+        """Keep new-entry warmup independent of frozen-thesis price usability."""
+        return not self.primary_quality.missing_bars or self.atr is not None
+
     def primary_frame(self) -> pd.DataFrame:
         """Return a new DataFrame; no cached frame is shared with strategies."""
 
@@ -1038,9 +1043,6 @@ def _primary_quality(
         for issue in issues
     ):
         status = ContextQuality.INVALID
-    elif normalized.missing_bars and len(complete_frame) < 14:
-        # Require a fresh ATR window before restarting ordinary confirmation.
-        status = ContextQuality.GAP
     elif (
         latest.astimezone(EXCHANGE_TIMEZONE).date()
         != decision_at.astimezone(EXCHANGE_TIMEZONE).date()
@@ -1049,6 +1051,10 @@ def _primary_quality(
     elif policy.max_primary_age_seconds and age > policy.max_primary_age_seconds:
         status = ContextQuality.STALE
     else:
+        # build() retained only the contiguous suffix after the last hole.
+        # Its prices are usable immediately; rolling feature readiness is
+        # tracked independently in observation_quality. Frozen entry-boundary
+        # confirmation needs no new ATR/EMA window.
         status = ContextQuality.VALID
     return SourceQuality(
         status=status,

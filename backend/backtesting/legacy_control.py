@@ -13,8 +13,10 @@ from importlib import import_module
 from math import isfinite
 
 from ..broker_models import OrderRole
+from ..entry_ordering import round_entry_price_to_tick
 from ..exit_management.models import ExposureState, LifecycleEvent, reduce_lifecycle
 from ..order_lifecycle import IntentType
+from ..risk_rules import valid_stop_tightening
 from ..strategies.base import BaseStrategy
 from ..strategies.breakout_evidence import BreakoutEvidence
 from ..strategies.oscillator_evidence import OscillatorEvidence
@@ -153,7 +155,9 @@ class LegacyControlRunner(CandidateRunner):
                 continue
             key = managed.state.position_key
             close = self.broker._prices[symbol]
+            mark = close
             entry, target = position["entry_price"], managed.thesis.objective
+            breakeven = round_entry_price_to_tick(entry, managed.policy.tick_size)
             long = position["direction"] == "BUY"
             reason = None
             frame = None
@@ -250,8 +254,8 @@ class LegacyControlRunner(CandidateRunner):
                     ):
                         reason = "LEGACY_CONTROL_WEAK_CONVICTION"
                     elif held >= self.legacy_policy.breakeven_minutes:
-                        tighten = (
-                            entry > position["sl"] if long else entry < position["sl"]
+                        tighten = valid_stop_tightening(
+                            position["direction"], position["sl"], breakeven, mark
                         )
                     self._legacy_last_review[key] = at
             record = {
@@ -292,7 +296,7 @@ class LegacyControlRunner(CandidateRunner):
 
                 def amend(tag):
                     order_id = self.broker.set_protective_stop(
-                        symbol, entry, at, stop_limit=stop["order_type"] == "SL"
+                        symbol, breakeven, at, stop_limit=stop["order_type"] == "SL"
                     )
                     self.broker.orders[order_id]["tag"] = tag
                     return order_id
@@ -303,7 +307,7 @@ class LegacyControlRunner(CandidateRunner):
                     role=OrderRole.PROTECTION,
                     side="SELL" if long else "BUY",
                     quantity=position["quantity"],
-                    payload={"stop_price": entry, "timestamp": at.isoformat()},
+                    payload={"stop_price": breakeven, "timestamp": at.isoformat()},
                     submit_order=amend,
                     reason="LEGACY_CONTROL_TIME_BREAKEVEN",
                 )
@@ -316,7 +320,7 @@ class LegacyControlRunner(CandidateRunner):
                     self.coordinator.observe_order(response.intent_id, observed)
                     self.coordinator.journal.complete_order_intent(response.intent_id)
                     managed.management = replace(
-                        managed.management, confirmed_stop=entry
+                        managed.management, confirmed_stop=breakeven
                     )
                 self.execution_results.append(
                     {

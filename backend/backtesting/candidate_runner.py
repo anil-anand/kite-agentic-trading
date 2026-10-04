@@ -198,6 +198,7 @@ class CandidateRunner:
         # Freeze the same price barrier used by quote evaluation. OHLC touches
         # enter the common coordinator before the simulator can execute them.
         position["target"] = self._fixed_objective(thesis, policy)
+        position["managed_position_key"] = state.position_key
         self.coordinator_record_fills(symbol)
 
     def _fixed_objective(self, thesis, policy):
@@ -210,12 +211,26 @@ class CandidateRunner:
             else None
         )
 
-    def _on_fixed_objective_touch(self, symbol, at, target):
-        managed = self.positions[symbol]
-        if managed.coordinator_intent_id:
+    def process_candle(self, symbol, candle):
+        """Execute a candle through the same target handoff in every driver."""
+        candle = dict(candle)
+        candle["available_at"] = as_utc(candle["date"]) + pd.Timedelta(minutes=5)
+        self.broker.process_candle(
+            symbol, pd.Series(candle), target_handler=self._on_fixed_objective_touch
+        )
+
+    def _on_fixed_objective_touch(self, symbol, at, target, *, objective_event):
+        managed = self.positions.get(symbol)
+        if (
+            managed is None
+            or managed.state.exposure is not ExposureState.OPEN
+            or managed.coordinator_intent_id
+        ):
             return None
         reason = "PROFIT_FIXED_OBJECTIVE_REACHED"
-        response = self._submit_reduction(symbol, at, reason, fixed_limit=target)
+        response = self._submit_reduction(
+            symbol, at, reason, fixed_limit=target, objective_event=objective_event
+        )
         managed.coordinator_intent_id = response.intent_id
         managed.state = reduce_lifecycle(
             managed.state,
@@ -232,6 +247,8 @@ class CandidateRunner:
         self.execution_results.append(
             {
                 "source": "PRECOMMITTED_FIXED_OBJECTIVE",
+                "objective_event_id": objective_event["event_id"],
+                "position_key": managed.state.position_key,
                 "intent_id": response.intent_id,
                 "order_id": response.broker_order_id,
                 "state": response.state,
@@ -346,7 +363,17 @@ class CandidateRunner:
                 known_quantity=quantity,
             )
 
-    def _submit_reduction(self, symbol, at, reason, *, hard=False, fixed_limit=None):
+    def _submit_reduction(
+        self,
+        symbol,
+        at,
+        reason,
+        *,
+        hard=False,
+        fixed_limit=None,
+        objective_event=None,
+        decision_id=None,
+    ):
         managed = self.positions[symbol]
         position = self.broker.positions[symbol]
         side = "SELL" if position["direction"] == "BUY" else "BUY"
@@ -380,6 +407,10 @@ class CandidateRunner:
                 )
             if not hard:
                 reason = projection.get("reason") or reason
+            objective_event = (
+                projection["payload"].get("objective_event") or objective_event
+            )
+            decision_id = projection["payload"].get("decision_id") or decision_id
         return self.coordinator.handoff_with_broker_adapter(
             broker=self.broker,
             position_key=managed.broker_position_key,
@@ -391,6 +422,8 @@ class CandidateRunner:
                 "timestamp": at.isoformat(),
                 "reason": reason,
                 "role": OrderRole.REDUCTION.value,
+                "objective_event": objective_event,
+                "decision_id": decision_id,
                 **(
                     {"order_type": "LIMIT", "price": fixed_limit}
                     if fixed_limit is not None
@@ -491,12 +524,7 @@ class CandidateRunner:
         self._execution_artifact = deepcopy(execution_artifact)
         self._last_event = at
         for symbol in sorted(candles):
-            candle = dict(candles[symbol])
-            # Receipt of an old bar does not make its historical close fresh.
-            candle["available_at"] = as_utc(candle["date"]) + pd.Timedelta(minutes=5)
-            self.broker.process_candle(
-                symbol, pd.Series(candle), target_handler=self._on_fixed_objective_touch
-            )
+            self.process_candle(symbol, candles[symbol])
         for symbol in sorted(self.positions):
             self._reconcile(symbol, at)
         equity = self.broker.current_equity({})
@@ -574,6 +602,7 @@ class CandidateRunner:
                     at,
                     evaluation.decision.primary_reason_code,
                     hard=evaluation.decision.urgency == "CRITICAL",
+                    decision_id=evaluation.decision.decision_id,
                 )
                 managed.coordinator_intent_id = response.intent_id
                 self.execution_results.append(
@@ -671,6 +700,68 @@ class CandidateRunner:
         )
         return tuple(results)
 
+    def _objective_execution_coverage(self):
+        events = {
+            event["event_id"]: event
+            for event in self.broker.events
+            if event["type"] == "TARGET_BARRIER_TOUCH" and event.get("event_id")
+        }
+        decisions = {
+            record["decision_id"]: record for record in self.recorded_decisions
+        }
+        target_fills = []
+        missing = []
+        for fill in self.broker.fills:
+            order = self.broker.orders[fill["order_id"]]
+            if order.get("reason") not in {
+                "target",
+                "PROFIT_FIXED_OBJECTIVE_REACHED",
+                "PROFIT_CONVERGENCE_OBJECTIVE",
+            } and not order.get("objective_event_id"):
+                continue
+            target_fills.append(fill["fill_id"])
+            owner = self.coordinator.journal.get_order_attempt_by_broker_order(
+                order["order_id"], position_key=fill["position_key"]
+            )
+            payload = (owner or {}).get("payload") or {}
+            objective = payload.get("objective_event") or {}
+            event_id = objective.get("event_id")
+            if objective:
+                trigger_known = (
+                    event_id in events
+                    and order.get("objective_event_id") == event_id
+                    and fill.get("objective_event_id") == event_id
+                    and events[event_id]["symbol"] == fill["symbol"]
+                    and all(
+                        events[event_id].get(key) == value
+                        for key, value in objective.items()
+                    )
+                )
+            else:
+                trigger = decisions.get(payload.get("decision_id")) or {}
+                trigger_known = trigger.get("action") == "REQUEST_EXIT" and trigger.get(
+                    "primary_reason_code"
+                ) in {"PROFIT_FIXED_OBJECTIVE_REACHED", "PROFIT_CONVERGENCE_OBJECTIVE"}
+            dispatched = any(
+                item.get("intent_id") == (owner or {}).get("intent_id")
+                and item.get("order_id") == order["order_id"]
+                for item in self.execution_results
+            )
+            if (
+                not owner
+                or not order.get("tag")
+                or order["tag"] != owner["attempt_tag"]
+                or not trigger_known
+                or not dispatched
+            ):
+                missing.append(fill["fill_id"])
+        return {
+            "target_fills": len(target_fills),
+            "linked_target_fills": len(target_fills) - len(missing),
+            "unlinked_target_fill_ids": missing,
+            "target_execution_complete": not missing,
+        }
+
     def finish(self) -> dict:
         """Censor unresolved exposure; end of data is never a fictional fill."""
         censored = [
@@ -716,6 +807,14 @@ class CandidateRunner:
             "evaluations": self.evaluations,
             "recorded_decisions": deepcopy(self.recorded_decisions),
             "execution_results": self.execution_results,
+            "execution_coverage": self._objective_execution_coverage(),
+            "execution_intents": {
+                item["intent_id"]: self.coordinator.journal.get_order_intent_projection(
+                    item["intent_id"]
+                )
+                for item in self.execution_results
+                if item.get("intent_id")
+            },
             "objective_events": deepcopy(
                 [
                     event

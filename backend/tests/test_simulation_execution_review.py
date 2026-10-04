@@ -284,7 +284,9 @@ def test_snapshot_does_not_refresh_old_mark_and_partial_exit_keeps_close_mark():
     broker.process_candle("TEST", candle(94, 95, 90, 92))
     snapshot = broker.position_snapshot(at(30)).net[0]
     assert snapshot.last_price == 92
-    assert snapshot.mark_time == at(5)
+    # The 04:25 candle's close is observed at 04:30, and a later snapshot
+    # preserves that clock rather than refreshing it to the snapshot time.
+    assert snapshot.mark_time == at(10)
     with pytest.raises(ValueError, match="chronological"):
         broker.mark_price("TEST", 100, at(1))
 

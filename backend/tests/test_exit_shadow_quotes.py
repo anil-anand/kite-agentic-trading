@@ -53,40 +53,46 @@ def _pin_confirmation(engine, key, mode="shadow"):
     return candidate
 
 
-def test_quote_burst_coalesces_extrema_without_decisions_or_broker_io(monkeypatch):
+def test_quote_burst_coalesces_policy_events_without_advancing_candles(monkeypatch):
     import backend.trading_engine as module
 
     engine, thesis = _managed_engine()
-    candidate = _pin_confirmation(engine, thesis.position_key)
+    _pin_confirmation(engine, thesis.position_key)
     at = START + timedelta(minutes=1)
     monkeypatch.setattr(module, "now_utc", lambda: at)
 
     def forbidden(*args, **kwargs):
-        pytest.fail("observational quotes must not evaluate rules or fetch metadata")
+        pytest.fail("shadow quotes must not fetch candles or submit orders")
 
-    monkeypatch.setattr(engine, "_get_tick_size", forbidden)
-    monkeypatch.setattr(module, "evaluate_exit", forbidden)
-    for mark in [104.0, 94.0, 100.0] * 1000:
+    monkeypatch.setattr(engine, "_get_tick_size", lambda *a: 0.05)
+    monkeypatch.setattr(module.scanner, "get_market_context", forbidden)
+    monkeypatch.setattr(engine._order_lifecycle, "submit", forbidden)
+    for mark in [104.0, 96.0, 100.0] * 1000:
         engine.enqueue_quote_event(_quote(mark, at))
     assert len(engine._quote_events) == 1
     engine._consume_quote_events()
     checkpoint = journal.get_managed_position(thesis.position_key)["state"]
     memory = checkpoint["counters"]["exit_policy"]
     assert memory["observed_mfe_r"] == 0.8
-    assert memory["observed_mae_r"] == 1.2
+    assert memory["observed_mae_r"] == 0.8
     assert memory["failure_count"] == 1
     assert memory["eligible_completed_bars"] == 2
-    assert checkpoint["counters"]["shadow_candidate_position_state"] == candidate
+    assert (
+        checkpoint["counters"]["shadow_candidate_position_state"][
+            "latched_exit_intent_id"
+        ]
+        is None
+    )
     assert checkpoint["counters"]["exit_shadow_assessment_key"] == "completed-bar"
     assert checkpoint["state"]["exposure"] == "OPEN"
-    assert journal.get_exit_decisions(thesis.position_key) == []
-    event = journal.get_position_lifecycle_event(checkpoint["state"]["last_event_id"])
-    assert event["event_type"] == "QUOTE_EXTREMA_OBSERVED"
-    assert len(event["details"]["observations"]) == 2
+    decisions = journal.get_exit_decisions(thesis.position_key)
+    assert len(decisions) == 2
+    assert all(row["payload"]["action"] == "HOLD" for row in decisions)
+    assert len(journal.get_position_quote_observations(thesis.position_key)) == 2
 
-    # Repeated/non-extreme marks must not consume another durable checkpoint.
+    # Identical quote events must not consume another durable checkpoint.
     before = checkpoint["state_version"]
-    for mark in (100.0, 103.0, 94.0):
+    for mark in (104.0, 96.0):
         engine.enqueue_quote_event(_quote(mark, at))
     engine._consume_quote_events()
     assert journal.get_managed_position(thesis.position_key)["state_version"] == before
@@ -238,6 +244,64 @@ def test_two_failure_bars_confirm_despite_interspersed_quote_burst(monkeypatch):
     current["context"] = _context(START + timedelta(minutes=5), close=97.0)
     engine._evaluate_shadow_position(_position(97.0, current["now"]), trade)
     decisions = journal.get_exit_decisions(thesis.position_key)
-    assert len(decisions) == 2
+    assert len(decisions) == 4
     assert decisions[-1]["payload"]["primary_reason_code"] == "THESIS_BREAKOUT_FAILED"
     assert decisions[-1]["payload"]["action"] == "REQUEST_EXIT"
+
+
+@pytest.mark.parametrize("event", ["quote", "poll_target", "daily_loss", "operator"])
+def test_same_candle_price_and_hard_risk_events_reach_shadow_policy(monkeypatch, event):
+    import backend.trading_engine as module
+    from backend.tests.exit_management.test_engine import _context
+    from backend.tests.test_exit_live_integration import _position
+
+    engine, thesis = _managed_engine()
+    at = START + timedelta(minutes=5)
+    context = _context(START, close=98)
+    monkeypatch.setattr(module, "now_utc", lambda: at)
+    monkeypatch.setattr(module.risk_manager, "kill_switch_active", False)
+    monkeypatch.setattr(module.scanner, "get_market_context", lambda *a, **k: context)
+    monkeypatch.setattr(engine, "_get_tick_size", lambda *a: 0.05)
+    monkeypatch.setattr(
+        engine._order_lifecycle,
+        "submit",
+        lambda *a, **k: pytest.fail("shadow dispatch"),
+    )
+    trade = engine.active_trades["RELIANCE"]
+    engine._evaluate_shadow_position(_position(98, at), trade)
+    assert (
+        journal.get_managed_position(thesis.position_key)["state"]["counters"][
+            "exit_policy"
+        ]["failure_count"]
+        == 1
+    )
+    at += timedelta(seconds=1)
+    if event == "daily_loss":
+        monkeypatch.setattr(module.risk_manager, "kill_switch_active", True)
+    if event == "operator":
+        engine._operator_close_keys.add(thesis.position_key.rsplit(":", 1)[0])
+
+    def observe():
+        if event == "quote":
+            engine.enqueue_quote_event(_quote(111, at))
+            engine._consume_quote_events()
+        else:
+            engine._evaluate_shadow_position(
+                _position(111 if event == "poll_target" else 98, at), trade
+            )
+
+    observe()
+    decisions = journal.get_exit_decisions(thesis.position_key)
+    assert len(decisions) == 2
+    assert decisions[-1]["payload"]["action"] == "REQUEST_EXIT"
+    expected = {
+        "daily_loss": "RISK_DAILY_LOSS",
+        "operator": "OPERATOR_POSITION_CLOSE",
+    }.get(event, "PROFIT_FIXED_OBJECTIVE_REACHED")
+    assert decisions[-1]["payload"]["primary_reason_code"] == expected
+    checkpoint = journal.get_managed_position(thesis.position_key)["state"]
+    assert checkpoint["state"]["exposure"] == "OPEN"
+    assert checkpoint["counters"]["exit_policy"]["failure_count"] == 1
+    assert checkpoint["counters"]["exit_policy"]["eligible_completed_bars"] == 1
+    observe()
+    assert len(journal.get_exit_decisions(thesis.position_key)) == 2

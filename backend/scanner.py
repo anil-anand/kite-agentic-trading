@@ -80,6 +80,7 @@ class Scanner:
         self.candle_cache = {}
         self.last_cache_time = {}
         self.last_scanned_candle = {}
+        self._completed_decisions = {}
         self.last_analysis_candle = {}
         self._market_context_service = MarketContextService()
         self._analysis_context_service = MarketContextService()
@@ -363,6 +364,7 @@ class Scanner:
                     context.normal_decision_eligible
                     or context.analysis_decision_eligible
                 )
+                or not context.entry_history_ready
                 or "VOLUME_UNAVAILABLE" in context.primary_quality.issues
                 or context.primary_frame().empty
             ):
@@ -387,6 +389,19 @@ class Scanner:
                 latest_candle_id = context.primary_bar.end
                 last_scanned = scanned_candles.get(symbol)
                 if last_scanned is not None and latest_candle_id <= last_scanned:
+                    cached = self._completed_decisions.get(symbol)
+                    if (
+                        not analysis_only
+                        and latest_candle_id == last_scanned
+                        and cached is not None
+                        and cached[0] == latest_candle_id
+                    ):
+                        return deepcopy(cached[1]), {
+                            "outcome": "unchanged",
+                            "detail": "Retained decision for this completed candle",
+                            "candle_time": candle_time,
+                            "signals": len(cached[1]),
+                        }
                     return [], {
                         "outcome": "unchanged",
                         "detail": "No new completed candle since the previous scan",
@@ -414,6 +429,14 @@ class Scanner:
 
             if not evaluate_on_incomplete and context.primary_bar:
                 scanned_candles[symbol] = context.primary_bar.end
+                if not analysis_only:
+                    # Calculation is shared, delivery is not consumption. A
+                    # manual scan must leave the automatic owner's opportunity
+                    # available, with the same IDs and frozen decision inputs.
+                    self._completed_decisions[symbol] = (
+                        context.primary_bar.end,
+                        deepcopy(symbol_aggregated_signals),
+                    )
             return symbol_aggregated_signals, {
                 "outcome": "signals" if symbol_aggregated_signals else "no_match",
                 "detail": "Strategy signals found"
@@ -428,8 +451,8 @@ class Scanner:
             try:
                 with self._scan_locks_lock:
                     symbol_lock = self._scan_locks.setdefault(symbol, threading.Lock())
-                # Manual scans and the entry worker share one decision high-water
-                # mark. Unrelated symbols still run concurrently.
+                # Serialize calculation/cache publication per symbol. Every
+                # consumer receives its own copy of the completed decision.
                 with symbol_lock:
                     signals, result = evaluate_symbol(symbol, worker_index)
             except Exception:

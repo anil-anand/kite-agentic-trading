@@ -60,6 +60,7 @@ from .risk_rules import (
     HardRiskSnapshot,
     evaluate_hard_risk,
     is_fresh_mark,
+    valid_stop_tightening,
 )
 from .scan_progress import ScanProgress
 from .scanner import scanner
@@ -114,6 +115,7 @@ class TradingEngine:
         self.running = False
         self._scan_only = False
         self._scan_progress = None
+        self._entry_scan_deliveries = {}
         self._last_reconciliation_report = None
         self._entry_pause_reason = "the agent has not been started"
         self._last_pause_log = None
@@ -1331,16 +1333,33 @@ class TradingEngine:
                 "exposure": actual_before.exposure.value,
                 "protection": actual_before.protection.value,
                 "intent": actual_before.latched_exit_intent_id,
+                "mark": risk_snapshot.mark_price,
+                "mark_time": risk_snapshot.mark_time.isoformat()
+                if risk_snapshot.mark_time
+                else None,
+                "mark_fresh": is_fresh_mark(risk_snapshot, policy.hard_risk_policy),
+                "stop": risk_snapshot.hard_stop_price,
+                "daily_loss": risk_snapshot.daily_loss_latched,
+                "protection_failed": risk_snapshot.protection_failed,
+                "operator_close": risk_snapshot.operator_close_requested,
+                "operator_emergency": risk_snapshot.operator_emergency_requested,
+                "session": risk_snapshot.session.session_id,
+                "forced_flatten": risk_snapshot.session.forced_flatten_due,
             },
             sort_keys=True,
         )
-        if assessment_key == counters_before.get("exit_shadow_assessment_key"):
+        # A candle interval only deduplicates structural confirmation inside
+        # evaluate_exit. Quote and hard-risk facts can change within it.
+        quote_keys = counters_before.get("exit_shadow_quote_keys", [])
+        if (
+            assessment_key in quote_keys
+            if source == "QUOTE"
+            else assessment_key == counters_before.get("exit_shadow_assessment_key")
+        ):
             return None
         primary = context.primary_bar if context is not None else None
         eligible = bool(context is not None and context.normal_decision_eligible)
         previous_end = as_utc(counters_before.get("exit_shadow_last_bar_end"))
-        if eligible and previous_end is not None and primary.end <= previous_end:
-            return None
         candidate_before = self._shadow_candidate_state_from_checkpoint(
             checkpoint_payload, actual_before
         )
@@ -1454,9 +1473,12 @@ class TradingEngine:
             "exit_policy_mode": mode,
             "exit_policy": management_after.to_dict(),
             "shadow_candidate_position_state": candidate_after.to_dict(),
-            "exit_shadow_assessment_key": assessment_key,
             "exit_shadow_last_decision_id": evaluation.decision.decision_id,
         }
+        if source == "QUOTE":
+            counters["exit_shadow_quote_keys"] = [*quote_keys, assessment_key][-128:]
+        else:
+            counters["exit_shadow_assessment_key"] = assessment_key
         if (
             eligible
             and as_utc(management_after.last_processed_primary_bar_end) == primary.end
@@ -1684,7 +1706,9 @@ class TradingEngine:
             separators=(",", ":"),
         )
 
-    def _evaluate_shadow_position(self, position: dict, trade: dict) -> None:
+    def _evaluate_shadow_position(
+        self, position: dict, trade: dict, *, quote_only: bool = False
+    ) -> None:
         """Evaluate one durable position from its own market-data subscription.
 
         This deliberately does not use the scanner's dynamic watchlist.  An
@@ -1709,7 +1733,6 @@ class TradingEngine:
             )
             if mode == "legacy_control":
                 return
-            memory = self._shadow_management_from_checkpoint(checkpoint)
         except (TypeError, ValueError) as exc:
             self._push_log(
                 f"Shadow state unavailable for {position.get('tradingsymbol')}: {exc}",
@@ -1726,27 +1749,23 @@ class TradingEngine:
         # This fetch is intentionally outside the per-position state lock. A
         # slow historical endpoint cannot hold the reducer or delay a fill/
         # protection update for the same position.
-        context = scanner.get_market_context(
-            int(instrument_id) if str(instrument_id).isdigit() else instrument_id,
-            symbol,
-            context_settings=(
-                thesis.policy_snapshot.values.get("marketContext", {})
-                if thesis is not None
-                else None
-            ),
+        context = (
+            None
+            if quote_only
+            else scanner.get_market_context(
+                int(instrument_id) if str(instrument_id).isdigit() else instrument_id,
+                symbol,
+                context_settings=(
+                    thesis.policy_snapshot.values.get("marketContext", {})
+                    if thesis is not None
+                    else None
+                ),
+            )
         )
         # Reception precedes the decision. Capturing the clock before a cache
         # miss makes every freshly fetched candle appear to come from the future.
         event_time = now_utc()
         assessment_key = self._shadow_assessment_key(context)
-        if (
-            context is not None
-            and context.normal_decision_eligible
-            and context.primary_bar is not None
-        ):
-            last_end = as_utc(memory.last_processed_primary_bar_end)
-            if last_end is not None and context.primary_bar.end <= last_end:
-                return
 
         direction = thesis.direction if thesis is not None else trade.get("direction")
         state = self._phase5_state_for(position_key)
@@ -1807,7 +1826,9 @@ class TradingEngine:
             policy=policy,
             mode=mode,
             assessment_key=assessment_key,
-            source="COMPLETED_BAR"
+            source="QUOTE"
+            if quote_only
+            else "COMPLETED_BAR"
             if context is not None and context.normal_decision_eligible
             else "DATA_QUALITY",
             legacy_control=self._legacy_control_summary(trade, thesis),
@@ -4130,6 +4151,42 @@ class TradingEngine:
                 self._record_shadow_quote_observation(
                     key, trade=batch["trade"], observations=observations
                 )
+                with self._trade_lock:
+                    trade = dict(
+                        self.active_trades.get(batch["trade"]["tradingsymbol"], {})
+                    )
+                if trade.get("exit_management_position_key") != key:
+                    continue
+                thesis = self._phase5_thesis_for(key)
+                binding = thesis.fill_binding if thesis else None
+                terminal_at = as_utc(binding.entry_terminal_at) if binding else None
+                if terminal_at is None:
+                    continue
+                for observation in sorted(
+                    observations, key=lambda item: as_utc(item["observed_at"])
+                ):
+                    observed_at = as_utc(observation["observed_at"])
+                    if not terminal_at <= observed_at <= now_utc():
+                        continue
+                    state = self._phase5_state_for(key)
+                    if state is None or not state.known_quantity:
+                        continue
+                    # No history fetch is needed. The pure policy may observe
+                    # an objective or hard obligation, but receives no candle
+                    # with which to advance structural confirmation.
+                    self._evaluate_shadow_position(
+                        {
+                            **trade,
+                            "instrument_token": trade.get("instrument_id"),
+                            "position_key": key.rsplit(":", 1)[0],
+                            "quantity": state.known_quantity
+                            * (1 if trade["direction"] == "BUY" else -1),
+                            "last_price": observation["mark"],
+                            "mark_time": observed_at,
+                        },
+                        trade,
+                        quote_only=True,
+                    )
             except Exception as exc:
                 self._push_log(
                     f"Shadow quote observation unavailable for {batch['trade'].get('tradingsymbol')}: {exc}",
@@ -4893,6 +4950,19 @@ class TradingEngine:
         batch_lock = threading.Lock()
 
         def handle_new_signal(signal):
+            if not analysis_only and signal.get("id"):
+                symbol = signal["tradingsymbol"]
+                candle = (signal.get("market_context") or {}).get("primary_bar_end")
+                with batch_lock:
+                    previous, delivered = self._entry_scan_deliveries.get(
+                        symbol, (candle, set())
+                    )
+                    if previous != candle:
+                        delivered = set()
+                    if signal["id"] in delivered:
+                        return
+                    delivered.add(signal["id"])
+                    self._entry_scan_deliveries[symbol] = (candle, delivered)
             signal["universe_version"] = universe_version
             signal["screener_ranking"] = rankings.get(signal["tradingsymbol"])
             if signal["signal_score"] >= 70:
@@ -6323,7 +6393,7 @@ class TradingEngine:
                     # stale — placing an exit now would sell a flat position into
                     # a new (opposite) position. Skip and clean up in that case;
                     # otherwise exit against the actual live position.
-                    live = self._find_live_position_by_symbol(symbol)
+                    live = self._find_live_position_by_symbol(symbol, trade)
                     if live is None:
                         self._push_log(
                             f"Position snapshot failed for {symbol}; skipping exit evaluation.",
@@ -7977,7 +8047,7 @@ class TradingEngine:
         ):
             return False
         mark = position["last_price"]
-        if trigger_price >= mark if direction == "BUY" else trigger_price <= mark:
+        if not valid_stop_tightening(direction, confirmed_trigger, trigger_price, mark):
             return False
         stop_tx = "SELL" if direction == "BUY" else "BUY"
         buffer_pct = 0.01

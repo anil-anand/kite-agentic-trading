@@ -143,6 +143,7 @@ class SimulatedBroker:
 
         return {
             "namespace": self.namespace.value,
+            "uncertain_exit_timestamp": "LATEST_POSSIBLE_EXECUTION_TIME",
             "account_id": self.account_id,
             "execution_policy": asdict(self.execution_policy),
             "cost_rate_version": self.cost_service.rate_version,
@@ -374,7 +375,7 @@ class SimulatedBroker:
         position["stop_order_id"] = stop["order_id"]
 
     def _record_trade(
-        self, position: Dict[str, Any], timestamp: datetime, reason: str
+        self, position: Dict[str, Any], timestamp: datetime, reason: str, timing: dict
     ) -> None:
         quantity = position["initial_quantity"]
         exit_price = position["exit_notional"] / quantity
@@ -386,6 +387,7 @@ class SimulatedBroker:
                 "direction": position["direction"],
                 "entry_time": position["entry_time"],
                 "exit_time": timestamp,
+                "exit_timing": dict(timing),
                 "entry_price": position["entry_notional"] / quantity,
                 "exit_price": round(exit_price, self.execution_policy.price_precision),
                 "quantity": quantity,
@@ -410,6 +412,7 @@ class SimulatedBroker:
         quantity: int,
         timestamp: datetime,
         reason: Optional[str],
+        timing: Optional[dict] = None,
     ) -> None:
         symbol = order["symbol"]
         side = order["side"]
@@ -436,6 +439,14 @@ class SimulatedBroker:
             "price": price,
             "exchange_time": timestamp,
             "received_at": timestamp,
+            "execution_timing": dict(timing)
+            if timing
+            else {
+                "earliest_at": timestamp.isoformat(),
+                "latest_at": timestamp.isoformat(),
+                "timing_quality": "OBSERVED_PRINT",
+            },
+            "objective_event_id": order.get("objective_event_id"),
         }
         self.fills.append(fill)
         self._prices[symbol] = price
@@ -520,7 +531,12 @@ class SimulatedBroker:
                 target["remaining_quantity"] = existing["quantity"]
             return
 
-        self._record_trade(existing, timestamp, reason or order.get("reason") or "exit")
+        self._record_trade(
+            existing,
+            timestamp,
+            reason or order.get("reason") or "exit",
+            fill["execution_timing"],
+        )
         for pending in list(self.orders.values()):
             if pending["symbol"] == symbol and pending["order_id"] != order["order_id"]:
                 self.cancel_order(pending["order_id"], timestamp=timestamp)
@@ -534,6 +550,7 @@ class SimulatedBroker:
         quantity: int,
         timestamp: datetime,
         reason: Optional[str] = None,
+        timing: Optional[dict] = None,
     ) -> None:
         order = self.orders[order_id]
         if order["status"] in {"COMPLETE", "CANCELLED", "REJECTED"}:
@@ -570,7 +587,12 @@ class SimulatedBroker:
             # the exit bar's other extrema may occur after the reduction.
             self._update_excursions(position, high=price, low=price)
         self._apply_fill(
-            order, price=price, quantity=quantity, timestamp=timestamp, reason=reason
+            order,
+            price=price,
+            quantity=quantity,
+            timestamp=timestamp,
+            reason=reason,
+            timing=timing,
         )
         if order["symbol"] in self._candle_fill_budget:
             self._candle_fill_budget[order["symbol"]] -= quantity
@@ -778,7 +800,18 @@ class SimulatedBroker:
                 order["order_id"],
                 raw_price=raw,
                 quantity=self._fill_quantity(order["remaining_quantity"]),
-                timestamp=timestamp,
+                timestamp=timestamp + pd.Timedelta(minutes=5)
+                if raw != float(candle["open"])
+                and order["role"] != OrderRole.ENTRY.value
+                else timestamp,
+                timing={
+                    "earliest_at": timestamp.isoformat(),
+                    "latest_at": (timestamp + pd.Timedelta(minutes=5)).isoformat(),
+                    "timing_quality": "INTRABAR_BOUNDS",
+                }
+                if raw != float(candle["open"])
+                and order["role"] != OrderRole.ENTRY.value
+                else None,
             )
             if (
                 order["role"] == OrderRole.ENTRY.value
@@ -791,6 +824,11 @@ class SimulatedBroker:
     def process_candle(self, symbol: str, candle: pd.Series, *, target_handler=None):
         """Advance one OHLC event using declared conservative ambiguity rules."""
 
+        if (
+            self.positions.get(symbol, {}).get("managed_position_key")
+            and target_handler is None
+        ):
+            raise ValueError("managed candle execution requires the target coordinator")
         for name in ("open", "high", "low", "close", "date"):
             if name not in candle:
                 raise ValueError(f"candle is missing {name}")
@@ -813,7 +851,10 @@ class SimulatedBroker:
             ):
                 raise ValueError("candle volume must be finite and nonnegative")
         mark_time = self._time(
-            candle.get("mark_time", candle.get("available_at", timestamp))
+            candle.get(
+                "mark_time",
+                candle.get("available_at", timestamp + pd.Timedelta(minutes=5)),
+            )
         )
         if mark_time < timestamp:
             raise ValueError("candle cannot be available before its start")
@@ -1030,14 +1071,26 @@ class SimulatedBroker:
                     if position["direction"] == "BUY"
                     else min(raw, limit)
                 )
-            if not stop_at_open:
+            # A stop-limit can trigger at the open yet wait for an intrabar
+            # recovery to its executable limit. Trigger time is not fill time.
+            fill_at_open = stop_at_open and raw == opening
+            if not fill_at_open:
                 position["excursion_quality"] = "PARTIAL_BAR_BOUNDS"
             self._fill_order(
                 stop_id,
                 raw_price=raw,
                 quantity=self._fill_quantity(position["quantity"]),
-                timestamp=max(timestamp, position["entry_time"]),
+                timestamp=max(timestamp, position["entry_time"])
+                if fill_at_open
+                else bar_end,
                 reason="stop_loss",
+                timing=None
+                if fill_at_open
+                else {
+                    "earliest_at": max(timestamp, position["entry_time"]).isoformat(),
+                    "latest_at": bar_end.isoformat(),
+                    "timing_quality": "INTRABAR_BOUNDS",
+                },
             )
             if symbol in self.positions:
                 self._update_excursions(position, high=high, low=low)
@@ -1051,34 +1104,45 @@ class SimulatedBroker:
             )
             if partial_entry_bar:
                 raw = target
-            execution_at = bar_end if partial_entry_bar else timestamp
-            self.events.append(
-                {
-                    "type": "TARGET_BARRIER_TOUCH",
-                    "symbol": symbol,
-                    "target_price": target,
-                    "earliest_at": (
-                        execution_at
-                        if target_at_open or partial_entry_bar
-                        else timestamp
-                    ).isoformat(),
-                    "latest_at": (
-                        execution_at if target_at_open or partial_entry_bar else bar_end
-                    ).isoformat(),
-                    "timing_quality": "OBSERVED_PRINT"
-                    if target_at_open or partial_entry_bar
-                    else "INTRABAR_BOUNDS",
-                }
-            )
+            execution_at = timestamp if target_at_open else bar_end
+            objective_event = {
+                "type": "TARGET_BARRIER_TOUCH",
+                "event_id": f"objective:{symbol}:{timestamp.isoformat()}",
+                "position_key": position.get(
+                    "managed_position_key", self._key_for(symbol).as_string()
+                ),
+                "symbol": symbol,
+                "target_price": target,
+                "earliest_at": (
+                    execution_at if target_at_open or partial_entry_bar else timestamp
+                ).isoformat(),
+                "latest_at": (
+                    execution_at if target_at_open or partial_entry_bar else bar_end
+                ).isoformat(),
+                "timing_quality": "OBSERVED_PRINT"
+                if target_at_open or partial_entry_bar
+                else "INTRABAR_BOUNDS",
+            }
+            self.events.append(objective_event)
             order = self.orders.get(position.get("target_order_id"))
             if target_handler is not None:
-                order_id = target_handler(symbol, execution_at, target)
+                order_id = target_handler(
+                    symbol,
+                    execution_at,
+                    target,
+                    objective_event=deepcopy(objective_event),
+                )
                 if not order_id:
                     return
                 order = self.orders[order_id]
+                objective_event["order_id"] = order_id
                 if order["latency_remaining"]:
                     return
             if not order or order["status"] in {"COMPLETE", "CANCELLED", "REJECTED"}:
+                if target_handler is not None or position.get("managed_position_key"):
+                    # A rejected/missing owned order is a coordinator obligation.
+                    # The simulator cannot invent a replacement reduction.
+                    return
                 order = self._new_order(
                     symbol=symbol,
                     side="SELL" if position["direction"] == "BUY" else "BUY",
@@ -1091,6 +1155,7 @@ class SimulatedBroker:
                     latency_bars=0,
                 )
                 position["target_order_id"] = order["order_id"]
+            order["objective_event_id"] = objective_event["event_id"]
             if not target_at_open:
                 position["excursion_quality"] = "PARTIAL_BAR_BOUNDS"
             self._fill_order(
@@ -1099,6 +1164,10 @@ class SimulatedBroker:
                 quantity=self._fill_quantity(position["quantity"]),
                 timestamp=execution_at,
                 reason=order.get("reason") or "target",
+                timing={
+                    key: objective_event[key]
+                    for key in ("earliest_at", "latest_at", "timing_quality")
+                },
             )
             if symbol in self.positions:
                 self._update_excursions(position, high=high, low=low)
@@ -1166,6 +1235,9 @@ class SimulatedBroker:
             trigger_price=payload.get("trigger_price"),
             reason=payload.get("reason"),
             signal_info=payload.get("signal_info"),
+        )
+        order["objective_event_id"] = (payload.get("objective_event") or {}).get(
+            "event_id"
         )
         return order["order_id"]
 

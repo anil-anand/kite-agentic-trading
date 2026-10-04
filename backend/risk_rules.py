@@ -90,6 +90,23 @@ def is_fresh_mark(snapshot: HardRiskSnapshot, policy: HardRiskPolicy) -> bool:
         return False
 
 
+def valid_stop_tightening(direction, current_stop, proposed_stop, mark) -> bool:
+    """Validate a tick-rounded proposal against protection and a fresh mark.
+
+    Callers establish mark freshness before using this shared price predicate.
+    Equality with the mark is already triggered, so it is never an amendment.
+    """
+    if not all(
+        _finite_positive(value) for value in (current_stop, proposed_stop, mark)
+    ):
+        return False
+    if direction == "BUY":
+        return current_stop < proposed_stop < mark
+    if direction == "SELL":
+        return current_stop > proposed_stop > mark
+    return False
+
+
 def evaluate_hard_risk(
     snapshot: HardRiskSnapshot, policy: HardRiskPolicy
 ) -> HardRiskDecision:

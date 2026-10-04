@@ -108,6 +108,14 @@ def test_cancellation_only_portfolio_cannot_be_claimed_as_held_exposure_stress()
     ]
 
 
+def test_missing_target_execution_linkage_blocks_acceptance_despite_decision_parity():
+    result, manifest, evidence = _measured_fixture("HELD_EXPOSURE")
+    account = result["portfolio_results"][0]["report"]["candidate"]
+    account["execution_coverage"]["target_execution_complete"] = False
+    failures = _executed_research_failures("oos", result, manifest, evidence, {})
+    assert "OOS_PORTFOLIO_TARGET_EXECUTION_COVERAGE_INCOMPLETE" in failures
+
+
 @pytest.mark.parametrize(
     "reports", [None, {}, {"execution_and_data_stress_passed": None}]
 )

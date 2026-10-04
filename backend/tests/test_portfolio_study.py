@@ -108,6 +108,94 @@ def test_production_risk_rejects_overlap_and_releases_epoch_capacity(signals):
         assert branch["entry_checkpoints"]
 
 
+def test_intrabar_target_uses_coordinator_and_latest_bound_for_cooldown(signals):
+    candles = frames()
+    candles["TEST"].loc[3, ["open", "high", "low", "close"]] = [100, 112, 99, 101]
+    result = run(candles, risk_config={**config(), "tradeCooldownMins": 5})
+    for branch in (result["candidate"], result["control"]):
+        event = next(
+            item
+            for item in branch["objective_events"]
+            if item["type"] == "TARGET_BARRIER_TOUCH"
+        )
+        dispatch = next(
+            item
+            for item in branch["execution_results"]
+            if item.get("objective_event_id") == event["event_id"]
+        )
+        order = next(
+            item
+            for item in branch["orders"]
+            if item["order_id"] == dispatch["order_id"]
+        )
+        assert order["tag"].startswith("ol")
+        assert order["reason"] == "PROFIT_FIXED_OBJECTIVE_REACHED"
+        intent = branch["execution_intents"][dispatch["intent_id"]]
+        assert intent["payload"]["objective_event"]["event_id"] == event["event_id"]
+        assert any(
+            item["role"] == "PROTECTION" and item["status"] == "CANCELLED"
+            for item in branch["orders"]
+        )
+        fill = next(
+            item for item in branch["fills"] if item["order_id"] == order["order_id"]
+        )
+        assert fill["objective_event_id"] == event["event_id"]
+        assert fill["execution_timing"]["timing_quality"] == "INTRABAR_BOUNDS"
+        trade = branch["trades"][0]
+        assert datetime.fromisoformat(trade["exit_time"]) == START + timedelta(
+            minutes=20
+        )
+        assert datetime.fromisoformat(
+            trade["exit_timing"]["earliest_at"]
+        ) == START + timedelta(minutes=15)
+        assert datetime.fromisoformat(
+            trade["exit_timing"]["latest_at"]
+        ) == START + timedelta(minutes=20)
+        # Identical OHLC permits either reference touch, including one just
+        # before the close. The coarse run must respect both cooldown bounds.
+        accepted = [
+            datetime.fromisoformat(item["at"])
+            for item in branch["admissions"]
+            if item["accepted"]
+        ]
+        assert accepted[1] == START + timedelta(minutes=25)
+        for touch in (
+            START + timedelta(minutes=15, seconds=1),
+            START + timedelta(minutes=19, seconds=59),
+        ):
+            assert accepted[1] >= touch + timedelta(minutes=5)
+        assert any(
+            item["reason"] == "TRADE_COOLDOWN"
+            for item in branch["rejected_opportunities"]
+        )
+        assert branch["execution_coverage"]["target_fills"] == 1
+        assert branch["execution_coverage"]["linked_target_fills"] == 1
+        assert branch["parity"]["execution_coverage_complete"]
+
+
+def test_portfolio_missing_target_dispatch_fails_execution_coverage(
+    signals, monkeypatch
+):
+    from backend.backtesting.candidate_runner import CandidateRunner
+
+    original = CandidateRunner._on_fixed_objective_touch
+
+    def lose_dispatch(self, *args, **kwargs):
+        order_id = original(self, *args, **kwargs)
+        if order_id:
+            self.execution_results.pop()
+        return order_id
+
+    monkeypatch.setattr(CandidateRunner, "_on_fixed_objective_touch", lose_dispatch)
+    candles = frames()
+    candles["TEST"].loc[3, ["open", "high", "low", "close"]] = [100, 112, 99, 101]
+    result = run(candles)
+    for branch in (result["candidate"], result["control"]):
+        assert branch["execution_coverage"]["target_fills"] == 1
+        assert branch["execution_coverage"]["unlinked_target_fill_ids"]
+        assert not branch["parity"]["execution_coverage_complete"]
+
+
 def test_pending_and_concurrent_symbols_consume_capacity(signals):
     result = run(frames(("B", "A")))
     records = result["candidate"]["admissions"]

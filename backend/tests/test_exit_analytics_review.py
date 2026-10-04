@@ -208,3 +208,90 @@ def test_exposure_samples_join_actual_partial_fills_and_count_missing_allocation
     assert analytics._retained_exposure_path(
         journal, managed, thesis.to_dict(), rows
     ) == [{}]
+
+
+def test_real_ledger_allocated_manual_reductions_restore_exposure_and_excursions(
+    monkeypatch,
+):
+    import backend.trading_engine as module
+
+    engine, thesis = _managed_engine()
+    key = thesis.position_key
+    journal.create_order_intent(
+        intent_id="owned-entry",
+        position_key=key,
+        trade_id=thesis.trade_id,
+        intent_type="ENTER",
+        role="ENTRY",
+        side="BUY",
+        quantity=10,
+    )
+    journal.prepare_order_attempt(
+        intent_id="owned-entry", attempt_id="entry-attempt", attempt_tag="entry-tag"
+    )
+    journal.record_order_attempt_state(
+        "entry-attempt", "FILLED", broker_order_id="ENTRY"
+    )
+    journal.record_order_fill(
+        broker_fill_id="entry-fill",
+        broker_order_id="ENTRY",
+        position_key=key,
+        side="BUY",
+        quantity=10,
+        fill_price=100,
+        exchange_time=START,
+    )
+    for order, at, price in (("MANUAL-PARTIAL", 1, 104), ("MANUAL-FINAL", 9, 106)):
+        journal.record_order_fill(
+            broker_fill_id=order,
+            broker_order_id=order,
+            position_key=key,
+            side="SELL",
+            quantity=5,
+            fill_price=price,
+            exchange_time=START + timedelta(minutes=at),
+            raw_fill={"allocated_position_key": key},
+        )
+    # Neither unallocated symbol history nor another epoch/account belongs here.
+    for index, other_key in enumerate(
+        (key, key.replace("epoch-1", "epoch-2"), key.replace("acct-1", "acct-2"))
+    ):
+        journal.record_order_fill(
+            broker_fill_id=f"unrelated-{index}",
+            broker_order_id=f"unrelated-{index}",
+            position_key=other_key,
+            side="SELL",
+            quantity=10,
+            fill_price=1,
+            exchange_time=START + timedelta(minutes=1),
+            raw_fill={} if other_key == key else {"allocated_position_key": other_key},
+        )
+    assert (
+        len(
+            journal.get_position_fills(
+                key, broker_order_ids={"ENTRY"}, include_allocated_external=True
+            )
+        )
+        == 3
+    )
+    monkeypatch.setattr(module, "now_utc", lambda: START + timedelta(minutes=6))
+    engine._record_shadow_quote_observation(
+        key,
+        trade=engine.active_trades["RELIANCE"],
+        observations=[
+            {"mark": 98, "observed_at": START + timedelta(seconds=30)},
+            {"mark": 108, "observed_at": START + timedelta(minutes=5)},
+        ],
+    )
+    analytics = TradeAnalytics(str(journal.db_path))
+    managed = journal.get_managed_position(key)
+    path = analytics._retained_exposure_path(journal, managed, thesis.to_dict(), [])
+    assert [
+        (point["residual_quantity"], point["realized_gross"]) for point in path
+    ] == [(10, 0), (5, 20)]
+    result = analytics._exit_quality_record(journal, {**_trade(thesis), "quantity": 10})
+    assert result["eligible"]
+    assert result["metrics"]["mfe_r"] == 1.6
+    assert result["metrics"]["mae_r"] == 0.4
+    assert result["metrics"]["exposure_peak_gross"] == 60
+    assert result["metrics"]["exposure_aware_r_given_back"] == 0.2

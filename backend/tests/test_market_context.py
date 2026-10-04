@@ -85,9 +85,12 @@ def test_session_gap_is_not_filled_or_interpreted_as_market_evidence():
 
     context = build_market_context("101", frame, _at(25))
 
-    assert context.primary_quality.status is ContextQuality.GAP
+    assert context.primary_quality.status is ContextQuality.VALID
     assert context.primary_quality.missing_bars == (_at(5),)
-    assert not context.normal_decision_eligible
+    assert context.normal_decision_eligible
+    assert [bar.start for bar in context.primary_bars] == [_at(10), _at(15)]
+    assert context.atr is None
+    assert context.session_vwap is None
 
 
 def test_invalid_ohlcv_is_unavailable_to_normal_decisions():
@@ -359,7 +362,7 @@ def test_off_grid_and_out_of_session_rows_fail_closed_without_exception():
 
 def test_missing_session_open_is_a_gap_and_cannot_claim_session_vwap():
     context = build_market_context("101", _candles(4).iloc[1:], _at(20))
-    assert context.primary_quality.status is ContextQuality.GAP
+    assert context.primary_quality.status is ContextQuality.VALID
     assert context.primary_quality.missing_bars == (_at(0),)
     assert context.session_vwap is None
 
@@ -382,7 +385,8 @@ def test_old_gap_recovers_real_context_and_restarts_exit_confirmation():
             "1", pd.concat([old, today.iloc[:count]], ignore_index=True), _at(count * 5)
         )
         if count == 1:
-            assert context.primary_quality.status is ContextQuality.GAP
+            assert context.normal_decision_eligible
+            assert context.atr is None
         else:
             assert context.normal_decision_eligible
             assert context.primary_quality.missing_bars
@@ -401,6 +405,41 @@ def test_old_gap_recovers_real_context_and_restarts_exit_confirmation():
         results.append(result)
     assert results[-2].decision.action.value == "HOLD"
     assert results[-1].decision.primary_reason_code == "THESIS_BREAKOUT_FAILED"
+
+
+def test_two_valid_post_gap_closes_invalidate_without_rolling_feature_warmup():
+    from backend.exit_management.engine import ExitPolicy, evaluate_exit
+    from backend.tests.exit_management.test_engine import _risk, _state, _thesis
+
+    frame = _candles(11).drop(index=8)
+    frame.loc[:, ["open", "high", "low", "close"]] = [98, 98.5, 97.5, 98]
+    frame["received_at"] = frame["date"] + pd.Timedelta(minutes=5)
+    service = MarketContextService()
+    state, management = _state(), None
+    # One adverse bar before the hole must not combine with the first after it.
+    for count, expected in ((8, 1), (10, 1), (11, 2)):
+        context = service.build("1", frame, _at(count * 5))
+        assert context.normal_decision_eligible
+        assert context.atr is None
+        assert context.direction_dynamics["ema_20"] is None
+        if count > 8:
+            assert context.session_vwap is None
+            assert context.primary_bars[0].start == _at(45)
+            assert not context.entry_history_ready
+        result = evaluate_exit(
+            _thesis(),
+            state,
+            context,
+            _risk(context, mark=98),
+            ExitPolicy(),
+            management_state=management,
+        )
+        state, management = result.next_position_state, result.next_management_state
+        assert management.failure_count == expected
+        assert result.decision.action.value == (
+            "REQUEST_EXIT" if count == 11 else "HOLD"
+        )
+    assert result.decision.primary_reason_code == "THESIS_BREAKOUT_FAILED"
 
 
 def test_same_session_gap_keeps_vwap_unknown_after_rolling_features_recover():

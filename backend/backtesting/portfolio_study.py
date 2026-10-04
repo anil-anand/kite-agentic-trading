@@ -475,12 +475,7 @@ def _branch(
             # A late receipt cannot grant a new order access to an earlier print.
             for symbol, row in sorted(candles.items()):
                 if row["date"] >= start:
-                    broker.process_candle(
-                        symbol,
-                        pd.Series(
-                            dict(row, available_at=row["date"] + timedelta(minutes=5))
-                        ),
-                    )
+                    runner.process_candle(symbol, row)
             # Coarse-bar entry timeout: terminate remainder after its first
             # observed bar, even if latency prevented execution on that bar.
             # Any filled fraction stays immediately protected.
@@ -656,9 +651,11 @@ def _branch(
                         "at": at,
                         "symbol": symbol,
                         "status": "AVAILABLE"
-                        if ctx.normal_decision_eligible
+                        if ctx.normal_decision_eligible and ctx.entry_history_ready
                         else "UNAVAILABLE",
-                        "reason": ctx.primary_quality.status.value,
+                        "reason": ctx.primary_quality.status.value
+                        if ctx.entry_history_ready
+                        else "ENTRY_HISTORY_WARMUP",
                     }
                 )
                 decisions = evaluate_production_entries(
@@ -854,6 +851,7 @@ def _branch(
             fills=broker.fills,
             orders=list(broker.orders.values()),
             execution_coverage={
+                **result["execution_coverage"],
                 "scope": "HELD_EXPOSURE"
                 if filled_entries
                 else "ENTRY_ADMISSION_ONLY"
@@ -871,6 +869,9 @@ def _branch(
                 "recorded_decisions": len(result["recorded_decisions"]),
                 "replayed_decisions": len(result["recorded_decisions"]),
                 "mismatches": 0,
+                "execution_coverage_complete": result["execution_coverage"][
+                    "target_execution_complete"
+                ],
             },
             metrics=MetricsEvaluator.evaluate(
                 broker.trades, capital, equity_curve=runner.equity_curve

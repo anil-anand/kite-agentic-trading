@@ -372,6 +372,7 @@ class TradeAnalytics:
                 broker_order_ids=journal.get_position_order_ids(
                     managed["position_key"]
                 ),
+                include_allocated_external=True,
             )
             if managed
             else []
@@ -571,6 +572,7 @@ class TradeAnalytics:
         fills = journal.get_position_fills(
             managed["position_key"],
             broker_order_ids=journal.get_position_order_ids(managed["position_key"]),
+            include_allocated_external=True,
         )
         reductions = []
         entries = []

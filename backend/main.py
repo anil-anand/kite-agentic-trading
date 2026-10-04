@@ -17,7 +17,6 @@ from .broker_models import (
 )
 from .config import config_manager
 from .dev_mode import is_dev_mode
-from .execution_gateway import execution_gateway
 from .journal import journal
 from .kite_client import kite_client
 from .llm_client import OPENCODE_PLANS, OpenAICompatibleClient
@@ -334,8 +333,14 @@ def _handle_request(req):
             return success(trading_engine.request_operator_cancel(order_id))
 
         elif method == "modify_order":
-            res = execution_gateway.modify_order(**params)
-            return success(res)
+            # An arbitrary amendment can expand an admitted entry or race an
+            # owned reduction. Only the engine's locked, persisted protection
+            # operations currently implement the amendment lifecycle contract.
+            return error(
+                -32004,
+                "Manual order amendments are disabled: order changes require "
+                "managed ownership and risk validation.",
+            )
 
         elif method == "get_historical":
             res = kite_client.get_historical_data(**params)

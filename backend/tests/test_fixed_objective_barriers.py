@@ -3,6 +3,7 @@
 from dataclasses import replace
 from datetime import timedelta
 
+import pandas as pd
 import pytest
 
 from backend.backtesting.candidate_runner import CandidateRunner
@@ -175,3 +176,53 @@ def test_target_handoff_respects_declared_execution_latency(tmp_path):
     runner.on_event(ENTRY_AT + timedelta(minutes=5), candles={"RELIANCE": _bar("BUY")})
     assert runner.broker.trades == []
     assert len(runner.execution_results) >= 1
+
+
+def test_managed_position_rejects_direct_simulator_execution(tmp_path):
+    runner = _runner(tmp_path, "BUY")
+    with pytest.raises(ValueError, match="target coordinator"):
+        runner.broker.process_candle("RELIANCE", pd.Series(_bar("BUY")))
+    assert runner.broker.trades == []
+    assert not [o for o in runner.broker.orders.values() if o["role"] == "REDUCTION"]
+
+
+@pytest.mark.parametrize("side", ["BUY", "SELL"])
+def test_stop_limit_trigger_at_open_does_not_backdate_intrabar_fill(side):
+    sign = 1 if side == "BUY" else -1
+    broker = SimulatedBroker(execution_policy=SimulationExecutionPolicy(slippage_bps=0))
+    broker.place_market_order("TEST", side, 10, 100, ENTRY_AT)
+    broker.set_protective_stop(
+        "TEST", 100 - sign * 5, ENTRY_AT, stop_limit=True, limit_price=100 - sign * 6
+    )
+    candle = {
+        "date": ENTRY_AT + timedelta(minutes=5),
+        "open": 90,
+        "high": 96,
+        "low": 89,
+        "close": 95,
+    }
+    if side == "SELL":
+        candle.update(open=110, high=111, low=104, close=105)
+    broker.process_candle("TEST", pd.Series(candle))
+    timing = broker.trades[0]["exit_timing"]
+    assert timing["timing_quality"] == "INTRABAR_BOUNDS"
+    assert timing["earliest_at"] == candle["date"].isoformat()
+    assert broker.trades[0]["exit_time"] == ENTRY_AT + timedelta(minutes=10)
+
+
+@pytest.mark.parametrize("missing", ["event", "fill_link", "intent_link"])
+def test_target_coverage_requires_all_retained_execution_joins(tmp_path, missing):
+    runner = _runner(tmp_path, "BUY")
+    runner.on_event(ENTRY_AT + timedelta(minutes=5), candles={"RELIANCE": _bar("BUY")})
+    assert runner.finish()["execution_coverage"]["target_execution_complete"]
+    if missing == "event":
+        runner.broker.events = [
+            event
+            for event in runner.broker.events
+            if event["type"] != "TARGET_BARRIER_TOUCH"
+        ]
+    elif missing == "fill_link":
+        runner.broker.fills[-1].pop("objective_event_id")
+    else:
+        runner.broker.orders[runner.broker.fills[-1]["order_id"]]["tag"] = None
+    assert not runner.finish()["execution_coverage"]["target_execution_complete"]
