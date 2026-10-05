@@ -504,4 +504,5 @@ export interface WhatIfAnalysis {
 export interface LLMPostMortem {
   analysis?: string;
   error?: string;
+  cached?: boolean;
 }

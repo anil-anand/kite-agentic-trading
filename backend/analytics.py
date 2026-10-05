@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import json
 import sqlite3
 from datetime import datetime
@@ -6,6 +7,10 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from .llm_client import OpenAICompatibleClient
+
+# Bump this when the post-mortem prompt/schema changes so cached responses
+# generated with an older prompt are regenerated instead of served stale.
+POST_MORTEM_PROMPT_VERSION = "v1"
 
 
 class TradeAnalytics:
@@ -19,6 +24,25 @@ class TradeAnalytics:
         conn = sqlite3.connect(str(self.db_path))
         conn.row_factory = sqlite3.Row
         return conn
+
+    def _ensure_post_mortem_cache_table(self, conn):
+        """
+        Schema for `llm_post_mortems` is owned by `TradeJournal._init_db`
+        alongside the other journal tables. This is a defensive fallback for
+        callers (and tests) that construct `TradeAnalytics` against a
+        database that hasn't been initialized via `TradeJournal`.
+        """
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS llm_post_mortems (
+                trade_id TEXT PRIMARY KEY,
+                cache_key TEXT,
+                provider TEXT,
+                model TEXT,
+                prompt_version TEXT,
+                analysis TEXT,
+                created_at TIMESTAMP
+            );
+        """)
 
     def get_strategy_expectancy(self) -> List[Dict[str, Any]]:
         """
@@ -470,6 +494,11 @@ class TradeAnalytics:
     def generate_llm_post_mortem(self, trade_id: str) -> Dict[str, Any]:
         """
         Uses the configured OpenAI-compatible provider to generate a post-mortem.
+
+        Results are cached locally (keyed by trade id, provider, model, prompt
+        version, and a hash of the trade/events data) so unchanged trades are
+        not re-sent to the LLM on every request. Only successful generations
+        are cached; failures are always retried.
         """
         from .config import config_manager
 
@@ -477,25 +506,39 @@ class TradeAnalytics:
         llm = config_manager.get_llm_settings()
         api_key = creds.get("llmApiKey")
         provider = llm.get("provider", "Gemini")
+        model = llm.get("model", "")
         if not api_key and provider != "Ollama":
             return {"error": "LLM API Key not configured in settings."}
 
         conn = self._get_conn()
-        trade = conn.execute(
-            "SELECT * FROM trades WHERE id = ?", (trade_id,)
-        ).fetchone()
-        if not trade:
-            return {"error": "Trade not found"}
+        try:
+            self._ensure_post_mortem_cache_table(conn)
+            trade = conn.execute(
+                "SELECT * FROM trades WHERE id = ?", (trade_id,)
+            ).fetchone()
+            if not trade:
+                return {"error": "Trade not found"}
 
-        events = conn.execute(
-            "SELECT * FROM trade_events WHERE trade_id = ? ORDER BY timestamp ASC",
-            (trade_id,),
-        ).fetchall()
+            events = conn.execute(
+                "SELECT * FROM trade_events WHERE trade_id = ? ORDER BY timestamp ASC",
+                (trade_id,),
+            ).fetchall()
 
-        trade_dict = dict(trade)
-        events_list = [dict(e) for e in events]
+            trade_dict = dict(trade)
+            events_list = [dict(e) for e in events]
 
-        prompt = f"""
+            cache_key = self._post_mortem_cache_key(
+                trade_dict, events_list, provider, model
+            )
+
+            cached_row = conn.execute(
+                "SELECT cache_key, analysis FROM llm_post_mortems WHERE trade_id = ?",
+                (trade_id,),
+            ).fetchone()
+            if cached_row and cached_row["cache_key"] == cache_key:
+                return {"analysis": cached_row["analysis"], "cached": True}
+
+            prompt = f"""
 Analyze this intraday trade from a systematic trading algorithm and provide a short, insightful post-mortem.
 Focus on:
 1. Why we likely entered based on the strategy and confluence snapshot.
@@ -524,21 +567,82 @@ Indicator Snapshot:
 
 Trade Timeline Events:
 """
-        for event in events_list:
-            prompt += f"- {event.get('timestamp')}: {event.get('event_type')} - {event.get('details')}\\n"
+            for event in events_list:
+                prompt += f"- {event.get('timestamp')}: {event.get('event_type')} - {event.get('details')}\\n"
 
-        try:
-            analysis = OpenAICompatibleClient().generate(
-                base_url=llm.get("baseUrl", ""),
-                api_key=api_key,
-                model=llm.get("model", ""),
-                prompt=prompt,
-                provider=provider,
-                plan=llm.get("openCodePlan", "zen"),
-            )
-            return {"analysis": analysis}
-        except Exception as e:
-            return {"error": f"LLM Generation failed: {str(e)}"}
+            try:
+                analysis = OpenAICompatibleClient().generate(
+                    base_url=llm.get("baseUrl", ""),
+                    api_key=api_key,
+                    model=model,
+                    prompt=prompt,
+                    provider=provider,
+                    plan=llm.get("openCodePlan", "zen"),
+                )
+            except Exception as e:
+                return {"error": f"LLM Generation failed: {str(e)}"}
+
+            if not analysis or not analysis.strip():
+                # Don't cache empty responses; treat as a failure so the next
+                # call retries generation instead of serving a blank result.
+                return {"error": "LLM returned an empty response."}
+
+            # Persisting the cache entry is best-effort: a successfully
+            # generated analysis must still be returned to the caller even
+            # if the cache write itself fails (e.g. DB locked/unwritable).
+            try:
+                with conn:
+                    conn.execute(
+                        """
+                        INSERT INTO llm_post_mortems
+                            (trade_id, cache_key, provider, model, prompt_version, analysis, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(trade_id) DO UPDATE SET
+                            cache_key = excluded.cache_key,
+                            provider = excluded.provider,
+                            model = excluded.model,
+                            prompt_version = excluded.prompt_version,
+                            analysis = excluded.analysis,
+                            created_at = excluded.created_at
+                        """,
+                        (
+                            trade_id,
+                            cache_key,
+                            provider,
+                            model,
+                            POST_MORTEM_PROMPT_VERSION,
+                            analysis,
+                            datetime.now().isoformat(),
+                        ),
+                    )
+            except sqlite3.Error:
+                pass
+
+            return {"analysis": analysis, "cached": False}
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _post_mortem_cache_key(
+        trade_dict: Dict[str, Any],
+        events_list: List[Dict[str, Any]],
+        provider: str,
+        model: str,
+    ) -> str:
+        """
+        Builds a cache key covering everything that should invalidate a cached
+        post-mortem: the trade/event data itself, the provider/model, and the
+        prompt version. Never include credentials in this key.
+        """
+        fingerprint = {
+            "trade": {k: v for k, v in trade_dict.items() if k not in ("id",)},
+            "events": events_list,
+            "provider": provider,
+            "model": model,
+            "prompt_version": POST_MORTEM_PROMPT_VERSION,
+        }
+        payload = json.dumps(fingerprint, sort_keys=True, default=str)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 analytics = TradeAnalytics()
