@@ -17,6 +17,7 @@ export function setupIpcHandlers(getWindow: () => BrowserWindow | null, trustedU
   };
 
   registerHandle(channels.APP_GET_PYTHON_STATUS, () => pythonBridge.getStatus());
+  registerHandle(channels.APP_RETRY_STARTUP, () => pythonBridge.retryStartup());
   
   // ─── Authentication ───────────────────────────────────────────────
   

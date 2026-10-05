@@ -155,6 +155,20 @@ class PythonBridge {
     return { ...this.backendStatus };
   }
 
+  public retryStartup(): BackendStatus {
+    if (this.isShuttingDown || this.backendReady) return this.getStatus();
+    if (!this.childProcess) {
+      this.restartCount = 0;
+      this.start();
+    } else if (this.backendStatus.error && this.backendStatus.generation) {
+      // Retry a failed handshake in place. Killing the process could interrupt
+      // supervision that was already restored before a later startup failure.
+      // An in-flight handshake has no error and must be allowed to finish.
+      void this.rehydrateTrustedBackend(this.backendStatus.generation, this.childProcess);
+    }
+    return this.getStatus();
+  }
+
   private publishStatus(status: BackendStatus): void {
     // Keep readiness available to renderers mounted after the event was sent.
     this.backendStatus = status;
@@ -219,13 +233,18 @@ class PythonBridge {
 
   private async rehydrateTrustedBackend(generation: string, child: ChildProcess): Promise<void> {
     const isCurrent = () => this.childProcess === child && !this.isShuttingDown;
+    this.publishStatus({ running: false, ready: false, generation, error: null });
     try {
       const credentials = secureStorage.loadCredentials();
       await this.callRpc('set_credentials', { credentials }, false);
       if (!isCurrent()) return;
       const session = await this.callRpc('check_session', {}, false);
       if (!isCurrent()) return;
-      const supervision = await this.callRpc('resume_supervision', {}, false);
+      if (typeof session?.is_valid !== 'boolean') throw new Error('Backend session status is unavailable');
+      // Expired/missing credentials are a login state, not a transport failure.
+      // Supervision requires a verified account; a local status read lets the
+      // login UI open while preserving all existing recovery obligations.
+      const supervision = await this.callRpc(session.is_valid ? 'resume_supervision' : 'agent_status', {}, false);
       if (!isCurrent()) return;
       this.backendReady = true;
       this.publishStatus({

@@ -10,7 +10,7 @@ from pathlib import Path
 from cryptography.fernet import Fernet
 
 from .dev_mode import runtime_data_dir
-from .time_utils import as_utc
+from .time_utils import EXCHANGE_TIMEZONE, as_utc
 
 
 class ConfigManager:
@@ -607,10 +607,19 @@ class ConfigManager:
             return {}
         with path.open() as stream:
             states = json.load(stream)
+            written_at = datetime.datetime.fromtimestamp(
+                os.fstat(stream.fileno()).st_mtime, EXCHANGE_TIMEZONE
+            )
         if not isinstance(states, dict) or any(
             not isinstance(state, dict) for state in states.values()
         ):
             raise ValueError("persisted operator state is malformed")
+        for state in states.values():
+            if state.get("hardFlattenReason") and "hardFlattenSession" not in state:
+                # Legacy controls had no session date. The file's last write
+                # is a conservative upper bound on when each latch was saved.
+                # Preserve it on subsequent writes, including another account's.
+                state["hardFlattenSession"] = written_at.date().isoformat()
         return states
 
     def load_operator_state(self, namespace: str, account_id: str) -> dict:

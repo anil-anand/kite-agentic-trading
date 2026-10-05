@@ -298,15 +298,27 @@ class KiteClient:
     def get_trades(self) -> List[Dict[str, Any]]:
         return fill_snapshot_to_renderer_dto(self.get_fills_snapshot())
 
-    def get_broker_snapshot(self, *, critical: bool = False) -> BrokerSnapshot:
-        positions = self.get_positions_snapshot(critical=critical)
-        orders = self.get_current_orders_snapshot(critical=critical)
+    def get_broker_snapshot(
+        self, *, critical: bool = False, positions: Optional[PositionSnapshot] = None
+    ) -> BrokerSnapshot:
+        scope = (
+            self.kite,
+            self.namespace,
+            self.account_id,
+            datetime.now(EXCHANGE_TIMEZONE).date(),
+        )
         # Startup/account reconciliation also must finish with degraded facts
         # when history is blocked, so protection supervision can start.
         with self._accounting_fill_lock:
             pending = self._accounting_fill_read
-            if pending is None:
-                pending = {"done": threading.Event()}
+            if pending is None or pending["scope"] != scope:
+                # Keep all three source reads together across polls. Pairing a
+                # completed fill read with next cycle's positions/orders can
+                # exceed the read-skew limit forever at a five-second cadence.
+                pending = {
+                    "done": threading.Event(),
+                    "scope": scope,
+                }
                 self._accounting_fill_read = pending
 
                 def fetch():
@@ -318,16 +330,68 @@ class KiteClient:
                         pending["done"].set()
 
                 threading.Thread(target=fetch, daemon=True).start()
+        # Give the fill request time to finish while essential reads run. A
+        # normal HTTP round trip should not turn every other poll unavailable
+        # merely because it takes longer than the final bounded wait.
+        positions = positions or self.get_positions_snapshot(critical=critical)
+        orders = self.get_current_orders_snapshot(critical=critical)
+        with self._accounting_fill_lock:
+            if "positions" not in pending:
+                pending["positions"] = positions
+                pending["orders"] = orders
         if pending["done"].wait(0.1):
             fills = pending["result"]
+            previous_positions = pending["positions"]
+            previous_orders = pending["orders"]
+
+            def exposure_rows(snapshot):
+                return tuple(
+                    tuple(
+                        replace(
+                            position,
+                            last_price=None,
+                            mark_time=None,
+                            unrealised_gross=None,
+                            pnl=None,
+                        )
+                        for position in rows
+                    )
+                    for rows in (snapshot.net, snapshot.day)
+                )
+
+            if (
+                positions.quality is SnapshotQuality.COMPLETE
+                and orders.quality is SnapshotQuality.COMPLETE
+                and exposure_rows(positions) == exposure_rows(previous_positions)
+                and tuple(replace(order, received_at=None) for order in orders.orders)
+                == tuple(
+                    replace(order, received_at=None) for order in previous_orders.orders
+                )
+            ):
+                positions, orders = previous_positions, previous_orders
+            else:
+                # Never hide newer evidence of changed exposure/working orders
+                # or a failed read behind a previously complete snapshot.
+                fills = replace(
+                    fills,
+                    quality=SnapshotQuality.STALE,
+                    errors=fills.errors + ("broker state changed during fill read",),
+                )
             with self._accounting_fill_lock:
                 if self._accounting_fill_read is pending:
                     self._accounting_fill_read = None
         else:
             fills = unavailable_fill_snapshot("fill history read is pending")
+        if scope != (
+            self.kite,
+            self.namespace,
+            self.account_id,
+            datetime.now(EXCHANGE_TIMEZONE).date(),
+        ):
+            fills = unavailable_fill_snapshot("broker session changed during read")
         return BrokerSnapshot(
-            namespace=self.namespace,
-            account_id=self.account_id,
+            namespace=scope[1],
+            account_id=scope[2],
             positions=positions.net,
             day_positions=positions.day,
             current_orders=orders.orders,

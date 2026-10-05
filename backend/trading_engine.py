@@ -20,6 +20,7 @@ from .broker_models import (
     ExecutionNamespace,
     OrderRole,
     OrderSubmissionRejected,
+    SnapshotQuality,
     fill_to_backend_dict,
     normalize_fills_response,
     normalize_orders_response,
@@ -174,6 +175,7 @@ class TradingEngine:
         self._ticker_listener_registered = False
         self._supervision_generation = 0
         self._hard_flatten_reason: Optional[str] = None
+        self._hard_flatten_session: Optional[str] = None
         self._operator_close_keys: set[str] = set()
         self._hard_flatten_pending = False
         self._control_state_loaded = False
@@ -334,6 +336,14 @@ class TradingEngine:
 
     def _broker_snapshot(self, *, critical: bool = True, positions=None):
         """Compose essential facts with a bounded optional fill-history read."""
+        if hasattr(kite_client, "get_broker_snapshot"):
+            try:
+                return kite_client.get_broker_snapshot(
+                    critical=critical, positions=positions
+                )
+            except TypeError:
+                # Legacy adapters do not implement coherent bounded reads.
+                pass
         positions = positions or self._position_snapshot(critical=critical)
         orders = self._order_snapshot(critical=critical)
         fills = self._fill_snapshot()
@@ -2429,7 +2439,7 @@ class TradingEngine:
         return tuple(allocated)
 
     def _accounting_fills(
-        self, symbol: str, trade: dict, *, live: bool = True
+        self, symbol: str, trade: dict, *, live: bool = True, fills_snapshot=None
     ) -> tuple[BrokerFill, ...]:
         """Union current and retained executions solely for trade accounting.
 
@@ -2440,7 +2450,11 @@ class TradingEngine:
 
         live_error = None
         try:
-            live_fills = self._fill_snapshot().require_complete().fills if live else ()
+            live_fills = (
+                (fills_snapshot or self._fill_snapshot()).require_complete().fills
+                if live
+                else ()
+            )
         except Exception as exc:
             live_fills = ()
             live_error = exc
@@ -3974,6 +3988,7 @@ class TradingEngine:
                 account_id,
                 {
                     "hardFlattenReason": self._hard_flatten_reason,
+                    "hardFlattenSession": self._hard_flatten_session,
                     "hardFlattenPending": self._hard_flatten_pending,
                     "pendingClosePositionKeys": sorted(self._operator_close_keys),
                 },
@@ -3997,10 +4012,14 @@ class TradingEngine:
         if namespace and account_id not in (None, "", "UNKNOWN", "TEST_COMPAT"):
             try:
                 state = config_manager.load_operator_state(namespace, account_id)
+                session = state.get("hardFlattenSession")
+                if session is not None:
+                    session = datetime.date.fromisoformat(session).isoformat()
             except Exception:
                 self._control_state_invalid = True
                 raise
             self._hard_flatten_reason = state.get("hardFlattenReason")
+            self._hard_flatten_session = session
             self._hard_flatten_pending = bool(state.get("hardFlattenPending"))
             self._operator_close_keys = set(state.get("pendingClosePositionKeys", []))
             self._control_state_loaded = True
@@ -4243,6 +4262,9 @@ class TradingEngine:
             changed = self._hard_flatten_reason != reason
             self._hard_flatten_reason = reason
             if changed:
+                self._hard_flatten_session = (
+                    self._session_clock().snapshot(now_utc()).session_id
+                )
                 self._entry_control_version += 1
                 self._hard_flatten_pending = True
             # Hard controls still pause live admission immediately. A run that
@@ -4299,25 +4321,57 @@ class TradingEngine:
         # normal-exit control until the later shadow-policy phase.
         self.monitor_positions()
 
-        reconciliation_verified = (
-            not self._reconciliation_pending
-            and not self._lifecycle_recovery_pending
-            and getattr(risk_manager, "reconciliation_status", "RECONCILED")
-            == "RECONCILED"
-        )
-        rotate_session = getattr(risk_manager, "rotate_session_if_verified", None)
-        rotated = bool(
-            callable(rotate_session)
-            and rotate_session(
-                session,
-                reconciliation_verified=reconciliation_verified,
-                has_residual_obligations=self._has_residual_obligations(),
+        with self._trade_lock:
+            if scope != self._current_broker_scope() or self._control_state_invalid:
+                return
+            session = self._session_clock().snapshot(now_utc())
+            reconciliation_verified = (
+                not self._reconciliation_pending
+                and not self._lifecycle_recovery_pending
+                and getattr(risk_manager, "reconciliation_status", "RECONCILED")
+                == "RECONCILED"
             )
-        )
-        if rotated:
-            self._hard_flatten_reason = None
-            self._save_control_state()
+            residual = self._has_residual_obligations() or bool(
+                self._pending_lifecycle_obligations()
+            )
+            rotate_session = getattr(risk_manager, "rotate_session_if_verified", None)
+            rotated = bool(
+                callable(rotate_session)
+                and rotate_session(
+                    session,
+                    reconciliation_verified=reconciliation_verified,
+                    has_residual_obligations=residual,
+                )
+            )
+            # Operator controls and daily accounting are persisted separately.
+            # A previous square-off can outlive an already-rotated risk session.
+            # Clear only a dated, settled prior-session halt after broker proof;
+            # never erase an emergency action arriving during reconciliation.
+            old_halt = (
+                self._hard_flatten_session is not None
+                and self._hard_flatten_session < session.session_id
+            )
+            clear_square_off = (
+                self._hard_flatten_reason == HardRiskReason.SESSION_FORCED_FLAT.value
+                and session.entries_allowed
+                and reconciliation_verified
+                and not residual
+                and not getattr(risk_manager, "kill_switch_active", False)
+            )
+            cleared = old_halt and (rotated or clear_square_off)
+            if cleared:
+                previous = (self._hard_flatten_reason, self._hard_flatten_session)
+                self._hard_flatten_reason = None
+                self._hard_flatten_session = None
+                try:
+                    self._save_control_state()
+                except Exception:
+                    self._hard_flatten_reason, self._hard_flatten_session = previous
+                    self._control_state_invalid = True
+                    raise
+        if rotated or cleared:
             self._push_log(f"Verified exchange session reset: {session.session_id}")
+            self._push_state_update()
 
     def _supervisor_loop(self) -> None:
         while self._supervision_active and not self._supervisor_stop.is_set():
@@ -9857,15 +9911,23 @@ class TradingEngine:
                     )
             break
 
-    def _reconcile_execution(self, symbol: str, trade_record: dict) -> tuple:
+    def _reconcile_execution(
+        self, symbol: str, trade_record: dict, *, fills_snapshot=None
+    ) -> tuple:
         """Find actual exit fills; unknown prices remain nullable and pending."""
 
         try:
-            fills = self._accounting_fills(symbol, trade_record)
-        except Exception as e:
-            self._push_log(
-                f"Failed to fetch trades for reconciliation: {e}", level="warning"
+            fills = self._accounting_fills(
+                symbol, trade_record, fills_snapshot=fills_snapshot
             )
+        except Exception as e:
+            if (
+                fills_snapshot is None
+                or fills_snapshot.quality is SnapshotQuality.COMPLETE
+            ):
+                self._push_log(
+                    f"Failed to fetch trades for reconciliation: {e}", level="warning"
+                )
             return None, "UNRECONCILED", None, None
 
         stop_order_id = str(trade_record.get("stop_order_id", ""))
@@ -10243,6 +10305,19 @@ class TradingEngine:
         except Exception:
             return
 
+        if not journal_trades:
+            return
+        # One current fill read per journal pass, including a pending result.
+        # Fetching again for every historical row floods the broker and lets
+        # journal repair consume reads needed by current-session risk recovery.
+        fills_snapshot = self._fill_snapshot()
+        try:
+            fills_snapshot.require_complete()
+        except Exception as exc:
+            self._push_log(
+                f"Journal reconciliation is waiting for fill history: {exc}",
+                level="warning",
+            )
         for t in journal_trades:
             if t["status"] == "OPEN" and not any(
                 self._trade_matches_position(t, p) for p in open_positions
@@ -10252,7 +10327,7 @@ class TradingEngine:
                     f"Reconcile job: Found ghost OPEN trade for {t['tradingsymbol']}. Attempting to reconcile."
                 )
                 exit_price, reason, exit_time, cost_details = self._reconcile_execution(
-                    t["tradingsymbol"], dict(t)
+                    t["tradingsymbol"], dict(t), fills_snapshot=fills_snapshot
                 )
                 if reason != "UNRECONCILED":
                     journal.close_trade(
@@ -10278,7 +10353,7 @@ class TradingEngine:
             ):
                 # Try to find fills now
                 exit_price, reason, exit_time, cost_details = self._reconcile_execution(
-                    t["tradingsymbol"], dict(t)
+                    t["tradingsymbol"], dict(t), fills_snapshot=fills_snapshot
                 )
                 if reason != "UNRECONCILED":
                     journal.update_trade_exit(

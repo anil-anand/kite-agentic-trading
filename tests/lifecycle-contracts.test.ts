@@ -187,6 +187,98 @@ test('backend readiness requires trusted rehydration and one handshake per child
   bridge.stop();
 });
 
+test('an expired or missing session opens login without resuming unauthenticated supervision', async () => {
+  const { bridge, children } = await bridgeFixture();
+  bridge.start();
+  const child = children[0];
+  child.send({ event: 'backend:ready', data: { generation: 'login-required' } });
+  await child.reply();
+  await child.reply({ is_valid: false });
+  assert.equal(child.requests.at(-1).method, 'agent_status');
+  await child.reply({ running: false, supervisionActive: false, reconciliationPending: true });
+  assert.equal(bridge.isRunning(), true, 'the login transport must remain available');
+  assert.equal(bridge.getStatus().ready, true);
+  assert.equal(bridge.getStatus().sessionValid, false);
+  assert.equal(bridge.getStatus().tradingReady, false);
+  assert.equal(bridge.getStatus().supervision.reconciliationPending, true);
+  assert.equal(bridge.getStatus().error, null);
+  assert.ok(!child.requests.some((request: any) => request.method === 'resume_supervision'));
+  const login = bridge.call('generate_session');
+  await child.reply({ user_id: 'TEST_ACCOUNT' });
+  assert.equal((await login).user_id, 'TEST_ACCOUNT');
+  bridge.stop();
+});
+
+test('an invalid session-check response remains a startup error', async () => {
+  const { bridge, children } = await bridgeFixture();
+  bridge.start();
+  const child = children[0];
+  child.send({ event: 'backend:ready', data: { generation: 'invalid-response' } });
+  await child.reply();
+  await child.reply({});
+  assert.equal(bridge.getStatus().ready, false);
+  assert.match(bridge.getStatus().error, /session status/i);
+  assert.equal(child.requests.length, 2);
+  bridge.stop();
+});
+
+test('startup retry reruns a failed handshake on the same child and coalesces pending retries', async () => {
+  const { bridge, children } = await bridgeFixture();
+  bridge.start();
+  const child = children[0];
+  bridge.retryStartup();
+  assert.equal(child.requests.length, 0, 'wait for the process readiness event');
+  child.send({ event: 'backend:ready', data: { generation: 'retry' } });
+  bridge.retryStartup();
+  assert.equal(child.requests.length, 1, 'do not duplicate an in-flight handshake');
+  child.send({ id: child.requests.at(-1).id, error: { message: 'temporary startup failure' } });
+  await flush();
+  assert.equal(bridge.getStatus().ready, false);
+  assert.match(bridge.getStatus().error, /temporary startup failure/);
+  bridge.retryStartup();
+  bridge.retryStartup();
+  assert.equal(children.length, 1, 'preserve the existing supervisor process');
+  assert.equal(child.killed, undefined);
+  assert.equal(child.requests.length, 2);
+  assert.equal(child.requests.at(-1).method, 'set_credentials');
+  assert.equal(bridge.getStatus().error, null);
+  await child.reply();
+  await child.reply({ is_valid: true });
+  await child.reply({ running: false, supervisionActive: true });
+  assert.equal(bridge.getStatus().ready, true);
+  const requestCount = child.requests.length;
+  bridge.retryStartup();
+  assert.equal(child.requests.length, requestCount, 'retry cannot pause a ready trading engine');
+  bridge.stop();
+  bridge.retryStartup();
+  assert.equal(child.requests.length, requestCount, 'retry cannot undo shutdown');
+});
+
+test('startup retry can start a backend after automatic restarts are exhausted', async () => {
+  const { bridge, children, timers } = await bridgeFixture();
+  bridge.start();
+  for (let attempt = 0; attempt < 4; attempt++) {
+    children.at(-1).emit('exit', 1, null);
+    if (attempt < 3) {
+      const restart = [...timers.values()][0];
+      timers.clear();
+      restart();
+    }
+  }
+  assert.equal(children.length, 4);
+  assert.equal(timers.size, 0);
+  bridge.retryStartup();
+  assert.equal(children.length, 5);
+  assert.equal(bridge.getStatus().error, null);
+  const child = children.at(-1);
+  child.send({ event: 'backend:ready', data: { generation: 'manual-retry' } });
+  await child.reply();
+  await child.reply({ is_valid: false });
+  await child.reply({ running: false, supervisionActive: false });
+  assert.equal(bridge.getStatus().ready, true);
+  bridge.stop();
+});
+
 test('dead child cannot alter replacement readiness; shutdown cancels queued restarts', async () => {
   const { bridge, children, statuses, timers } = await bridgeFixture();
   bridge.start();
@@ -195,8 +287,9 @@ test('dead child cannot alter replacement readiness; shutdown cancels queued res
   old.emit('exit', 1, null);
   bridge.start();
   const replacement = children[1];
+  const replacementStatusCount = statuses.length;
   await flush();
-  assert.ok(!statuses.some(status => status.generation === 'old'), 'old rejected bootstrap is fenced');
+  assert.equal(statuses.length, replacementStatusCount, 'old rejected bootstrap cannot publish over its replacement');
   replacement.send({ event: 'backend:ready', data: { generation: 'new' } });
   await replacement.reply();
   await replacement.reply({ is_valid: true });

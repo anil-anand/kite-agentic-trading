@@ -181,3 +181,44 @@ test('App mounts neither login nor account routes until startup is resolved', as
   assert.match(render(), /Dashboard/);
   assert.doesNotMatch(render(), /LoginModal|StartupScreen/);
 });
+
+for (const fails of [false, true]) {
+  test(`Retry requests backend recovery before reloading and handles ${fails ? 'failure' : 'success'}`, async () => {
+    const recovery = deferred();
+    const calls: string[] = [];
+    let retrying = false;
+    const state: any = {
+      startup: { status: 'error', error: 'Startup failed' },
+      setStartup: (startup: unknown) => { state.startup = startup; },
+    };
+    const element = (type: any, props: any) => ({ type, props });
+    const module = await loadModule('src/renderer/components/StartupScreen.tsx', {
+      react: { useState: () => [retrying, (value: boolean) => { retrying = value; }] },
+      'react/jsx-runtime': { jsx: element, jsxs: element },
+      'lucide-react': { Loader2: 'spinner' },
+      '../stores/trading-store': { useTradingStore: (selector: (state: any) => any) => selector(state) },
+    }, {
+      window: {
+        electronAPI: { invoke: async (channel: string) => {
+          calls.push(channel);
+          await recovery.promise;
+          if (fails) throw new Error('IPC unavailable');
+        } },
+        location: { reload: () => calls.push('reload') },
+      },
+    });
+    const button = () => module.default().props.children.props.children.find((child: any) => child?.type === 'button');
+    const pending = button().props.onClick();
+    assert.deepEqual(calls, [IPC.APP_RETRY_STARTUP]);
+    assert.equal(button().props.disabled, true);
+    recovery.resolve(undefined);
+    await pending;
+    if (fails) {
+      assert.deepEqual(calls, [IPC.APP_RETRY_STARTUP]);
+      assert.match(state.startup.error, /Please restart/);
+      assert.equal(button().props.disabled, false);
+    } else {
+      assert.deepEqual(calls, [IPC.APP_RETRY_STARTUP, 'reload']);
+    }
+  });
+}

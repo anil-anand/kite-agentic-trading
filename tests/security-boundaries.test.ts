@@ -215,7 +215,10 @@ test('every registered IPC handler validates its sender before reaching privileg
   const window: any = { isDestroyed: () => false, webContents: contents };
   const module = await bundled('src/main/ipc-handlers.ts', {
     electron: { ipcMain: { handle: (name: string, listener: (...args: any[]) => any) => handlers.set(name, listener) } },
-    './python-bridge': { pythonBridge: { call: async (method: string, params: any) => { calls.push({ method, params }); return {}; } } },
+    './python-bridge': { pythonBridge: {
+      call: async (method: string, params: any) => { calls.push({ method, params }); return {}; },
+      retryStartup: () => { calls.push({ method: 'retryStartup' }); return { ready: false }; },
+    } },
     './auth-manager': { authManager: {} },
     './secure-storage': { secureStorage: {} },
   });
@@ -227,6 +230,9 @@ test('every registered IPC handler validates its sender before reaching privileg
   assert.equal(calls.length, 0);
   await handlers.get(IPC.ORDERS_GET_ALL)!({ sender: contents, senderFrame: mainFrame });
   assert.equal(calls[0].method, 'get_orders');
+  const retry = await handlers.get(IPC.APP_RETRY_STARTUP)!({ sender: contents, senderFrame: mainFrame });
+  assert.equal(calls[1].method, 'retryStartup');
+  assert.equal(retry.ready, false);
 });
 
 test('settings validation sees masked public fields, preserves blanks and never accepts a renderer token', async () => {
