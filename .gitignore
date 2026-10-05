@@ -37,6 +37,7 @@ logs/
 
 # Local Data
 .data/
+.research_runs/
 
 # PyInstaller
 build/

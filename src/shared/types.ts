@@ -3,6 +3,7 @@
 export interface KiteCredentials {
   apiKey: string;
   apiSecret: string;
+  redirectUrl?: string;
   accessToken?: string;
   userId?: string;
   userName?: string;
@@ -23,9 +24,19 @@ export interface LLMSettings {
 
 export interface AuthState {
   isLoggedIn: boolean;
-  credentials: KiteCredentials | null;
+  credentials: { userId?: string; userName?: string } | null;
   loginUrl: string | null;
   error: string | null;
+}
+
+export interface BackendStatus {
+  running: boolean;
+  ready: boolean;
+  error: string | null;
+  generation?: string;
+  tradingReady?: boolean;
+  sessionValid?: boolean;
+  supervision?: Partial<AgentState>;
 }
 
 // ─── Market Data ──────────────────────────────────────────────────
@@ -93,7 +104,11 @@ export type OrderStatus =
   | 'MODIFY PENDING'
   | 'CANCEL PENDING'
   | 'PUT ORDER REQ RECEIVED'
-  | 'VALIDATION PENDING';
+  | 'VALIDATION PENDING'
+  | 'OPEN PENDING'
+  | 'MODIFY VALIDATION PENDING'
+  | 'AMO REQ RECEIVED'
+  | (string & {});
 
 export interface OrderRequest {
   tradingsymbol: string;
@@ -118,53 +133,68 @@ export interface Order {
   quantity: number;
   filledQuantity: number;
   pendingQuantity: number;
-  price: number;
-  averagePrice: number;
-  triggerPrice: number;
+  price: number | null;
+  averagePrice: number | null;
+  triggerPrice: number | null;
   product: ProductType;
   orderType: OrderType;
   variety: string;
   status: OrderStatus;
-  statusMessage: string;
-  tag: string;
-  orderTimestamp: string;
-  exchangeTimestamp: string;
+  statusMessage: string | null;
+  isWorking?: boolean;
+  tag: string | null;
+  isArchived?: boolean;
+  snapshotQuality?: 'COMPLETE' | 'PARTIAL' | 'STALE' | 'UNAVAILABLE';
+  orderTimestamp: string | null;
+  exchangeTimestamp: string | null;
+}
+
+export interface OrderSnapshot {
+  orders: Order[];
+  snapshotQuality: 'COMPLETE' | 'PARTIAL' | 'STALE' | 'UNAVAILABLE';
+  snapshotId: string;
+  fetchedAt: string;
+  errors?: string[];
 }
 
 // ─── Positions & Holdings ─────────────────────────────────────────
 
 export interface Position {
+  positionKey?: string;
+  namespace?: string;
+  accountId?: string;
   tradingsymbol: string;
   exchange: string;
-  instrumentToken: number;
+  instrumentToken: number | string;
   product: ProductType;
   quantity: number;
   overnightQuantity: number;
-  averagePrice: number;
-  lastPrice: number;
-  closePrice: number;
-  pnl: number;
-  unrealised: number;
-  realised: number;
+  averagePrice: number | null;
+  lastPrice: number | null;
+  closePrice: number | null;
+  pnl: number | null;
+  unrealised: number | null;
+  realised: number | null;
   buyQuantity: number;
   sellQuantity: number;
-  buyPrice: number;
-  sellPrice: number;
-  multiplier: number;
-  value: number;
+  buyPrice: number | null;
+  sellPrice: number | null;
+  multiplier: number | null;
+  value: number | null;
   dayBuyQuantity: number;
   daySellQuantity: number;
+  markTime?: string | null;
 }
 
 export interface Holding {
   tradingsymbol: string;
   exchange: string;
-  instrumentToken: number;
+  instrumentToken: number | string;
   quantity: number;
-  averagePrice: number;
-  lastPrice: number;
-  pnl: number;
-  closePrice: number;
+  averagePrice: number | null;
+  lastPrice: number | null;
+  pnl: number | null;
+  closePrice: number | null;
 }
 
 // ─── Margins ──────────────────────────────────────────────────────
@@ -242,7 +272,42 @@ export interface Signal {
   riskReward: number;
   reasoning: string;
   timestamp: string;
+  analysisOnly?: boolean;
+  analysisAsOf?: string;
   indicators: Record<string, number>;
+}
+
+export interface ScanProgress {
+  phase: 'preparing' | 'screening' | 'loading_instruments' | 'scanning' | 'completed' | 'error';
+  analysisOnly: boolean;
+  startedAt: string;
+  completedAt: string | null;
+  nextScanAt: string | null;
+  universeSize: number | null;
+  totalSymbols: number;
+  completedSymbols: number;
+  evaluatedSymbols: number;
+  skippedSymbols: number;
+  failedSymbols: number;
+  signalsFound: number;
+  signalsPublished: number;
+  enabledStrategies: string[];
+  queuedSymbols: string[];
+  workers: {
+    id: number;
+    symbol: string | null;
+    stage: 'idle' | 'waiting_for_symbol' | 'fetching_candles' | 'building_context' | 'evaluating_strategies';
+    startedAt: string | null;
+    updatedAt: string | null;
+  }[];
+  results: {
+    symbol: string;
+    outcome: 'signals' | 'no_match' | 'unchanged' | 'unavailable' | 'unknown_symbol' | 'error';
+    detail: string;
+    signals: number;
+    candleTime: string | null;
+  }[];
+  message: string | null;
 }
 
 export interface AgentState {
@@ -254,8 +319,23 @@ export interface AgentState {
   currentPnl: number;
   maxDrawdownToday: number;
   lastScanTime: string | null;
-  status: 'idle' | 'scanning' | 'placing_order' | 'monitoring' | 'stopped' | 'error';
+  status: 'idle' | 'scanning' | 'placing_order' | 'monitoring' | 'supervising' | 'stopped' | 'error';
   statusMessage: string;
+  effectiveMode?: AgentMode | 'paused' | 'scan_only';
+  scanOnly?: boolean;
+  scanProgress?: ScanProgress | null;
+  marketSession?: { isOpen: boolean; isTradingDay: boolean; isWeekend: boolean };
+  entryBlockReasons?: string[];
+  entryPaused?: boolean;
+  supervisionActive?: boolean;
+  protectionFailureHalt?: boolean;
+  reconciliationPending?: boolean;
+  lifecycleRecoveryPending?: boolean;
+  controlStateInvalid?: boolean;
+  supervisionGeneration?: number;
+  hardFlattenReason?: string | null;
+  hardFlattenPending?: boolean;
+  pendingClosePositionKeys?: string[];
 }
 
 // ─── Risk Management ──────────────────────────────────────────────
@@ -381,18 +461,20 @@ export interface RPCEvent {
 // ─── Dashboard Summary ────────────────────────────────────────────
 
 export interface DashboardSummary {
-  totalPnl: number;
-  netPnl: number;
-  realisedPnl: number;
-  unrealisedPnl: number;
+  totalPnl: number | null;
+  netPnl: number | null;
+  realisedPnl: number | null;
+  unrealisedPnl: number | null;
   tradesToday: number;
   winningTrades: number;
   losingTrades: number;
   winRate: number;
   maxDrawdown: number;
   openPositionsCount: number;
-  availableMargin: number;
-  usedMargin: number;
+  availableMargin: number | null;
+  usedMargin: number | null;
+  reconciliationStatus?: string;
+  killSwitchActive?: boolean;
 }
 
 // ─── Journal & Analytics ──────────────────────────────────────────
@@ -426,7 +508,12 @@ export interface JournalTrade {
   other_fees: number | null;
   slippage: number | null;
   signal_entry_price: number | null;
-  status: 'OPEN' | 'CLOSED';
+  status: 'OPEN' | 'CLOSED' | 'RECONCILIATION_PENDING';
+  financial_quality?: 'RECONCILED' | 'ESTIMATED' | 'UNAVAILABLE' | null;
+  financial_provenance?: string | null;
+  accounting_policy_version?: string | null;
+  cost_model_version?: string | null;
+  rounding_version?: string | null;
   confluence_snapshot: string | null;
   indicator_snapshot: string | null;
   market_regime?: string | null;
@@ -499,6 +586,102 @@ export interface WhatIfAnalysis {
   wider_stop_hit: boolean;
   wider_stop_pnl: number;
   actual_pnl: number;
+}
+
+export interface ExitQualityMetrics {
+  risk_per_share_price: number | null;
+  initial_risk_currency: number | null;
+  mfe_price: number | null;
+  mae_price: number | null;
+  mfe_r: number | null;
+  mae_r: number | null;
+  captured_gross: number | null;
+  captured_net: number | null;
+  captured_gross_r: number | null;
+  captured_net_r: number | null;
+  mfe_capture_pct: number | null;
+  r_given_back: number | null;
+  exposure_peak_r: number | null;
+  exposure_aware_r_given_back: number | null;
+  holding_time_seconds: number | null;
+  decision_to_intent_seconds: number | null;
+  intent_to_fill_seconds: number | null;
+}
+
+export interface ExitQualityRecord {
+  trade_id: string;
+  eligible: boolean;
+  exclusion_reason: string | null;
+  quality: string;
+  reason_code: string | null;
+  execution_outcome_code: string | null;
+  replay_status: string;
+  retained_input_available: boolean;
+  metrics: ExitQualityMetrics;
+  coverage: {
+    available: Record<string, boolean>;
+    available_count: number;
+    total_count: number;
+    extrema_quality: string;
+  };
+  hold_n?: {
+    status: string;
+    censor_reason?: string;
+    message?: string;
+  };
+}
+
+export interface ExitDecisionReplay {
+  trade_id?: string;
+  available: boolean;
+  reason?: string;
+  thesis?: { payload?: Record<string, unknown> | null; payload_corrupt?: boolean } | null;
+  position?: { position_key?: string; state?: Record<string, unknown>; state_corrupt?: boolean };
+  decisions: Array<{ decision_id: string; payload: Record<string, unknown> | null; payload_corrupt?: boolean }>;
+  intents?: Array<Record<string, unknown>>;
+  checkpoints?: Array<Record<string, unknown>>;
+  attempts?: Array<Record<string, unknown>>;
+  fills?: Array<Record<string, unknown>>;
+  execution_events?: Array<Record<string, unknown>>;
+  exact_replay_complete?: boolean;
+  verification?: Array<{ decision_id: string; status: string; action?: string; reason_code?: string; message?: string }>;
+  replayability?: { reproduced: number; total: number; uses_current_market_data: boolean };
+}
+
+export interface ActivePositionExplanation {
+  position_key: string;
+  broker_position_key?: string;
+  namespace?: string | null;
+  account_id?: string | null;
+  exchange?: string | null;
+  product?: string | null;
+  instrument_id?: string | number | null;
+  symbol: string | null;
+  state_corrupt: boolean;
+  policy_mode?: string | null;
+  thesis: { strategy?: string | null; playbook?: string | null; setup_variant?: string | null; reasoning?: string | null; expected_behavior?: string | null; original_boundary?: number | null; initial_stop?: number | null; entry_price?: number | null };
+  health: string | null;
+  development: string | null;
+  exposure: string | null;
+  protection: { quality?: string | null; confirmed_stop?: number | null; requested_stop?: number | null; protected_quantity?: number | null; confirmed_stop_order_id?: string | null };
+  residual_quantity?: number | null;
+  pending_intent?: { intent_id?: string; intent_type?: string; status?: string; quantity?: number; reason?: string } | null;
+  context?: Record<string, unknown> | null;
+  quality?: Record<string, unknown> | null;
+  management: { u_r?: number | null; mfe_r?: number | null; mae_r?: number | null; giveback_r?: number | null; session_remaining_minutes?: number | null; last_bar_end?: string | null };
+  latest_decision: Record<string, unknown> | null;
+}
+
+export interface ExitQualityReport {
+  records_total: number;
+  records_eligible: number;
+  records_excluded: number;
+  records: ExitQualityRecord[];
+  averages: Record<string, number | null>;
+  coverage: Record<string, { available: number; eligible: number }>;
+  reason_distribution: Array<{ initiating_reason_code: string; execution_outcome_code: string; count: number }>;
+  cohorts: Array<{ dimension: string; value: string; count: number; average_net_r: number | null }>;
+  research_label: string;
 }
 
 export interface LLMPostMortem {

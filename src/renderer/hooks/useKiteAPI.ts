@@ -1,14 +1,14 @@
 import { useEffect } from 'react';
 import { useTradingStore } from '../stores/trading-store';
 import * as IPC from '@shared/ipc-channels';
-import { OrderRequest, KiteCredentials, StrategyName } from '@shared/types';
+import { OrderRequest, KiteCredentials, StrategyName, OrderVariety, ExitQualityReport, ExitQualityRecord, ExitDecisionReplay, ActivePositionExplanation, BackendStatus } from '@shared/types';
 
 export interface ElectronAPI {
   isDevMode?: boolean;
-  invoke(channel: string, ...args: any[]): Promise<any>;
-  on(channel: string, listener: (...args: any[]) => void): void;
-  removeListener(channel: string, listener: (...args: any[]) => void): void;
-  removeAllListeners(channel: string): void;
+  invoke(channel: IPC.InvokeChannel, ...args: any[]): Promise<any>;
+  on(channel: IPC.EventChannel, listener: (...args: any[]) => void): () => void;
+  removeListener(channel: IPC.EventChannel, listener: (...args: any[]) => void): void;
+  removeAllListeners(channel: IPC.EventChannel): void;
   dashboard: {
     summary(): Promise<any>;
   };
@@ -23,6 +23,14 @@ export interface ElectronAPI {
     cancel(orderId: string, variety: string): Promise<any>;
     getAll(): Promise<any>;
     getTrades(): Promise<any>;
+  };
+  agent: {
+    start(params: { mode: string }): Promise<any>;
+    stop(): Promise<any>;
+    status(): Promise<any>;
+    setMode(mode: string): Promise<any>;
+    closePosition(positionKey: string): Promise<any>;
+    emergencyFlatten(): Promise<any>;
   };
   journal: {
     getTrades(): Promise<any>;
@@ -40,6 +48,10 @@ export interface ElectronAPI {
     getConfluenceValidation(): Promise<any>;
     getSignalScoreCalibration(): Promise<any>;
     getExitReasonEffectiveness(): Promise<any>;
+    getExitQualityReport(): Promise<ExitQualityReport>;
+    getExitQualityForTrade(tradeId: string): Promise<ExitQualityRecord & { error?: string }>;
+    getExitManagementReplay(tradeId: string): Promise<ExitDecisionReplay & { error?: string }>;
+    getActivePositionExplanations(): Promise<ActivePositionExplanation[]>;
     getTradeReplay(tradeId: string): Promise<any>;
     getWhatIfAnalysis(tradeId: string): Promise<any>;
     getLlmPostMortem(tradeId: string): Promise<any>;
@@ -52,49 +64,61 @@ declare global {
   }
 }
 
-export const useKiteAPI = () => {
+export const useKiteAPI = ({ subscribe = false }: { subscribe?: boolean } = {}) => {
   const store = useTradingStore();
 
   useEffect(() => {
-    if (!window.electronAPI) return;
+    if (!subscribe) return;
+    const api = window.electronAPI;
+    if (!api) {
+      store.setStartup({ status: 'error', error: 'Unable to connect to the app. Please restart Kite Agent.' });
+      return;
+    }
+    let active = true;
+    let initialization = 0;
+    let stateRevision = 0;
+    let backendRevision = 0;
+    let initialized = store.startup.status === 'ready';
+    const startupTimeout = setTimeout(() => {
+      if (active && !initialized) {
+        store.setStartup({ status: 'error', error: 'Startup is taking longer than expected. Retry or restart the app.' });
+      }
+    }, 30000);
 
-    window.electronAPI.on(IPC.TICKER_TICK, (event: any, data: any) => {
+    const tickListener = (_event: any, data: any) => {
       if (data && data.tradingsymbol) {
         store.updateTick(data.tradingsymbol, data);
       }
-    });
-    window.electronAPI.on(IPC.AGENT_SIGNAL, (event: any, data: any) => {
+    };
+    const signalListener = (_event: any, data: any) => {
       store.addSignal(data);
-    });
-    window.electronAPI.on(IPC.LOG_ENTRY, (event: any, data: any) => {
+    };
+    const logListener = (_event: any, data: any) => {
       store.addLogEntry(data);
-    });
-    window.electronAPI.on(IPC.AGENT_STATE_UPDATE, (event: any, data: any) => {
-      store.setAgentState(data);
-    });
+    };
+    const stateListener = (_event: any, data: any) => {
+      stateRevision++;
+      store.setAgentState({ ...data, statusMessage: data?.statusMessage ?? '' });
+    };
 
     const init = async () => {
+      const request = ++initialization;
+      const isCurrent = () => active && request === initialization;
+      if (!initialized) store.setStartup({ status: 'restoring-session', error: null });
       try {
-        const authStat = await window.electronAPI?.invoke(IPC.AUTH_STATUS);
-        if (authStat !== undefined) {
-          store.setAuth({ isLoggedIn: authStat === true });
-          store.setConnectionStatus(authStat === true ? 'connected' : 'disconnected');
-        }
-        const agentStat = await window.electronAPI?.invoke(IPC.AGENT_STATUS);
-        if (agentStat) {
-          store.setAgentState({ running: agentStat.running, mode: agentStat.mode || 'auto' });
-        }
-
-        if (authStat !== true && agentStat?.running) {
-          try {
-            await window.electronAPI?.invoke(IPC.AGENT_STOP);
-            store.setAgentState({ running: false });
-          } catch (_) {
-            // Best-effort — ignore failure to stop
-          }
+        const authStat = await api.invoke(IPC.AUTH_STATUS);
+        if (!isCurrent()) return;
+        if (typeof authStat !== 'boolean') throw new Error('Session status is unavailable. Please retry.');
+        const revision = stateRevision;
+        const [agentStat, settings] = await Promise.all([
+          api.invoke(IPC.AGENT_STATUS),
+          api.invoke(IPC.SETTINGS_GET),
+        ]);
+        if (!isCurrent()) return;
+        if (agentStat && revision === stateRevision) {
+          store.setAgentState({ ...agentStat, statusMessage: agentStat.statusMessage ?? '' });
         }
 
-        const settings = await window.electronAPI?.invoke(IPC.SETTINGS_GET);
         if (settings) {
           if (settings.strategies) {
             const enabledStrats = Object.keys(settings.strategies).filter(
@@ -102,23 +126,72 @@ export const useKiteAPI = () => {
             ) as StrategyName[];
             store.setAgentState({ enabledStrategies: enabledStrats });
           }
-          if (settings.mode) {
-            store.setAgentState({ mode: settings.mode });
-          } else {
-            store.setAgentState({ mode: 'auto' });
-          }
           store.setSettings(settings);
+        }
+        store.setAuth({ isLoggedIn: authStat });
+        store.setConnectionStatus(authStat ? 'connected' : 'disconnected');
+        initialized = true;
+        clearTimeout(startupTimeout);
+        store.setStartup({ status: 'ready', error: null });
 
-          if (Array.isArray(settings.watchlist) && settings.watchlist.length > 0) {
-            await loadWatchlist(settings.watchlist);
-          }
+        if (authStat && Array.isArray(settings?.watchlist) && settings.watchlist.length > 0) {
+          void loadWatchlist(settings.watchlist, isCurrent);
         }
       } catch (e) {
+        if (!isCurrent()) return;
+        if (!initialized) {
+          clearTimeout(startupTimeout);
+          store.setStartup({ status: 'error', error: 'Unable to restore your session. Please retry.' });
+        }
         console.error("Init Error", e);
       }
     };
 
-    const loadWatchlist = async (symbols: string[]) => {
+    const applyBackendStatus = (data: BackendStatus) => {
+      if (data?.ready) {
+        store.setConnectionStatus('connected');
+        if (data.supervision) {
+          store.setAgentState({ ...data.supervision, statusMessage: data.supervision.statusMessage ?? '' });
+        }
+        void init();
+      } else {
+        initialization++;
+        stateRevision++;
+        store.setConnectionStatus(data?.error ? 'disconnected' : 'connecting');
+        if (!initialized) {
+          store.setStartup({
+            status: data?.error ? 'error' : 'connecting',
+            error: data?.error ? 'Unable to connect to Kite Agent. Retry or restart the app.' : null,
+          });
+        }
+        store.setAgentState({
+          running: false,
+          supervisionActive: false,
+          entryPaused: true,
+          effectiveMode: 'paused',
+          scanOnly: false,
+          entryBlockReasons: ['Backend connection is recovering'],
+          reconciliationPending: true,
+          status: data?.error ? 'error' : 'stopped',
+          statusMessage: data?.error || 'Backend recovering; supervision is not yet verified.',
+        });
+      }
+    };
+
+    const backendStatusListener = (_event: any, data: BackendStatus) => {
+      backendRevision++;
+      applyBackendStatus(data);
+    };
+
+    const unsubscribe = [
+      api.on(IPC.TICKER_TICK, tickListener),
+      api.on(IPC.AGENT_SIGNAL, signalListener),
+      api.on(IPC.LOG_ENTRY, logListener),
+      api.on(IPC.AGENT_STATE_UPDATE, stateListener),
+      api.on(IPC.APP_PYTHON_STATUS, backendStatusListener),
+    ];
+
+    const loadWatchlist = async (symbols: string[], isCurrent: () => boolean) => {
       try {
         const instruments = await window.electronAPI?.invoke(IPC.MARKET_INSTRUMENTS, 'NSE') || [];
         const tokenBySymbol: Record<string, number> = {};
@@ -127,6 +200,7 @@ export const useKiteAPI = () => {
         }
         const keys = symbols.map(s => `NSE:${s}`);
         const ltpMap = await window.electronAPI?.invoke(IPC.MARKET_LTP, keys) || {};
+        if (!isCurrent()) return;
 
         const items = symbols
           .map(s => ({ symbol: s, token: tokenBySymbol[s] }))
@@ -152,19 +226,32 @@ export const useKiteAPI = () => {
       }
     };
 
-    init();
+    // Subscribe first, then read readiness so a fast backend or renderer reload
+    // cannot miss the ready event. A newer push always wins over this snapshot.
+    const revision = backendRevision;
+    void api.invoke(IPC.APP_GET_PYTHON_STATUS).then((status: BackendStatus) => {
+      if (active && revision === backendRevision) {
+        // The cached handshake's supervision may predate live state updates.
+        applyBackendStatus({ running: status.running, ready: status.ready, error: status.error });
+      }
+    }).catch(() => {
+      if (active && revision === backendRevision) {
+        clearTimeout(startupTimeout);
+        store.setStartup({ status: 'error', error: 'Unable to connect to the app. Please retry.' });
+      }
+    });
 
     return () => {
-      window.electronAPI?.removeAllListeners(IPC.TICKER_TICK);
-      window.electronAPI?.removeAllListeners(IPC.AGENT_SIGNAL);
-      window.electronAPI?.removeAllListeners(IPC.LOG_ENTRY);
-      window.electronAPI?.removeAllListeners(IPC.AGENT_STATE_UPDATE);
+      active = false;
+      clearTimeout(startupTimeout);
+      unsubscribe.forEach(remove => remove());
     };
-  }, []);
+  }, [subscribe]);
 
   const login = async (creds: KiteCredentials) => {
     try {
       const res = await window.electronAPI?.invoke(IPC.AUTH_LOGIN, creds);
+      if (res?.isLoggedIn) store.setConnectionStatus('connected');
       return res;
     } catch (e: any) {
       throw new Error(e.message);
@@ -173,7 +260,7 @@ export const useKiteAPI = () => {
 
   const logout = async () => {
     await window.electronAPI?.invoke(IPC.AUTH_LOGOUT);
-    store.setAuth({ isLoggedIn: false });
+    store.setAuth({ isLoggedIn: false, credentials: null });
     store.setConnectionStatus('disconnected');
   };
 
@@ -181,17 +268,45 @@ export const useKiteAPI = () => {
     return await window.electronAPI?.invoke(IPC.ORDERS_PLACE, order);
   };
 
-  const cancelOrder = async (orderId: string) => {
-    return await window.electronAPI?.invoke(IPC.ORDERS_CANCEL, orderId);
+  const cancelOrder = async (orderId: string, variety: OrderVariety | string = 'regular') => {
+    if (!window.electronAPI) throw new Error('Backend connection unavailable');
+    return await window.electronAPI.invoke(IPC.ORDERS_CANCEL, orderId, variety);
   };
 
   const startAgent = async (mode: string) => {
-    return await window.electronAPI?.invoke(IPC.AGENT_START, { mode });
+    if (!window.electronAPI) throw new Error('Backend connection unavailable');
+    return await window.electronAPI.agent.start({ mode });
   };
 
   const stopAgent = async () => {
-    return await window.electronAPI?.invoke(IPC.AGENT_STOP);
+    if (!window.electronAPI) throw new Error('Backend connection unavailable');
+    return await window.electronAPI.agent.stop();
   };
 
-  return { login, logout, placeOrder, cancelOrder, startAgent, stopAgent };
+  const setAgentMode = async (mode: string) => {
+    if (!window.electronAPI) throw new Error('Backend connection unavailable');
+    return await window.electronAPI.agent.setMode(mode);
+  };
+
+  const closePosition = async (positionKey: string) => {
+    if (!window.electronAPI) throw new Error('Backend connection unavailable');
+    return await window.electronAPI.agent.closePosition(positionKey);
+  };
+
+  const emergencyFlatten = async () => {
+    if (!window.electronAPI) throw new Error('Backend connection unavailable');
+    return await window.electronAPI.agent.emergencyFlatten();
+  };
+
+  return {
+    login,
+    logout,
+    placeOrder,
+    cancelOrder,
+    startAgent,
+    stopAgent,
+    setAgentMode,
+    closePosition,
+    emergencyFlatten,
+  };
 };

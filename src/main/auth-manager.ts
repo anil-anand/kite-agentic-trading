@@ -1,10 +1,12 @@
-import { BrowserWindow, shell } from 'electron';
+import { BrowserWindow } from 'electron';
+import { isKiteLoginNavigation, isLoginCallback, validateLoginCallback } from '../shared/navigation-policy';
 import { pythonBridge } from './python-bridge';
 import { AuthState } from '../shared/types';
 import { secureStorage } from './secure-storage';
 
 class AuthManager {
   private loginWindow: BrowserWindow | null = null;
+  private sessionCheck: Promise<boolean> | null = null;
 
   public async setupSecureStorage(): Promise<void> {
     if (!secureStorage.hasSecretsFile()) {
@@ -38,95 +40,85 @@ class AuthManager {
     }
   }
 
-  public async startLogin(apiKey: string, apiSecret: string): Promise<AuthState> {
-    if (!apiKey || !apiSecret) {
+  public async startLogin(apiKey: string, apiSecret: string, redirectUrl: string): Promise<AuthState> {
+    if (typeof apiKey !== 'string' || typeof apiSecret !== 'string' || !apiKey.trim() || !apiSecret.trim()) {
       throw new Error('API Key and API Secret are required');
     }
+    const callback = validateLoginCallback(redirectUrl);
+    if (this.loginWindow) throw new Error('A login is already in progress');
+    if (!secureStorage.isAvailable) throw new Error('Secure credential storage is unavailable');
 
-    // Save API Key and Secret initially in case session generation fails
-    secureStorage.updateCredentials({ apiKey, apiSecret });
-    
-    // Pass to backend so it has them for session generation
-    await pythonBridge.call('set_credentials', { credentials: secureStorage.loadCredentials() });
-
-    // Attempt to login
-    return new Promise((resolve, reject) => {
-      const loginUrl = `https://kite.zerodha.com/connect/login?v=3&api_key=${apiKey}`;
-
-      this.loginWindow = new BrowserWindow({
-        width: 800,
-        height: 700,
-        show: true,
-        webPreferences: {
-          nodeIntegration: false,
-          contextIsolation: true,
-        },
+    return new Promise((resolve) => {
+      let settled = false;
+      let exchanging = false;
+      const loginWindow = new BrowserWindow({
+        width: 800, height: 700, show: true,
+        webPreferences: { nodeIntegration: false, contextIsolation: true, sandbox: true, partition: 'kite-login' },
       });
-
-      this.loginWindow.loadURL(loginUrl);
-
-      // Handle navigation to capture redirect
-      this.loginWindow.webContents.on('will-redirect', async (event, url) => {
-        const parsedUrl = new URL(url);
-        const requestToken = parsedUrl.searchParams.get('request_token');
-
-        if (requestToken) {
-          event.preventDefault(); // Stop redirect
-          
-          try {
-            // Call Python backend to exchange request_token
-            const response = await pythonBridge.call('generate_session', {
-              api_key: apiKey,
-              api_secret: apiSecret,
-              request_token: requestToken,
-            });
-
-            secureStorage.updateCredentials({ accessToken: response.access_token });
-            // Sync with backend
-            await pythonBridge.call('set_credentials', { credentials: secureStorage.loadCredentials() });
-
-            this.loginWindow?.close();
-            this.loginWindow = null;
-            
-            resolve({
-              isLoggedIn: true,
-              credentials: {
-                apiKey,
-                apiSecret,
-                accessToken: response.access_token,
-                userId: response.user_id,
-                userName: response.user_name
-              },
-              loginUrl: null,
-              error: null
-            });
-            
-          } catch (error: any) {
-            this.loginWindow?.close();
-            this.loginWindow = null;
-            resolve({
-              isLoggedIn: false,
-              credentials: null,
-              loginUrl: null,
-              error: error.message || 'Failed to generate session'
-            });
-          }
-        }
-      });
-
-      this.loginWindow.on('closed', () => {
+      this.loginWindow = loginWindow;
+      const finish = (result: AuthState) => {
+        if (settled) return;
+        settled = true;
+        resolve(result);
         this.loginWindow = null;
-        resolve({
-          isLoggedIn: false,
-          credentials: null,
-          loginUrl: null,
-          error: 'Login window closed by user'
-        });
+        if (!loginWindow.isDestroyed()) loginWindow.close();
+      };
+      const failure = (message: string) => finish({ isLoggedIn: false, credentials: null, loginUrl: null, error: message });
+      const navigate = async (event: Electron.Event, url: string) => {
+        let parsed: URL;
+        try { parsed = new URL(url); } catch { event.preventDefault(); return; }
+        const tokens = parsed.searchParams.getAll('request_token');
+        if (tokens.length) {
+          event.preventDefault();
+          if (exchanging || settled) return;
+          if (!isLoginCallback(url, callback) || tokens.length !== 1 || !tokens[0]
+            || (parsed.searchParams.has('status') && parsed.searchParams.get('status') !== 'success')) {
+            failure('Login returned an unexpected redirect. Check your Kite app redirect URL.');
+            return;
+          }
+          exchanging = true;
+          try {
+            const response = await pythonBridge.call('generate_session', {
+              api_key: apiKey, api_secret: apiSecret, request_token: tokens[0],
+            });
+            if (typeof response.access_token !== 'string' || !response.access_token) throw new Error('Session unavailable');
+            // Authentication and account verification must succeed before a
+            // failed attempt can replace a trusted recovery credential pair.
+            secureStorage.updateCredentials({ apiKey, apiSecret, accessToken: response.access_token });
+            finish({
+              isLoggedIn: true,
+              credentials: { userId: typeof response.user_id === 'string' ? response.user_id : undefined, userName: typeof response.user_name === 'string' ? response.user_name : undefined },
+              loginUrl: null, error: null,
+            });
+          } catch {
+            failure('Failed to generate a Kite session.');
+          }
+          return;
+        }
+        if (!isKiteLoginNavigation(url)) event.preventDefault();
+      };
+      loginWindow.webContents.on('will-redirect', navigate);
+      loginWindow.webContents.on('will-navigate', navigate);
+      loginWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+      loginWindow.on('closed', () => {
+        if (!settled && !exchanging) failure('Login window closed by user');
       });
+      void loginWindow.loadURL(`https://kite.zerodha.com/connect/login?v=3&api_key=${encodeURIComponent(apiKey)}`)
+        .catch(() => failure('Unable to open Kite login.'));
     });
   }
 
   public async checkSession(): Promise<boolean> {
+    // The bridge owns trusted startup rehydration. Renderer mounts can happen
+    // before it finishes; the ready event will trigger a fresh status check.
+    if (!pythonBridge.isRunning()) return false;
+    if (!this.sessionCheck) {
+      this.sessionCheck = this.verifySession().finally(() => { this.sessionCheck = null; });
+    }
+    return this.sessionCheck;
+  }
+
+  private async verifySession(): Promise<boolean> {
     try {
       await this.setupSecureStorage();
       const response = await pythonBridge.call('check_session');
@@ -138,13 +130,10 @@ class AuthManager {
   }
 
   public async logout(): Promise<void> {
-    try {
-      secureStorage.updateCredentials({ accessToken: '' });
-      await pythonBridge.call('set_credentials', { credentials: secureStorage.loadCredentials() });
-      await pythonBridge.call('logout');
-    } catch (e) {
-      console.error('Error during logout:', e);
-    }
+    // The backend must prove there are no remaining management obligations
+    // before the only trusted recovery token is removed.
+    await pythonBridge.call('logout');
+    secureStorage.clearAccessToken();
   }
 }
 

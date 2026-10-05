@@ -1,7 +1,16 @@
-import { app, BrowserWindow, Menu } from 'electron';
+import { app, BrowserWindow, Menu, shell } from 'electron';
+import { pathToFileURL } from 'url';
+import { isDevMode } from './runtime-paths';
+import { sameDocumentLocation } from '../shared/navigation-policy';
 import * as path from 'path';
 import { setupIpcHandlers } from './ipc-handlers';
 import { pythonBridge } from './python-bridge';
+
+// Chromium sessions/localStorage are separate as well as broker persistence.
+if (isDevMode()) app.setPath('userData', path.join(app.getPath('userData'), 'dev'));
+const trustedRendererUrl = app.isPackaged
+  ? pathToFileURL(path.join(__dirname, '../../renderer/index.html')).href
+  : 'http://localhost:5173/';
 
 // Ensure single instance lock
 const isSingleInstance = app.requestSingleInstanceLock();
@@ -27,8 +36,20 @@ async function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       nodeIntegration: false,
       contextIsolation: true,
-      sandbox: false,
+      sandbox: true,
     }
+  });
+
+  pythonBridge.setRenderer(mainWindow.webContents, trustedRendererUrl);
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    if (!sameDocumentLocation(url, trustedRendererUrl)) event.preventDefault();
+  });
+  mainWindow.webContents.on('will-redirect', (event, url) => {
+    if (!sameDocumentLocation(url, trustedRendererUrl)) event.preventDefault();
+  });
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (url === 'https://developers.kite.trade/') void shell.openExternal(url);
+    return { action: 'deny' };
   });
 
   const isDev = !app.isPackaged;
@@ -39,11 +60,12 @@ async function createWindow() {
     mainWindow.loadFile(path.join(__dirname, '../../renderer/index.html'));
   }
 
-  mainWindow.webContents.on('console-message', (event, level, message, line, sourceId) => {
+  mainWindow.webContents.on('console-message', (_event, _level, message, line, _sourceId) => {
     console.log(`[Browser Console]: ${message} (line ${line})`);
   });
 
   mainWindow.on('closed', () => {
+    pythonBridge.setRenderer(null);
     mainWindow = null;
   });
 }
@@ -135,7 +157,7 @@ function setupMenu() {
 }
 
 app.whenReady().then(() => {
-  setupIpcHandlers();
+  setupIpcHandlers(() => mainWindow, trustedRendererUrl);
   setupMenu();
   createWindow();
 

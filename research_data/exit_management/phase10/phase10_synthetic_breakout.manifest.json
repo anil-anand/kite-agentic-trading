@@ -1,0 +1,11 @@
+{
+  "schema_version": "research-fixture-v1",
+  "fixture_name": "phase10_synthetic_breakout",
+  "data_classification": "SYNTHETIC_NON_SENSITIVE",
+  "mode": "REPLAY",
+  "dataset_sha256": "0ae0cf723abee6783ae929c2f982ff111e0f589a6a635f33ad33b83744267a12",
+  "policy_version": "deterministic-exit-v1",
+  "execution_model_version": "simulation-execution-v1",
+  "timestamp_convention": "BAR_START_UTC",
+  "purpose": "Regression fixture only; not promotion evidence."
+}

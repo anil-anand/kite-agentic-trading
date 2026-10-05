@@ -54,8 +54,9 @@ class RegimeClassifier:
         )
 
         # Price relative to VWAP
-        price_above_vwap = last["close"] > last["vwap"]
-        price_below_vwap = last["close"] < last["vwap"]
+        vwap_known = pd.notna(last["vwap"])
+        price_above_vwap = bool(last["close"] > last["vwap"]) if vwap_known else None
+        price_below_vwap = bool(last["close"] < last["vwap"]) if vwap_known else None
 
         # Volatility expansion (Breakout condition)
         # E.g., current ATR > 1.2 * SMA of ATR
@@ -80,12 +81,12 @@ class RegimeClassifier:
             "ema_20": round(last["ema_20"], 2) if not pd.isna(last["ema_20"]) else 0.0,
             "ema_50": round(last["ema_50"], 2) if not pd.isna(last["ema_50"]) else 0.0,
             "atr": round(last["atr"], 2) if not pd.isna(last["atr"]) else 0.0,
-            "vwap": round(last["vwap"], 2) if not pd.isna(last["vwap"]) else 0.0,
+            "vwap": round(last["vwap"], 2) if vwap_known else None,
             "volatility_expanding": bool(volatility_expanding),
             "ema_trending_up": bool(ema_trending_up),
             "ema_trending_down": bool(ema_trending_down),
-            "price_above_vwap": bool(price_above_vwap),
-            "price_below_vwap": bool(price_below_vwap),
+            "price_above_vwap": price_above_vwap,
+            "price_below_vwap": price_below_vwap,
         }
 
         return {"regime": regime, "features": features}
