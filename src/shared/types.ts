@@ -224,7 +224,7 @@ export type StrategyName =
   // LLM agent gateway
   | 'llm_agent';
 export type SignalDirection = 'BUY' | 'SELL';
-export type AgentMode = 'auto' | 'confirm';
+export type AgentMode = 'auto' | 'confirm' | 'paper';
 
 export interface Signal {
   id: string;
